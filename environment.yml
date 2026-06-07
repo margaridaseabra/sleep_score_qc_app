@@ -1,0 +1,16 @@
+name: sleep_stage_qc_v2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - h5py
+  - numpy
+  - pandas
+  - scikit-learn
+  - scipy
+  - plotly
+  - streamlit
+  - pip
+  - pip:
+      - streamlit-plotly-events
+      - pyedflib

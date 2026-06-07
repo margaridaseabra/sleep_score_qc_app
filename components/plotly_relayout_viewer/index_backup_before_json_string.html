@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+      font-family: sans-serif;
+    }
+
+    #plot {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+  <script src="./plotly.min.js"></script>
+</head>
+
+<body>
+  <div id="plot"></div>
+
+  <script>
+    // Minimal Streamlit component bridge.
+    // This avoids st.components.v1.html and creates a true bidirectional component.
+    function sendMessageToStreamlitClient(type, data) {
+      const outData = Object.assign({
+        isStreamlitMessage: true,
+        type: type,
+      }, data);
+      window.parent.postMessage(outData, "*");
+    }
+
+    function initStreamlitComponent() {
+      sendMessageToStreamlitClient("streamlit:componentReady", { apiVersion: 1 });
+    }
+
+    function setFrameHeight(height) {
+      sendMessageToStreamlitClient("streamlit:setFrameHeight", { height: height });
+    }
+
+    function sendValue(value) {
+      sendMessageToStreamlitClient("streamlit:setComponentValue", { value: value });
+    }
+
+    let initialized = false;
+    let suppressRelayout = false;
+    let lastSentSignature = "";
+    let debounceTimer = null;
+
+    function parseRelayoutRange(eventData) {
+      if (!eventData) return null;
+
+      // Common Plotly relayout formats.
+      const candidates = [
+        ["xaxis.range[0]", "xaxis.range[1]"],
+        ["xaxis2.range[0]", "xaxis2.range[1]"],
+        ["xaxis3.range[0]", "xaxis3.range[1]"],
+        ["xaxis4.range[0]", "xaxis4.range[1]"],
+        ["xaxis5.range[0]", "xaxis5.range[1]"],
+        ["xaxis6.range[0]", "xaxis6.range[1]"]
+      ];
+
+      for (const [a, b] of candidates) {
+        if (eventData[a] !== undefined && eventData[b] !== undefined) {
+          return [Number(eventData[a]), Number(eventData[b])];
+        }
+      }
+
+      if (Array.isArray(eventData["xaxis.range"])) {
+        return [Number(eventData["xaxis.range"][0]), Number(eventData["xaxis.range"][1])];
+      }
+
+      if (Array.isArray(eventData["xaxis2.range"])) {
+        return [Number(eventData["xaxis2.range"][0]), Number(eventData["xaxis2.range"][1])];
+      }
+
+      if (Array.isArray(eventData["xaxis3.range"])) {
+        return [Number(eventData["xaxis3.range"][0]), Number(eventData["xaxis3.range"][1])];
+      }
+
+      if (Array.isArray(eventData["xaxis4.range"])) {
+        return [Number(eventData["xaxis4.range"][0]), Number(eventData["xaxis4.range"][1])];
+      }
+
+      if (Array.isArray(eventData["xaxis5.range"])) {
+        return [Number(eventData["xaxis5.range"][0]), Number(eventData["xaxis5.range"][1])];
+      }
+
+      return null;
+    }
+
+    function maybeSendRange(eventType, x0, x1) {
+      if (!Number.isFinite(x0) || !Number.isFinite(x1)) return;
+      if (x1 <= x0) return;
+
+      const signature = `${eventType}:${x0.toFixed(4)}:${x1.toFixed(4)}`;
+
+      if (signature === lastSentSignature) return;
+      lastSentSignature = signature;
+
+      sendValue({
+        event_type: eventType,
+        x0: x0,
+        x1: x1,
+        timestamp: Date.now()
+      });
+    }
+
+    function attachHandlers(plotDiv) {
+      if (plotDiv.__handlersAttached) return;
+      plotDiv.__handlersAttached = true;
+
+      plotDiv.on("plotly_relayout", function(eventData) {
+        if (suppressRelayout) return;
+
+        const range = parseRelayoutRange(eventData);
+        if (!range) return;
+
+        clearTimeout(debounceTimer);
+
+        // Debounce so we don't send hundreds of events while dragging.
+        debounceTimer = setTimeout(function() {
+          maybeSendRange("relayout", range[0], range[1]);
+        }, 350);
+      });
+
+      plotDiv.on("plotly_selected", function(eventData) {
+        if (!eventData || !eventData.points || eventData.points.length < 2) return;
+
+        const xs = eventData.points
+          .map(p => Number(p.x))
+          .filter(v => Number.isFinite(v));
+
+        if (xs.length < 2) return;
+
+        const x0 = Math.min(...xs);
+        const x1 = Math.max(...xs);
+
+        maybeSendRange("selection", x0, x1);
+      });
+    }
+
+    function onRender(event) {
+      if (!event.data || event.data.type !== "streamlit:render") return;
+
+      const args = event.data.args;
+      const fig = args.fig_json;
+      const height = args.height || 900;
+
+      const plotDiv = document.getElementById("plot");
+      plotDiv.style.height = `${height}px`;
+
+      const config = {
+        responsive: true,
+        displaylogo: false,
+        scrollZoom: true,
+        modeBarButtonsToAdd: ["select2d", "lasso2d", "pan2d", "zoom2d", "resetScale2d"]
+      };
+
+      suppressRelayout = true;
+
+      Plotly.react(
+        plotDiv,
+        fig.data || [],
+        fig.layout || {},
+        config
+      ).then(function() {
+        suppressRelayout = false;
+        attachHandlers(plotDiv);
+        setFrameHeight(height);
+      });
+    }
+
+    window.addEventListener("message", onRender);
+    initStreamlitComponent();
+  </script>
+</body>
+</html>
