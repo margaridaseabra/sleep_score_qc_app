@@ -95,11 +95,6 @@ The most important files for a minimal demo are:
 - `epoch_features.csv`
 - `layer1_wake_sleep.csv`
 
-If you also want people to test the review workflow, add:
-
-- `manual_scoring_aligned.csv`
-- `final_scoring.csv`
-- `somnotate/somnotate_results_timeseries.csv`
 
 ## Project workflow
 
