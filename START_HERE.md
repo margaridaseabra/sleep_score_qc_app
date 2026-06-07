@@ -2,7 +2,7 @@
 
 Use this when sharing the project with lab colleagues.
 
-## What they need
+## What you need
 
 - this repository
 - a Conda or Python environment created from `environment.yml`
