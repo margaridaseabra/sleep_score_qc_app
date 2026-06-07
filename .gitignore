@@ -8,8 +8,9 @@ __pycache__/
 venv/
 .env
 .streamlit/
-outputs/
+outputs/*
 !outputs/.gitkeep
+sleep_stage_qc_v2_app_backup*.py
 recordings/
 somnotate_models/
 somnotate_runs/
