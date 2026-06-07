@@ -1,5 +1,4 @@
-# Sleep Stage QC v2
-
+# Sleep Scoring QC app
 Sleep Stage QC v2 is a Streamlit app for inspecting, comparing, correcting, and exporting EEG/EMG sleep-stage scoring.
 
 If you are setting this up for the first time, start with [START_HERE.md](START_HERE.md).
