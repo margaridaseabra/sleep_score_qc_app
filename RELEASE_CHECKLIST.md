@@ -26,8 +26,3 @@ Use this before sharing the app with the lab.
 - [ ] Somnotate training workflow works on a manually scored recording
 - [ ] Export CSV and MAT work
 
-## Sharing
-
-- [ ] Add a short message in the repo describing the recommended order of use
-- [ ] Share the sample project or test recording separately from the code repo
-- [ ] Ask one colleague to follow the full setup once before wider rollout
