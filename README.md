@@ -63,6 +63,44 @@ To use the app, colleagues need:
 - their recording project folder with imported data
 - a preprocessed `.mat` file, or existing recordings already prepared by the import pipeline
 
+## Files to include for a test run
+
+If you want colleagues to try the app without preparing their own data first, include one small example project with a single recording folder.
+
+Suggested structure:
+
+```text
+project_root/
+├── recordings_manifest.csv
+└── recordings/
+	└── sample_recording/
+		├── metadata.json
+		├── eeg.npy
+		├── emg.npy
+		├── epoch_features.csv
+		├── layer1_wake_sleep.csv
+		├── manual_scoring_aligned.csv        # optional, if you have manual scoring
+		├── final_scoring.csv                 # optional, if you want a reviewed scoring example
+		└── somnotate/
+			├── somnotate_results_timeseries.csv  # optional, if Somnotate has been run
+			└── somnotate_automated.tsv            # optional, depending on the Somnotate workflow
+```
+
+The most important files for a minimal demo are:
+
+- `recordings_manifest.csv`
+- `metadata.json`
+- `eeg.npy`
+- `emg.npy`
+- `epoch_features.csv`
+- `layer1_wake_sleep.csv`
+
+If you also want people to test the review workflow, add:
+
+- `manual_scoring_aligned.csv`
+- `final_scoring.csv`
+- `somnotate/somnotate_results_timeseries.csv`
+
 ## Project workflow
 
 1. Import the `.mat` file and run Layer 1.

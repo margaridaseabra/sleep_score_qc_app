@@ -11,6 +11,26 @@ Use this when sharing the project with lab colleagues.
 - the trained Somnotate model file if they are scoring with an existing model
 - a recording project folder containing imported data
 
+## Files to include for a test project
+
+If you want someone to test the app right away, give them one small project folder with one recording inside it.
+
+Minimum files:
+
+- `recordings_manifest.csv`
+- `metadata.json`
+- `eeg.npy`
+- `emg.npy`
+- `epoch_features.csv`
+- `layer1_wake_sleep.csv`
+
+Useful extra files:
+
+- `manual_scoring_aligned.csv`
+- `final_scoring.csv`
+- `somnotate/somnotate_results_timeseries.csv`
+- `somnotate/somnotate_automated.tsv`
+
 ## Fastest setup
 
 1. Clone the private GitHub repository.
