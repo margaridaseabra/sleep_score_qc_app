@@ -184,13 +184,6 @@ After import and scoring, a recording folder typically contains:
 - `somnotate/` for Somnotate outputs
 - `final_scoring.csv` for review/export
 
-## Recommended install notes for labs
-
-- Use a private GitHub repository for the app.
-- Keep `environment.yml` under version control.
-- Share one tested Somnotate repository path and one tested Somnotate environment with the lab.
-- Include a small sample recording or test project so new users can verify the installation.
-
 ## Troubleshooting
 
 - If the app cannot find Somnotate, check the Somnotate repository path and Python executable.
