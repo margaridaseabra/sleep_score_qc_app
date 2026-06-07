@@ -44,7 +44,17 @@ If you use Conda, you can also run the helper script:
 bash run_app.sh
 ```
 
-## What colleagues need
+When the app opens in the browser, the typical workflow is:
+
+1. Open `1. Import .mat + Layer 1`.
+2. Set the project root.
+3. Select the `.mat` file and run the import steps in order.
+4. Open `2. QC viewer` to confirm the recording and Layer 1 output.
+5. Open `3. Somnotate` to score with an existing model or train a new one.
+6. Use `4. Review / Edit scoring` to inspect and correct the scoring.
+7. Export the final results when you are done.
+
+## What you need to have
 
 To use the app, colleagues need:
 

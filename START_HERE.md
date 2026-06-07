@@ -33,6 +33,46 @@ git clone https://github.com/paulbrodersen/somnotate.git
 bash run_app.sh
 ```
 
+5. Open the local URL printed in the terminal, usually `http://localhost:8501`.
+
+## First time inside the app
+
+1. Open the `1. Import .mat + Layer 1` tab.
+2. Enter your project root folder.
+3. Paste the path to the preprocessed `.mat` file.
+4. Run `1. Import .mat`, then `2. Compute epoch features`, then `3. Run Layer 1`.
+5. Move to the `2. QC viewer` tab and confirm the recording appears.
+6. Open the `3. Somnotate` tab only after the app environment is working.
+
+## How to fill the Somnotate tab
+
+### If you already have a trained model
+
+1. Paste the Somnotate repository folder path.
+2. Paste the Somnotate Python executable path, or leave it as the Conda environment name if that works on your machine.
+3. Paste the trained model file path.
+4. Select the recording you want to score.
+5. Click `Run Somnotate using existing model`.
+
+### If you want to train a new model
+
+1. Paste the Somnotate repository folder path.
+2. Paste the Somnotate Python executable path, or use the Conda environment name.
+3. Choose recordings that already have manual scoring.
+4. Optionally choose test recordings.
+5. Enter a new model name.
+6. Click `Train Somnotate model`.
+
+## What to do next
+
+After Layer 1 or Somnotate is ready:
+
+1. Go to `4. Review / Edit scoring`.
+2. Inspect suspicious periods.
+3. Accept Somnotate, manual scoring, or Layer 1 when appropriate.
+4. Use manual labels when needed.
+5. Export the final scoring.
+
 ## Somnotate choices
 
 ### Use an existing trained model
