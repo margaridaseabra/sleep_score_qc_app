@@ -63,30 +63,16 @@ To use the app, colleagues need:
 - their recording project folder with imported data
 - a preprocessed `.mat` file, or existing recordings already prepared by the import pipeline
 
-## Files to include for a test run
+## Local folders for test data and Somnotate models
 
-If you want colleagues to try the app without preparing their own data first, include one small example project with a single recording folder.
+The repository includes two tracked placeholder folders:
 
-Suggested structure:
+- `test_data/` for example recordings or a small project used to test the app
+- `somnotate_models/` for pretrained Somnotate `.pickle` files
 
-```text
-project_root/
-├── recordings_manifest.csv
-└── recordings/
-	└── sample_recording/
-		├── metadata.json
-		├── eeg.npy
-		├── emg.npy
-		├── epoch_features.csv
-		├── layer1_wake_sleep.csv
-		├── manual_scoring_aligned.csv        # optional, if you have manual scoring
-		├── final_scoring.csv                 # optional, if you want a reviewed scoring example
-		└── somnotate/
-			├── somnotate_results_timeseries.csv  # optional, if Somnotate has been run
-			└── somnotate_automated.tsv            # optional, depending on the Somnotate workflow
-```
+You can place your own local test project files inside `test_data/` and keep pretrained models inside `somnotate_models/`.
 
-The most important files for a minimal demo are:
+For a test project, the app still expects the usual recording structure inside the project folder:
 
 - `recordings_manifest.csv`
 - `metadata.json`
@@ -95,6 +81,12 @@ The most important files for a minimal demo are:
 - `epoch_features.csv`
 - `layer1_wake_sleep.csv`
 
+Optional files can also live in the same test project if you want to try more features:
+
+- `manual_scoring_aligned.csv` if manual scoring exists
+- `final_scoring.csv` if you want a reviewed scoring example
+- `somnotate/somnotate_results_timeseries.csv` if Somnotate has been run
+- `somnotate/somnotate_automated.tsv` depending on the Somnotate workflow
 
 ## Project workflow
 

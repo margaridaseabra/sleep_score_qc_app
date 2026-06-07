@@ -11,11 +11,16 @@ Use this when sharing the project with lab colleagues.
 - the trained Somnotate model file if they are scoring with an existing model
 - a recording project folder containing imported data
 
-## Files to include for a test project
+## Local folders in the repository
 
-If you want someone to test the app right away, give them one small project folder with one recording inside it.
+The repo includes two placeholder folders for local use:
 
-Minimum files:
+- `test_data/` for example recordings or a small project to test the app
+- `somnotate_models/` for pretrained Somnotate `.pickle` files
+
+If you want someone to test the app right away, put one small project inside `test_data/` with one recording inside it.
+
+The app still expects the usual project files inside that test project:
 
 - `recordings_manifest.csv`
 - `metadata.json`
@@ -23,13 +28,10 @@ Minimum files:
 - `emg.npy`
 - `epoch_features.csv`
 - `layer1_wake_sleep.csv`
-
-Useful extra files:
-
-- `manual_scoring_aligned.csv`
-- `final_scoring.csv`
-- `somnotate/somnotate_results_timeseries.csv`
-- `somnotate/somnotate_automated.tsv`
+- `manual_scoring_aligned.csv` if manual scoring exists
+- `final_scoring.csv` if you want a reviewed scoring example
+- `somnotate/somnotate_results_timeseries.csv` if Somnotate has been run
+- `somnotate/somnotate_automated.tsv` depending on the Somnotate workflow
 
 ## Fastest setup
 

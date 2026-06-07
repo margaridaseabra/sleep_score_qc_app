@@ -15,3 +15,7 @@ recordings/
 somnotate_models/
 somnotate_runs/
 review_undo_stack/
+!somnotate_models/
+!test_data/
+!somnotate_models/.gitkeep
+!test_data/.gitkeep
