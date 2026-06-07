@@ -17,7 +17,7 @@ It includes:
 ### 1. Clone the repository
 
 ```bash
-git clone <your-private-repo-url>
+git clone <https://github.com/margaridaseabra/sleep_score_qc_app>
 cd sleep_stage_qc_v2
 ```
 
