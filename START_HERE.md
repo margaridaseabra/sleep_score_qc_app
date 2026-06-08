@@ -129,3 +129,34 @@ You will need:
 5. Confirm that the QC viewer shows EEG, EMG, scoring rows, and probabilities.
 
 If the test run succeeds, the colleague can use their own project folder next.
+
+## Somnotate input signals (EEG and EMG)
+
+The Somnotate preparation and example pipeline expect an EDF with two channels: a frontal EEG channel and an EMG channel. The app's preparation scripts and Somnotate wrappers look for `eeg.npy` and `emg.npy` in each recording folder, or for equivalent paths set in `metadata.json` (keys `eeg_file` / `emg_file`).
+
+If you only have a single EEG channel, use one of these simple options to make the recording compatible:
+
+- Create a dummy EMG (zeros) with the same length as the EEG and save it as `emg.npy` in the recording folder. Example:
+
+```python
+import numpy as np
+eeg = np.load('recordings/<RECORDING_ID>/eeg.npy', mmap_mode='r')
+emg = np.zeros_like(eeg, dtype=np.float32)
+np.save('recordings/<RECORDING_ID>/emg.npy', emg)
+```
+
+- Or duplicate the EEG as a stand-in EMG:
+
+```python
+import numpy as np
+eeg = np.load('recordings/<RECORDING_ID>/eeg.npy', mmap_mode='r')
+np.save('recordings/<RECORDING_ID>/emg.npy', eeg.astype(np.float32))
+```
+
+After creating `emg.npy`, either add the path to `metadata.json` (set `"emg_file": "emg.npy"`) or place the file at `recordings/<RECORDING_ID>/emg.npy`. Then re-run the Somnotate preparation step (the app exposes this as "Prepare selected recording for Somnotate" or you can run the pipeline script):
+
+```bash
+python sleep_scoring_qc_app/pipelines/20_prepare_somnotate_recording.py --project-root . --recording-id <RECORDING_ID>
+```
+
+If you prefer to run Somnotate using only EEG and no EMG, you would need to adapt the Somnotate `configuration.py` and pipeline scripts to remove EMG from preprocessing. That is more invasive — creating a dummy `emg.npy` is the simplest and safest approach.
