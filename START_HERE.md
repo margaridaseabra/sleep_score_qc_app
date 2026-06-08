@@ -130,32 +130,115 @@ You will need:
 
 If the test run succeeds, the colleague can use their own project folder next.
 
-## Somnotate input signals (EEG and EMG)
+## Adapting Somnotate for one EEG + one EMG
 
-The Somnotate preparation and example pipeline expect an EDF with two channels: a frontal EEG channel and an EMG channel. The app's preparation scripts and Somnotate wrappers look for `eeg.npy` and `emg.npy` in each recording folder, or for equivalent paths set in `metadata.json` (keys `eeg_file` / `emg_file`).
+Some Somnotate examples may assume a recording setup with more than one EEG channel, for example two EEG channels plus one EMG channel. In our app, the expected format is simpler:
 
-If you only have a single EEG channel, use one of these simple options to make the recording compatible:
+* one EEG signal
+* one EMG signal
 
-- Create a dummy EMG (zeros) with the same length as the EEG and save it as `emg.npy` in the recording folder. Example:
+This is enough to run Somnotate, as long as the Somnotate configuration and the trained model match this signal setup.
 
-```python
-import numpy as np
-eeg = np.load('recordings/<RECORDING_ID>/eeg.npy', mmap_mode='r')
-emg = np.zeros_like(eeg, dtype=np.float32)
-np.save('recordings/<RECORDING_ID>/emg.npy', emg)
-```
+### Where Somnotate defines the input signals
 
-- Or duplicate the EEG as a stand-in EMG:
+In Somnotate, the preprocessing script reads the list of signals from `configuration.py`, specifically from:
 
 ```python
-import numpy as np
-eeg = np.load('recordings/<RECORDING_ID>/eeg.npy', mmap_mode='r')
-np.save('recordings/<RECORDING_ID>/emg.npy', eeg.astype(np.float32))
+state_annotation_signals
 ```
 
-After creating `emg.npy`, either add the path to `metadata.json` (set `"emg_file": "emg.npy"`) or place the file at `recordings/<RECORDING_ID>/emg.npy`. Then re-run the Somnotate preparation step (the app exposes this as "Prepare selected recording for Somnotate" or you can run the pipeline script):
+The preprocessing script then checks that the spreadsheet contains one column for each signal listed in `state_annotation_signals`.
 
-```bash
+For example, if `configuration.py` contains something like:
+
+```python
+state_annotation_signals = [
+    "frontal_eeg_signal_label",
+    "parietal_eeg_signal_label",
+    "emg_signal_label",
+]
+```
+
+then the spreadsheet must contain all three columns:
+
+```text
+frontal_eeg_signal_label
+parietal_eeg_signal_label
+emg_signal_label
+```
+
+This is the setup for two EEG channels plus one EMG channel.
+
+For our usual recordings, with one EEG and one EMG, this should instead be changed to:
+
+```python
+state_annotation_signals = [
+    "frontal_eeg_signal_label",
+    "emg_signal_label",
+]
+```
+
+or to the equivalent EEG/EMG label names used in your local Somnotate configuration.
+
+### What the Somnotate spreadsheet should contain
+
+For one EEG + one EMG, the Somnotate spreadsheet should contain the standard file/path columns:
+
+```text
+file_path_raw_signals
+sampling_frequency_in_hz
+file_path_preprocessed_signals
+```
+
+and the two signal-label columns:
+
+```text
+frontal_eeg_signal_label
+emg_signal_label
+```
+
+For example:
+
+```text
+file_path_raw_signals,sampling_frequency_in_hz,file_path_preprocessed_signals,frontal_eeg_signal_label,emg_signal_label
+/path/to/recording.edf,512,/path/to/preprocessed.npy,EEG,EMG
+```
+
+The exact signal names, for example `EEG` and `EMG`, must match the channel labels inside the EDF file.
+
+### Why this works
+
+The Somnotate preprocessing script loads only the signals listed in `state_annotation_signals`:
+
+```python
+signal_labels = [dataset[column_name] for column_name in state_annotation_signals]
+raw_signals = load_raw_signals(dataset["file_path_raw_signals"], signal_labels)
+```
+
+It then computes a spectrogram for each signal and concatenates the features. Therefore, if `state_annotation_signals` contains only one EEG and one EMG, Somnotate will preprocess only those two signals.
+
+### Important model compatibility note
+
+The Somnotate model must be trained with the same signal setup that is used later for scoring.
+
+This means:
+
+* a model trained with one EEG + one EMG should be used with one EEG + one EMG;
+* a model trained with two EEGs + one EMG should not be used directly with one EEG + one EMG unless the configuration and feature structure are adapted;
+* if you change the number or type of signals, it is usually best to train a new model with that same configuration.
+
+The pretrained Somnotate models included with this app were trained using the signal structure expected by the app.
+
+### Do not add fake channels
+
+Do not create fake EEG or EMG channels just to satisfy a Somnotate configuration. A dummy or duplicated signal changes the input feature space and can make the model unreliable.
+
+The preferred solution is to adapt the Somnotate configuration so that it uses the real available signals:
+
+```text
+one EEG + one EMG
+```
+
 python sleep_scoring_qc_app/pipelines/20_prepare_somnotate_recording.py --project-root . --recording-id <RECORDING_ID>
 ```
 
