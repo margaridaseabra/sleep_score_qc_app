@@ -19,3 +19,29 @@ review_undo_stack/
 !test_data/
 !somnotate_models/.gitkeep
 !test_data/.gitkeep
+
+# Local / generated files
+__pycache__/
+*.pyc
+.DS_Store
+
+# Large data / recordings
+*.mat
+*.npy
+*.npz
+*.h5
+*.hdf5
+recordings/
+Data/
+prepared_data/
+
+# Local backups and patches
+*.zip
+*_backup*/
+dash_app_backup*/
+app_backup*.py
+
+# Backup files created during patching
+*backup*.py
+*backup*.sh
+*_backup_*

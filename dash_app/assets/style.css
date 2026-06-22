@@ -1,0 +1,257 @@
+body {
+  margin: 0;
+  background: #f6f7fb;
+  color: #1f2937;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+.theme-light {
+  background: #f6f7fb;
+  color: #1f2937;
+  min-height: 100vh;
+  padding: 18px;
+}
+
+.theme-dark {
+  background: #0b1220;
+  color: #e5e7eb;
+  min-height: 100vh;
+  padding: 18px;
+}
+
+.theme-dark h1,
+.theme-dark h2,
+.theme-dark h3,
+.theme-dark h4,
+.theme-dark label,
+.theme-dark p,
+.theme-dark li {
+  color: #f9fafb;
+}
+
+h1, h2, h3, h4 {
+  color: #111827;
+  letter-spacing: -0.02em;
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 14px;
+}
+
+.app-title {
+  font-size: 30px;
+  font-weight: 800;
+  margin: 0;
+}
+
+.app-subtitle {
+  color: #6b7280;
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+.theme-dark .app-subtitle,
+.theme-dark .status-line {
+  color: #cbd5e1;
+}
+
+.status-line {
+  color: #374151;
+  font-size: 14px;
+  margin-top: 8px;
+  white-space: pre-wrap;
+}
+
+button {
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #111827;
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #eef2ff;
+  border-color: #7c3aed;
+}
+
+.theme-dark button {
+  background: #111827;
+  color: #e5e7eb;
+  border-color: #374151;
+}
+
+.theme-dark button:hover {
+  background: #1f2937;
+  border-color: #8b5cf6;
+}
+
+input, textarea, select {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: white;
+}
+
+.theme-dark input,
+.theme-dark textarea,
+.theme-dark select {
+  background: #111827;
+  color: #e5e7eb;
+  border-color: #374151;
+}
+
+.card {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
+  margin: 12px 0;
+}
+
+.theme-dark .card {
+  background: #111827;
+  border-color: #1f2937;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+
+.empty-panel {
+  border: 1px dashed #bbb;
+  border-radius: 10px;
+  padding: 40px;
+  text-align: center;
+  color: #555;
+  background: #fafafa;
+  margin-top: 12px;
+}
+
+.theme-dark .empty-panel {
+  border-color: #374151;
+  background: #0f172a;
+  color: #cbd5e1;
+}
+
+.metric-card {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 14px;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.05);
+  text-align: center;
+}
+
+.theme-dark .metric-card {
+  background: #111827;
+  border-color: #1f2937;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.metric-value {
+  font-size: 28px;
+  font-weight: 800;
+  color: #4f46e5;
+}
+
+.theme-dark .metric-value {
+  color: #a78bfa;
+}
+
+.metric-label {
+  color: #6b7280;
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.theme-dark .metric-label {
+  color: #9ca3af;
+}
+
+.legend-row {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+}
+
+.legend-square {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid #d1d5db;
+}
+
+.queue-box {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 12px;
+  background: #ffffff;
+  margin: 10px 0;
+}
+
+.theme-dark .queue-box {
+  background: #0f172a;
+  border-color: #1f2937;
+}
+
+.log-box {
+  white-space: pre-wrap;
+  background: #f7f7f7;
+  padding: 10px;
+  max-height: 420px;
+  overflow: auto;
+  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+  margin-top: 8px;
+}
+
+.theme-dark .log-box {
+  background: #020617;
+  color: #d1d5db;
+  border-color: #1f2937;
+}
+
+.tab {
+  padding: 10px 16px !important;
+  font-size: 15px !important;
+  font-weight: 600 !important;
+  border: 1px solid #e5e7eb !important;
+  background: #f9fafb !important;
+}
+
+.tab--selected {
+  color: #4f46e5 !important;
+  background: #ffffff !important;
+  border-top: 3px solid #7c3aed !important;
+}
+
+.theme-dark .tab {
+  background: #111827 !important;
+  color: #e5e7eb !important;
+  border-color: #1f2937 !important;
+}
+
+.theme-dark .tab--selected {
+  background: #1f2937 !important;
+  color: #c4b5fd !important;
+}
