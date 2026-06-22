@@ -11,15 +11,85 @@
       font-family: sans-serif;
     }
 
+    #toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 6px;
+      background: rgba(245, 245, 245, 0.96);
+      border-bottom: 1px solid #ddd;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      font-size: 13px;
+    }
+
+    .group {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 1px solid #bbb;
+      border-radius: 5px;
+      padding: 3px 7px;
+      background: white;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    button:hover {
+      background: #f0f4ff;
+      border-color: #5b8def;
+    }
+
+    .score {
+      font-weight: 600;
+    }
+
+    #selectionStatus {
+      color: #1357c8;
+      font-weight: 600;
+      min-width: 190px;
+      text-align: center;
+    }
+
     #plot {
       width: 100%;
-      height: 100%;
+      height: calc(100% - 34px);
+      cursor: crosshair;
     }
   </style>
   <script src="./plotly.min.js"></script>
 </head>
 
 <body>
+  <div id="toolbar">
+    <div class="group">
+      <button data-nav="-15">◀ 15 min</button>
+      <button data-nav="-5">◀ 5 min</button>
+    </div>
+
+    <div id="selectionStatus">Drag on plot to select interval</div>
+
+    <div class="group">
+      <button class="score" data-score="wake">1 Wake</button>
+      <button class="score" data-score="nrem">2 NREM</button>
+      <button class="score" data-score="rem">3 REM</button>
+      <button data-score="somnotate">S Somnotate</button>
+      <button data-score="layer1">L Layer 1</button>
+      <button data-score="manual">M Manual</button>
+    </div>
+
+    <div class="group">
+      <button data-nav="5">5 min ▶</button>
+      <button data-nav="15">15 min ▶</button>
+    </div>
+  </div>
+
   <div id="plot"></div>
 
   <script>
@@ -46,6 +116,185 @@
     let suppressRelayout = false;
     let lastSentSignature = "";
     let debounceTimer = null;
+
+    let activeSelectionRange = null;
+    let isDraggingSelection = false;
+    let dragStartX = null;
+    let currentPlotDiv = null;
+
+    function getMainXAxis(plotDiv) {
+      if (!plotDiv || !plotDiv._fullLayout) return null;
+
+      const layout = plotDiv._fullLayout;
+
+      if (layout.xaxis && layout.xaxis.p2c) {
+        return layout.xaxis;
+      }
+
+      for (const key of Object.keys(layout)) {
+        if (key.startsWith("xaxis") && layout[key] && layout[key].p2c) {
+          return layout[key];
+        }
+      }
+
+      return null;
+    }
+
+    function mouseEventToX(plotDiv, ev) {
+      const ax = getMainXAxis(plotDiv);
+      if (!ax) return null;
+
+      const rect = plotDiv.getBoundingClientRect();
+      const localX = ev.clientX - rect.left;
+
+      const pxInsideAxis = localX - ax._offset;
+      let x = ax.p2c(pxInsideAxis);
+
+      if (!Number.isFinite(x)) return null;
+
+      const r0 = Number(ax.range[0]);
+      const r1 = Number(ax.range[1]);
+      const lo = Math.min(r0, r1);
+      const hi = Math.max(r0, r1);
+
+      x = Math.max(lo, Math.min(x, hi));
+
+      return x;
+    }
+
+    function isInsidePlotArea(plotDiv, ev) {
+      if (!plotDiv || !plotDiv._fullLayout || !plotDiv._fullLayout._size) return false;
+
+      const rect = plotDiv.getBoundingClientRect();
+      const localX = ev.clientX - rect.left;
+      const localY = ev.clientY - rect.top;
+      const s = plotDiv._fullLayout._size;
+
+      return (
+        localX >= s.l &&
+        localX <= s.l + s.w &&
+        localY >= s.t &&
+        localY <= s.t + s.h
+      );
+    }
+
+    function formatRange(x0, x1) {
+      const durSec = Math.max(0, (x1 - x0) * 60.0);
+      return `${x0.toFixed(2)}–${x1.toFixed(2)} min (${durSec.toFixed(1)} s)`;
+    }
+
+    function drawActiveSelectionShade(plotDiv, x0, x1) {
+      if (!Number.isFinite(x0) || !Number.isFinite(x1)) return;
+
+      if (x1 < x0) {
+        const tmp = x0;
+        x0 = x1;
+        x1 = tmp;
+      }
+
+      if (x1 <= x0) return;
+
+      activeSelectionRange = { x0: x0, x1: x1 };
+
+      const status = document.getElementById("selectionStatus");
+      if (status) {
+        status.textContent = "Selected: " + formatRange(x0, x1);
+      }
+
+      const oldShapes = (plotDiv.layout && plotDiv.layout.shapes)
+        ? plotDiv.layout.shapes.filter(s => s.name !== "__active_selection__")
+        : [];
+
+      const activeShape = {
+        type: "rect",
+        name: "__active_selection__",
+        xref: "x",
+        yref: "paper",
+        x0: x0,
+        x1: x1,
+        y0: 0,
+        y1: 1,
+        fillcolor: "rgba(0, 120, 255, 0.12)",
+        line: { color: "rgba(0, 90, 220, 0.95)", width: 2 },
+        layer: "above"
+      };
+
+      Plotly.relayout(plotDiv, {
+        shapes: oldShapes.concat([activeShape])
+      });
+    }
+
+    function sendScore(shortcut, key) {
+      if (!activeSelectionRange) {
+        sendValue({
+          event_type: "shortcut_no_selection",
+          shortcut: shortcut,
+          key: key,
+          timestamp: Date.now()
+        });
+        return;
+      }
+
+      sendValue({
+        event_type: "shortcut",
+        shortcut: shortcut,
+        key: key,
+        x0: activeSelectionRange.x0,
+        x1: activeSelectionRange.x1,
+        timestamp: Date.now()
+      });
+    }
+
+    function installMouseSelection(plotDiv) {
+      if (plotDiv.__mouseSelectionInstalled) return;
+      plotDiv.__mouseSelectionInstalled = true;
+
+      plotDiv.addEventListener("mousedown", function(ev) {
+        if (ev.button !== 0) return;
+        if (ev.target && ev.target.closest && ev.target.closest(".modebar")) return;
+        if (!isInsidePlotArea(plotDiv, ev)) return;
+
+        const x = mouseEventToX(plotDiv, ev);
+        if (x === null) return;
+
+        ev.preventDefault();
+        ev.stopPropagation();
+
+        isDraggingSelection = true;
+        dragStartX = x;
+        currentPlotDiv = plotDiv;
+
+        drawActiveSelectionShade(plotDiv, dragStartX, dragStartX + 0.001);
+      }, true);
+
+      window.addEventListener("mousemove", function(ev) {
+        if (!isDraggingSelection || !currentPlotDiv) return;
+
+        const x = mouseEventToX(currentPlotDiv, ev);
+        if (x === null) return;
+
+        ev.preventDefault();
+        ev.stopPropagation();
+
+        drawActiveSelectionShade(currentPlotDiv, dragStartX, x);
+      }, true);
+
+      window.addEventListener("mouseup", function(ev) {
+        if (!isDraggingSelection || !currentPlotDiv) return;
+
+        const x = mouseEventToX(currentPlotDiv, ev);
+        if (x !== null) {
+          drawActiveSelectionShade(currentPlotDiv, dragStartX, x);
+        }
+
+        isDraggingSelection = false;
+        dragStartX = null;
+        currentPlotDiv = null;
+
+        ev.preventDefault();
+        ev.stopPropagation();
+      }, true);
+    }
 
     function parseRelayoutRange(eventData) {
       if (!eventData) return null;
@@ -108,17 +357,72 @@
         }, 350);
       });
 
+      // Do not use Plotly's selected event for scoring.
+      // Selection is handled by our own mouse-drag layer above.
       plotDiv.on("plotly_selected", function(eventData) {
-        if (!eventData || !eventData.points || eventData.points.length < 2) return;
-
-        const xs = eventData.points
-          .map(p => Number(p.x))
-          .filter(v => Number.isFinite(v));
-
-        if (xs.length < 2) return;
-
-        maybeSendRange("selection", Math.min(...xs), Math.max(...xs));
+        return;
       });
+
+      installMouseSelection(plotDiv);
+    }
+
+    function installToolbar() {
+      if (window.sleepStageToolbarInstalled) return;
+      window.sleepStageToolbarInstalled = true;
+
+      document.querySelectorAll("[data-score]").forEach(btn => {
+        btn.addEventListener("click", function() {
+          const score = this.getAttribute("data-score");
+          sendScore(score, score);
+        });
+      });
+
+      document.querySelectorAll("[data-nav]").forEach(btn => {
+        btn.addEventListener("click", function() {
+          const delta = Number(this.getAttribute("data-nav"));
+          sendValue({
+            event_type: "nav",
+            delta_min: delta,
+            timestamp: Date.now()
+          });
+        });
+      });
+    }
+
+    function installShortcutListener() {
+      if (window.sleepStageShortcutListenerInstalled) return;
+      window.sleepStageShortcutListenerInstalled = true;
+
+      window.addEventListener("keydown", function(e) {
+        const active = document.activeElement;
+        const tag = active ? active.tagName.toLowerCase() : "";
+        const isTyping = (
+          tag === "input" ||
+          tag === "textarea" ||
+          tag === "select" ||
+          (active && active.isContentEditable)
+        );
+
+        if (isTyping) return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+        const key = e.key.toLowerCase();
+
+        const shortcutMap = {
+          "1": "wake",
+          "2": "nrem",
+          "3": "rem",
+          "s": "somnotate",
+          "l": "layer1",
+          "m": "manual"
+        };
+
+        if (shortcutMap[key]) {
+          e.preventDefault();
+          e.stopPropagation();
+          sendScore(shortcutMap[key], key);
+        }
+      }, true);
     }
 
     function onRender(event) {
@@ -134,14 +438,22 @@
       }
 
       const height = args.height || 900;
+      const toolbarHeight = 34;
       const plotDiv = document.getElementById("plot");
-      plotDiv.style.height = `${height}px`;
+
+      plotDiv.style.height = `${height - toolbarHeight}px`;
+
+      activeSelectionRange = null;
+      const status = document.getElementById("selectionStatus");
+      if (status) {
+        status.textContent = "Drag on plot to select interval";
+      }
 
       const config = {
         responsive: true,
         displaylogo: false,
         scrollZoom: true,
-        modeBarButtonsToAdd: ["select2d", "lasso2d", "pan2d", "zoom2d", "resetScale2d"]
+        modeBarButtonsToAdd: ["pan2d", "zoom2d", "resetScale2d"]
       };
 
       suppressRelayout = true;
@@ -154,6 +466,8 @@
       ).then(function() {
         suppressRelayout = false;
         attachHandlers(plotDiv);
+        installToolbar();
+        installShortcutListener();
         setFrameHeight(height);
       });
     }
