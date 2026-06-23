@@ -1,222 +1,408 @@
-# Sleep Scoring QC app
-Sleep Stage QC v2 is a Streamlit app for inspecting, comparing, correcting, and exporting EEG/EMG sleep-stage scoring.
+# Semi-automated sleep scoring QC app
 
-If you are setting this up for the first time, start with [START_HERE.md](START_HERE.md).
+This repository contains a **Dash-based app** for semi-automated EEG/EMG sleep scoring quality control.
 
-It includes:
+The app is designed to help users import sleep recordings, run automatic scoring steps, inspect EEG/EMG/ACh signals, compare scoring layers, review suspicious/dissociated periods, manually correct labels, and save a final reviewed sleep scoring file.
 
-- import of preprocessed `.mat` recordings
-- Layer 1 Wake/Sleep scoring
-- QC visualisation of EEG, EMG, scoring rows, and probabilities
-- Somnotate integration for Wake/NREM/REM scoring
-- review, undo, dissociation analysis, and export
+> **Current recommended version:** Dash app
+> **Legacy version:** the older Streamlit app is kept only for reference and should not be used for new scoring.
 
-## Quick Start
+---
+
+## What this app is for
+
+This app was developed for sleep scoring quality control in mouse EEG/EMG recordings.
+
+It supports:
+
+* importing `.mat` recordings;
+* extracting EEG, EMG, optional ACh/fiber photometry, and optional manual scoring;
+* running a first automatic Wake/Sleep layer;
+* using Somnotate scoring when available;
+* comparing scoring layers;
+* reviewing dissociation/disagreement events;
+* manually correcting scoring;
+* saving a final reviewed scoring file.
+
+The main idea is that automatic models help guide the review, but the user keeps control over the final scoring.
+
+---
+
+## Main scoring layers
+
+The app keeps scoring layers separate:
+
+| Layer         | Meaning                              |
+| ------------- | ------------------------------------ |
+| **Layer 1**   | Automatic Wake/Sleep scoring         |
+| **Somnotate** | Automatic Wake/NREM/REM scoring      |
+| **Manual**    | Imported manual labels, if available |
+| **Final**     | Reviewed labels created by the user  |
+
+Important:
+
+> **Final scoring starts empty/Undefined by default.**
+> It is only filled when the user explicitly applies labels or accepts one of the scoring sources.
+
+This means the app should not automatically copy Layer 1 or Somnotate into the final score unless the user chooses to do so.
+
+---
+
+## Quick start
 
 ### 1. Clone the repository
 
 ```bash
-git clone <https://github.com/margaridaseabra/sleep_score_qc_app>
-cd sleep_stage_qc_v2
+git clone https://github.com/margaridaseabra/sleep_score_qc_app.git
+cd sleep_score_qc_app
 ```
 
 ### 2. Create the Python environment
 
-If you use Conda:
+If using Conda:
 
 ```bash
 conda env create -f environment.yml
 conda activate sleep_stage_qc_v2
 ```
 
-If you prefer pip, install the same packages listed in `environment.yml` into your own environment.
-
-### 3. Launch the app
+If the environment already exists under a different name, activate that environment instead. For example:
 
 ```bash
-streamlit run sleep_stage_qc_v2_app.py
+conda activate sleep_app
 ```
 
-If you use Conda, you can also run the helper script:
+### 3. Launch the Dash app
 
 ```bash
 bash run_app.sh
 ```
 
-When the app opens in the browser, the typical workflow is:
+Then open the URL printed in the terminal, usually:
 
-1. Open `1. Import .mat + Layer 1`.
-2. Set the project root.
-3. Select the `.mat` file and run the import steps in order.
-4. Open `2. QC viewer` to confirm the recording and Layer 1 output.
-5. Open `3. Somnotate` to score with an existing model or train a new one.
-6. Use `4. Review / Edit scoring` to inspect and correct the scoring.
-7. Export the final results when you are done.
+```text
+http://127.0.0.1:8050
+```
 
-## What you need to have
+---
 
-To use the app, colleagues need:
+## App tabs
 
-- this repository
-- a Python environment with the packages in `environment.yml`
-- their recording project folder with imported data
-- a preprocessed `.mat` file, or existing recordings already prepared by the import pipeline
+The app is organized into four main tabs.
 
-## Local folders for test data and Somnotate models
+### 1. Import `.mat` + Layer 1
 
-The repository includes two tracked placeholder folders:
+Use this tab to import a recording and prepare it for review.
 
-- `test_data/` for example recordings or a small project used to test the app
-- `somnotate_models/` for pretrained Somnotate `.pickle` files
+Typical variable names used in the `.mat` file:
 
-You can place your own local test project files inside `test_data/` and keep pretrained models inside `somnotate_models/`.
+| Field                           | Example         |
+| ------------------------------- | --------------- |
+| EEG variable                    | `eeg`           |
+| EMG variable                    | `emg`           |
+| ACh / photometry variable       | `ne`            |
+| EEG sampling frequency variable | `eeg_frequency` |
+| ACh sampling frequency variable | `ne_frequency`  |
 
-For a test project, the app still expects the usual recording structure inside the project folder:
+After importing the recording, this tab can also be used to run Layer 1 Wake/Sleep scoring.
 
-- `recordings_manifest.csv`
-- `metadata.json`
-- `eeg.npy`
-- `emg.npy`
-- `epoch_features.csv`
-- `layer1_wake_sleep.csv`
+---
 
-Optional files can also live in the same test project if you want to try more features:
+### 2. QC / Review
 
-- `manual_scoring_aligned.csv` if manual scoring exists
-- `final_scoring.csv` if you want a reviewed scoring example
-- `somnotate/somnotate_results_timeseries.csv` if Somnotate has been run
-- `somnotate/somnotate_automated.tsv` depending on the Somnotate workflow
+Use this tab for the main scoring review.
 
-## Project workflow
+The QC viewer can show:
 
-1. Import the `.mat` file and run Layer 1.
-2. Open the QC viewer and inspect EEG, EMG, and scoring.
-3. Run Somnotate if available.
-4. Use the Review/Edit tab to inspect suspicious periods and correct labels.
-5. Export the final scoring as CSV and MAT.
+* scoring rows;
+* raw EEG;
+* raw EMG;
+* optional ACh/fiber photometry;
+* scoring probabilities;
+* dissociation review queue;
+* final reviewed scoring.
 
-## First-run checklist
+The faint colours over the raw traces correspond to the current **Final** scoring.
 
-Before colleagues start using the app, make sure they have:
+---
 
-- the repository cloned locally
-- the Conda environment created from `environment.yml`
-- the app launched with `streamlit run sleep_stage_qc_v2_app.py` or `bash run_app.sh`
-- the Somnotate repository cloned locally
-- a Somnotate Python environment or executable path
-- either an existing trained Somnotate model or manual scoring files for training
-- a test recording or sample project to confirm everything works end to end
+### 3. Somnotate
 
-## Somnotate setup
+Use this tab to run or import Somnotate scoring.
 
-Somnotate is not bundled as a Python dependency of this app. It must be installed from the official Somnotate repository and run in its own Python environment.
+Somnotate is not bundled inside this repository. It must be installed separately from:
 
-### 1. Download Somnotate
+```text
+https://github.com/paulbrodersen/somnotate
+```
+
+The app can use Somnotate outputs as an automatic Wake/NREM/REM scoring layer.
+
+---
+
+### 4. Dissociation
+
+Use this tab to identify periods where scoring layers disagree or where model confidence is low.
+
+Examples of useful comparisons:
+
+* Layer 1 vs Somnotate;
+* Final vs Somnotate;
+* Wake/Sleep disagreement;
+* low-confidence automatic scoring;
+* suspicious periods for manual review.
+
+After running dissociation analysis, return to the **QC / Review** tab and use the dissociation review queue to jump through interesting events.
+
+---
+
+## Expected project folder structure
+
+The app expects a local project folder containing prepared recordings.
+
+A typical project structure is:
+
+```text
+project_root/
+└── recordings/
+    └── recording_id/
+        ├── metadata.json
+        ├── eeg.npy
+        ├── emg.npy
+        ├── ach.npy                         # optional
+        ├── epoch_features.csv
+        ├── layer1_wake_sleep.csv
+        ├── manual_scoring_aligned.csv       # optional
+        ├── final_scoring.csv
+        └── somnotate/
+            └── somnotate_results_timeseries.csv
+```
+
+The app reads and writes files inside the selected project folder.
+
+Large data files should not be committed to GitHub. Keep raw recordings and prepared data on a local folder, shared drive, or OneDrive folder.
+
+---
+
+## Important files created by the app
+
+### `final_scoring.csv`
+
+This is the main reviewed output file.
+
+It is saved inside each recording folder:
+
+```text
+project_root/recordings/<recording_id>/final_scoring.csv
+```
+
+This file contains the user-reviewed scoring.
+
+### `layer1_wake_sleep.csv`
+
+This contains the Layer 1 automatic Wake/Sleep scoring.
+
+### `manual_scoring_aligned.csv`
+
+This contains imported manual labels, if available.
+
+### Somnotate output files
+
+Somnotate outputs are stored inside the recording’s `somnotate/` folder when available.
+
+---
+
+## QC keyboard shortcuts
+
+| Key | Action                              |
+| --- | ----------------------------------- |
+| `P` | Pan / move through the recording    |
+| `S` | Select window for scoring           |
+| `1` | Apply Wake                          |
+| `2` | Apply NREM                          |
+| `3` | Apply REM                           |
+| `A` | Apply automatic / Somnotate scoring |
+| `L` | Apply Layer 1 scoring               |
+| `M` | Apply Manual scoring                |
+| `Z` | Zoom mode                           |
+
+Typical use:
+
+```text
+P = move through the recording
+S = select a scoring window
+1 / 2 / 3 / A / L / M = apply label/source
+```
+
+---
+
+## How scoring is saved
+
+Scoring is saved automatically when labels are applied.
+
+The reviewed scoring is written to:
+
+```text
+project_root/recordings/<recording_id>/final_scoring.csv
+```
+
+If you close the app, labels already written to this file should remain.
+
+What may be lost when closing the app:
+
+* current zoom/pan view;
+* currently selected interval;
+* active Plotly mouse mode;
+* temporary interface state.
+
+What should not be lost:
+
+* labels already applied to `final_scoring.csv`.
+
+---
+
+## Safe stopping procedure
+
+If you need to stop while scoring:
+
+1. Finish the current scoring action.
+2. Wait for the app feedback/status to update.
+3. Note the approximate time/minute where you stopped, if useful.
+4. Stop the app in the terminal with `Ctrl+C`.
+5. Restart later with:
 
 ```bash
-git clone https://github.com/paulbrodersen/somnotate.git
+bash run_app.sh
 ```
 
-The app expects a local Somnotate checkout so it can call the external example pipeline scripts.
+6. Load the same project and recording.
+7. Continue scoring from the saved `final_scoring.csv`.
 
-### 2. Create a Somnotate Python environment
+---
 
-Follow the installation instructions in the Somnotate repository. The app can use either:
+## Optional backup of final scoring files
 
-- the full path to the Somnotate Python executable, or
-- the name of a Conda environment such as `somnotate_env`
-
-### 3. Prepare or train a model
-
-Use Somnotate in one of two ways:
-
-- existing trained model: provide the trained `.pickle` model file
-- new model: provide manually scored training recordings and optionally test recordings
-
-### 4. Point the app to Somnotate
-
-In the Somnotate tab of the app, provide:
-
-- Somnotate repository folder
-- Somnotate Python executable or Conda environment
-- trained model file if using an existing model
-- training and optional test recordings if training a new model
-
-### 5. Run Somnotate from the app
-
-The app prepares the recordings, launches the external Somnotate pipeline, imports the results, and displays them together with the raw signals and other scoring layers.
-
-## Somnotate input signals (EEG and EMG)
-
-Somnotate's example pipeline expects an EDF with two channels: a frontal EEG channel and an EMG channel. The app's preparation scripts look for `eeg.npy` and `emg.npy` in each recording folder, or for equivalent paths set in `metadata.json` (keys `eeg_file` / `emg_file`).
-
-If you only have a single EEG channel, use one of these options to make the recording compatible:
-
-- Create a dummy EMG (zeros) with the same length as the EEG and save it as `emg.npy` in the recording folder. Example:
-
-```python
-import numpy as np
-eeg = np.load('recordings/<RECORDING_ID>/eeg.npy', mmap_mode='r')
-emg = np.zeros_like(eeg, dtype=np.float32)
-np.save('recordings/<RECORDING_ID>/emg.npy', emg)
-```
-
-- Or duplicate the EEG as a stand-in EMG:
-
-```python
-import numpy as np
-eeg = np.load('recordings/<RECORDING_ID>/eeg.npy', mmap_mode='r')
-np.save('recordings/<RECORDING_ID>/emg.npy', eeg.astype(np.float32))
-```
-
-After creating `emg.npy`, either place the file at `recordings/<RECORDING_ID>/emg.npy` or add the path to `metadata.json` (`"emg_file": "emg.npy"`), then re-run the Somnotate preparation step (app option "Prepare selected recording for Somnotate" or the CLI):
+Before a long scoring session or before stopping for the day, you can back up all `final_scoring.csv` files:
 
 ```bash
-python sleep_scoring_qc_app/pipelines/20_prepare_somnotate_recording.py --project-root . --recording-id <RECORDING_ID>
+PROJECT="/path/to/project_root"
+STAMP=$(date +%Y%m%d_%H%M)
+
+find "$PROJECT/recordings" -name "final_scoring.csv" -exec sh -c '
+  for f do
+    cp "$f" "${f%.csv}_backup_'$STAMP'.csv"
+    echo "Backed up $f"
+  done
+' sh {} +
 ```
 
-Adapting the Somnotate configuration to run without EMG is more invasive; creating a dummy `emg.npy` is the simplest, safest workaround.
+---
 
-## Somnotate workflows
+## Legacy Streamlit version
 
-### Use an existing trained model
+The previous Streamlit version is kept only for reference.
 
-Use this if a reliable model already exists. You will need:
+New users should use the Dash app.
 
-- Somnotate repository path
-- Somnotate Python environment
-- trained model file
-- one or more recordings to score
+If the repository still contains a file such as:
 
-This is the fastest way to score new recordings.
+```text
+sleep_stage_qc_v2_app.py
+```
 
-### Train a new Somnotate model
+treat it as legacy code.
 
-Use this if you want to train your own model from manually scored recordings. You will need:
+The current recommended launch command is:
 
-- Somnotate repository folder
-- Somnotate Python executable or environment
-- training recordings with manual scoring
-- optional test recordings
-- a model name
+```bash
+bash run_app.sh
+```
 
-After training, the model is saved in the project’s `somnotate_models` folder and can be reused later.
+not:
 
-## Expected output folders
+```bash
+streamlit run ...
+```
 
-After import and scoring, a recording folder typically contains:
-
-- `eeg.npy`
-- `emg.npy`
-- `metadata.json`
-- `epoch_features.csv`
-- `layer1_wake_sleep.csv`
-- `manual_scoring_aligned.csv` if manual scoring exists
-- `somnotate/` for Somnotate outputs
-- `final_scoring.csv` for review/export
+---
 
 ## Troubleshooting
 
-- If the app cannot find Somnotate, check the Somnotate repository path and Python executable.
-- If Somnotate training fails, confirm that the training recordings contain manual scoring.
-- If EDF export fails, install `pyedflib` in the app environment.
+### The app opens but no recordings appear
+
+Check that the selected project root contains a `recordings/` folder.
+
+Expected structure:
+
+```text
+project_root/
+└── recordings/
+    └── recording_id/
+```
+
+### The app opens on the wrong port
+
+The Dash app usually opens at:
+
+```text
+http://127.0.0.1:8050
+```
+
+The old Streamlit app used port `8501`. That is not the current recommended app.
+
+### The final score is already filled
+
+This can happen if the recording already had an older `final_scoring.csv` created before the empty-final workflow.
+
+To fix this, reset the Final scoring in the app or manually back up and reset `final_scoring.csv` to `Undefined`.
+
+### I cannot select a scoring window
+
+Press:
+
+```text
+S
+```
+
+to activate select mode, then drag horizontally over the QC plot.
+
+Press:
+
+```text
+P
+```
+
+to return to pan mode.
+
+### Somnotate is not found
+
+Somnotate must be installed separately.
+
+Check:
+
+* the local Somnotate repository path;
+* the Python/Conda environment used for Somnotate;
+* whether the trained model file exists.
+
+---
+
+## What to tell new users
+
+1. Clone the repository.
+2. Create or activate the Python environment.
+3. Run:
+
+```bash
+bash run_app.sh
+```
+
+4. Open:
+
+```text
+http://127.0.0.1:8050
+```
+
+5. Choose the project root.
+6. Follow the app tabs from left to right.
+7. Use the QC / Review tab for final scoring.
+8. Final scoring is saved in `final_scoring.csv`.
