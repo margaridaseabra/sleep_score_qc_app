@@ -1,8 +1,0 @@
-Add these under pip: in environment.yml if not present:
-
-  - dash
-  - dash-bootstrap-components
-
-Or install directly in the existing conda env:
-
-pip install dash dash-bootstrap-components
