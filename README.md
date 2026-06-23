@@ -87,6 +87,7 @@ project_root/
         ├── layer1_wake_sleep.csv
         ├── manual_scoring_aligned.csv       # optional
         ├── final_scoring.csv
+        ├── metadata.json                  # may include video_file and video_offset_s
         └── somnotate/
             └── somnotate_results_timeseries.csv
 ```
@@ -127,6 +128,39 @@ The viewer can show:
 - dissociation review queue
 
 The faint colours over the raw traces correspond to the current **Final** scoring.
+
+
+### Optional video QC
+
+The QC / Review tab includes an optional **Video QC** panel. It can link a local `.mp4`, `.mov`, or `.avi` video to each recording. The video path and synchronization offset are saved in the recording `metadata.json` file.
+
+Recommended video format:
+
+```text
+.mp4 encoded with H.264
+```
+
+AVI files can be selected and saved, but many browsers cannot play `.avi` directly. If the video player is blank, convert the file to MP4 and save the MP4 path instead:
+
+```bash
+ffmpeg -i input_video.avi -c:v libx264 -crf 23 -preset fast -c:a aac output_video.mp4
+```
+
+Video synchronization uses:
+
+```text
+video_time_s = recording_time_s - video_offset_s
+```
+
+Examples:
+
+| Situation | `video_offset_s` |
+|---|---:|
+| Video and EEG start together | `0` |
+| Video starts 10 s after EEG | `10` |
+| Video starts 5 s before EEG | `-5` |
+
+The video panel has buttons to jump the video to the current QC window start or to the selected scoring interval.
 
 ### 3. Somnotate
 

@@ -125,6 +125,28 @@ Use this page to inspect:
 - dissociation events
 - final scoring
 
+
+### Optional video QC
+
+In the QC / Review tab, you can link a local video to the recording.
+
+1. Paste the full path to the `.mp4`, `.mov`, or `.avi` file.
+2. Set the video offset in seconds. Use `0` if the video and EEG start together.
+3. Click **Save video**.
+4. Use **Jump video to window start** or **Jump video to selected interval** during review.
+
+MP4 is the most reliable browser format. AVI paths are accepted, but if the video does not play, convert it to MP4:
+
+```bash
+ffmpeg -i input_video.avi -c:v libx264 -crf 23 -preset fast -c:a aac output_video.mp4
+```
+
+Synchronization rule:
+
+```text
+video_time_s = recording_time_s - video_offset_s
+```
+
 ### Step 4 — Somnotate
 
 Open:

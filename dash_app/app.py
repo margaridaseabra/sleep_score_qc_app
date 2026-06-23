@@ -6,12 +6,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from dash import Dash, dcc, html, Input, Output, State, callback_context, Patch, no_update, dash_table
+from flask import abort, request, send_file
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -185,6 +187,115 @@ def as_path(x: str | Path | None) -> Path:
 def read_json(path: Path) -> dict[str, Any]:
     with open(path, "r") as f:
         return json.load(f)
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def video_url_for_path(video_file: str | Path | None) -> str | None:
+    """Return a local Dash/Flask URL for a video path.
+
+    Browser video elements usually cannot reliably read arbitrary local file://
+    paths, so the app serves the selected file through a local Flask route.
+    The video itself remains on the user's computer; it is not copied to GitHub.
+    """
+    if not video_file:
+        return None
+    return "/_local_video?path=" + quote(str(Path(str(video_file)).expanduser()))
+
+
+def video_format_message(video_file: str | Path | None) -> str:
+    if not video_file:
+        return "No video selected yet."
+    suffix = Path(str(video_file)).suffix.lower()
+    if suffix in {".mp4", ".m4v", ".mov"}:
+        return "Video selected. MP4/MOV playback should work in most browsers."
+    if suffix == ".avi":
+        return "AVI selected. The path is saved, but browser playback may fail. Convert to MP4 if it does not play."
+    return f"Video selected with extension '{suffix}'. MP4 is recommended for browser playback."
+
+
+def video_panel_children(video_file: str | Path | None, offset_s: float | int | str | None = 0.0):
+    if not video_file:
+        return html.Div("No video file saved for this recording yet.", className="app-subtitle")
+
+    p = Path(str(video_file)).expanduser()
+    exists = p.exists()
+    suffix = p.suffix.lower()
+
+    messages = []
+    if not exists:
+        messages.append(html.Div(f"Video file not found: {p}", className="status-line"))
+    elif suffix == ".avi":
+        messages.append(html.Div(
+            "AVI files are accepted, but many browsers cannot play them directly. "
+            "If the player is blank, convert this file to MP4 and save the MP4 path instead.",
+            className="status-line",
+        ))
+    elif suffix not in {".mp4", ".m4v", ".mov"}:
+        messages.append(html.Div(
+            f"Unsupported or unusual video extension ({suffix}). MP4 is recommended.",
+            className="status-line",
+        ))
+
+    if not exists:
+        return html.Div(messages)
+
+    return html.Div(children=messages + [
+        html.Video(
+            id="qc-video-player",
+            src=video_url_for_path(p),
+            controls=True,
+            preload="metadata",
+            style={"width": "100%", "maxHeight": "420px", "background": "#000", "borderRadius": "10px"},
+        ),
+        html.Div(
+            f"Video offset: {float(offset_s or 0):.3f} s. Video time = recording time - offset.",
+            className="app-subtitle",
+            style={"marginTop": "6px"},
+        ),
+    ])
+
+
+def load_video_metadata(project_root: str | Path | None, recording_id: str | None) -> tuple[str, float]:
+    if not project_root or not recording_id:
+        return "", 0.0
+    try:
+        rd = recording_dir_from_manifest(project_root, recording_id)
+        meta = read_json(rd / "metadata.json")
+        return str(meta.get("video_file", "") or ""), float(meta.get("video_offset_s", 0.0) or 0.0)
+    except Exception:
+        return "", 0.0
+
+
+def save_video_metadata(project_root: str | Path, recording_id: str, video_file: str, video_offset_s: float) -> tuple[bool, str]:
+    try:
+        rd = recording_dir_from_manifest(project_root, recording_id)
+        meta_path = rd / "metadata.json"
+        meta = read_json(meta_path)
+        video_file = str(video_file or "").strip()
+        meta["video_file"] = video_file
+        meta["video_offset_s"] = float(video_offset_s or 0.0)
+        write_json(meta_path, meta)
+
+        if video_file and not Path(video_file).expanduser().exists():
+            return True, f"Saved video settings, but file does not exist: {video_file}"
+        return True, f"Saved video settings. {video_format_message(video_file)}"
+    except Exception as e:
+        return False, f"Could not save video settings: {type(e).__name__}: {e}"
+
+
+def safe_float(x, default=0.0) -> float:
+    try:
+        if x is None or x == "":
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
 
 
 def safe_mat_keys(mat_file: str | Path) -> list[str]:
@@ -911,6 +1022,36 @@ def legend_bar():
 
 app = Dash(__name__, suppress_callback_exceptions=True, title="Semi-automated sleep scoring QC app")
 
+
+@app.server.route("/_local_video")
+def serve_local_video():
+    """Serve a local video file to the browser through Dash/Flask.
+
+    This allows the Dash video player to display videos that live outside the
+    repository/project folder. The app is intended for local lab use.
+    """
+    raw_path = request.args.get("path", "")
+    if not raw_path:
+        abort(404)
+
+    path = Path(raw_path).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        abort(404)
+
+    suffix = path.suffix.lower()
+    if suffix not in {".mp4", ".m4v", ".mov", ".avi"}:
+        abort(415)
+
+    mimetype = {
+        ".mp4": "video/mp4",
+        ".m4v": "video/mp4",
+        ".mov": "video/quicktime",
+        ".avi": "video/x-msvideo",
+    }.get(suffix, "application/octet-stream")
+
+    return send_file(path, mimetype=mimetype, conditional=True, as_attachment=False)
+
+
 app.layout = html.Div(
     id="app-shell",
     className="theme-light",
@@ -1038,6 +1179,10 @@ dcc.Graph(id="qc-graph"),
     html.Button(id="score-window-somnotate"), html.Button(id="score-window-layer1"), html.Button(id="score-window-manual"),
     html.Button(id="btn-reset-final-empty"), html.Button(id="btn-undo"), html.Button(id="btn-export"),
     html.Div(id="score-status"),
+    PInput(id="video-file-input"), PInput(id="video-offset-input"), html.Button(id="save-video-settings"),
+    html.Button(id="jump-video-window"), html.Button(id="jump-video-selected"),
+    html.Div(id="video-status"), html.Div(id="video-player-container"),
+    dcc.Store(id="video-seek-store"), html.Div(id="video-seek-feedback"),
 
     # Somnotate tab
     PInput(id="som-recording-ids"), PInput(id="som-target-fs"), PInput(id="som-root"),
@@ -1184,6 +1329,38 @@ def render_tab(tab, project_root, _refresh):
                 html.Div(id="empty-qc-message", children=[html.H4("No recording loaded yet"), html.P("Load a project and choose a recording first.")], className="empty-panel"),
                 dcc.Graph(id="qc-graph", style={"display":"none"}, config={"scrollZoom": False, "displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["select2d", "pan2d", "zoom2d", "resetScale2d"]}),
                 html.Div(id="selected-interval-label", className="status-line"),
+
+                html.Div(className="video-qc-card", children=[
+                    html.H4("Video QC"),
+                    html.Div(
+                        "Optional: link an .mp4/.mov/.avi video to this recording. MP4 is the most reliable browser format; AVI paths are saved but may need conversion to MP4.",
+                        className="app-subtitle",
+                    ),
+                    html.Div(
+                        style={"display": "grid", "gridTemplateColumns": "3fr 1fr 1fr", "gap": "8px", "alignItems": "end", "marginTop": "8px"},
+                        children=[
+                            html.Div([html.Label("Video file path"), PInput(id="video-file-input", type="text", placeholder="/full/path/to/video.mp4 or .avi", style={"width": "100%"})]),
+                            html.Div([html.Label("Video offset (s)"), PInput(id="video-offset-input", type="number", value=0.0, step=0.1, style={"width": "100%"})]),
+                            html.Button("Save video", id="save-video-settings", n_clicks=0),
+                        ],
+                    ),
+                    html.Div(
+                        style={"display": "grid", "gridTemplateColumns": "1fr 1fr 2fr", "gap": "8px", "alignItems": "center", "marginTop": "8px"},
+                        children=[
+                            html.Button("Jump video to window start", id="jump-video-window", n_clicks=0),
+                            html.Button("Jump video to selected interval", id="jump-video-selected", n_clicks=0),
+                            html.Div(id="video-status", className="status-line"),
+                        ],
+                    ),
+                    html.Div(id="video-player-container", style={"marginTop": "10px"}),
+                    dcc.Store(id="video-seek-store"),
+                    html.Div(id="video-seek-feedback", className="status-line"),
+                    html.Details(children=[
+                        html.Summary("AVI conversion helper"),
+                        html.Pre("ffmpeg -i input_video.avi -c:v libx264 -crf 23 -preset fast -c:a aac output_video.mp4", className="log-box"),
+                    ]),
+                ]),
+
                 html.H4("Apply label to selected interval"),
                 html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(6, 1fr)", "gap":"6px"}, children=[
                     html.Button("1 = Wake", id="score-wake"), html.Button("2 = NREM", id="score-nrem"), html.Button("3 = REM", id="score-rem"),
@@ -1714,6 +1891,90 @@ def score_or_export(*args):
     if ok:
         msg = f"{msg} Applied to {scope_text}: {start:.2f}–{end:.2f} min."
     return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update
+
+
+# -----------------------------------------------------------------------------
+# Optional video QC callbacks
+# -----------------------------------------------------------------------------
+
+@app.callback(
+    Output("video-file-input", "value"),
+    Output("video-offset-input", "value"),
+    Output("video-player-container", "children"),
+    Output("video-status", "children"),
+    Input("recording-id-store", "data"),
+    Input("save-video-settings", "n_clicks"),
+    State("project-root-store", "data"),
+    State("video-file-input", "value"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def update_video_panel(recording_id, save_clicks, project_root, video_file_value, video_offset_value):
+    if not project_root or not recording_id:
+        return "", 0.0, html.Div("Load a recording to enable video QC.", className="app-subtitle"), "Load a recording first."
+
+    trig = callback_context.triggered_id
+
+    if trig == "save-video-settings":
+        video_file = str(video_file_value or "").strip()
+        offset_s = safe_float(video_offset_value, 0.0)
+        ok, msg = save_video_metadata(project_root, recording_id, video_file, offset_s)
+        return video_file, offset_s, video_panel_children(video_file, offset_s), msg
+
+    video_file, offset_s = load_video_metadata(project_root, recording_id)
+    return video_file, offset_s, video_panel_children(video_file, offset_s), video_format_message(video_file)
+
+
+@app.callback(
+    Output("video-seek-store", "data"),
+    Input("jump-video-window", "n_clicks"),
+    Input("jump-video-selected", "n_clicks"),
+    State("window-store", "data"),
+    State("selected-interval-store", "data"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def request_video_seek(n_window, n_selected, window_data, selected_data, offset_s):
+    trig = callback_context.triggered_id
+    offset_s = safe_float(offset_s, 0.0)
+
+    if trig == "jump-video-selected":
+        if not selected_data:
+            return {"error": "Select an interval first."}
+        recording_time_s = float(selected_data.get("start_min", 0.0)) * 60.0
+    else:
+        recording_time_s = float((window_data or {}).get("start_min", 0.0)) * 60.0
+
+    video_time_s = max(0.0, recording_time_s - offset_s)
+    return {"time_s": video_time_s, "recording_time_s": recording_time_s, "offset_s": offset_s, "source": trig}
+
+
+app.clientside_callback(
+    """
+    function(data) {
+        if (!data) {
+            return "";
+        }
+        if (data.error) {
+            return data.error;
+        }
+        const video = document.getElementById("qc-video-player");
+        if (!video) {
+            return "No video player loaded. Save a valid video path first.";
+        }
+        const t = Math.max(0, Number(data.time_s || 0));
+        try {
+            video.currentTime = t;
+            video.pause();
+            return "Video jumped to " + t.toFixed(2) + " s.";
+        } catch (e) {
+            return "Could not jump video: " + e;
+        }
+    }
+    """,
+    Output("video-seek-feedback", "children"),
+    Input("video-seek-store", "data"),
+)
 
 
 # -----------------------------------------------------------------------------
