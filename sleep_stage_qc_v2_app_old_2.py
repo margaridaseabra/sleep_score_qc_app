@@ -164,97 +164,6 @@ def safe_mat_keys(mat_file):
         return keys
 
 
-def read_mat_scalar_variable(mat_file, variable_name):
-    """
-    Read a scalar numeric variable from a MATLAB file.
-
-    Used to detect photometry sampling rate variables such as `ne_frequency`.
-    Returns None if the variable is missing or cannot be interpreted as a scalar.
-    """
-    mat_file = Path(mat_file).expanduser()
-    variable_name = str(variable_name).strip()
-
-    if not variable_name or not mat_file.exists():
-        return None
-
-    try:
-        d = loadmat(mat_file, squeeze_me=True)
-        if variable_name not in d:
-            return None
-        value = d[variable_name]
-    except NotImplementedError:
-        try:
-            import h5py
-            with h5py.File(mat_file, "r") as f:
-                if variable_name not in f:
-                    return None
-                value = np.array(f[variable_name]).squeeze()
-        except Exception:
-            return None
-    except Exception:
-        return None
-
-    try:
-        arr = np.asarray(value).squeeze()
-        if arr.size != 1:
-            return None
-        out = float(arr.reshape(-1)[0])
-        if not np.isfinite(out) or out <= 0:
-            return None
-        return out
-    except Exception:
-        return None
-
-
-def infer_photometry_sampling_rate_from_mat(mat_file, photometry_key, fallback_fs):
-    """
-    Infer the photometry sampling frequency from the .mat file.
-
-    For your lab files, the ACh trace can be stored as `ne`, and the correct
-    sampling frequency is often stored separately as `ne_frequency`.
-    """
-    fallback = float(fallback_fs)
-    photometry_key = str(photometry_key).strip()
-
-    if not mat_file or not photometry_key:
-        return fallback, "fallback EEG/EMG sampling rate"
-
-    key = photometry_key.split("/")[-1].strip()
-
-    candidates = []
-    if key:
-        candidates.extend([
-            f"{key}_frequency",
-            f"{key}_fs",
-            f"{key}_Fs",
-            f"{key}_sampling_rate",
-            f"{key}_sampling_rate_hz",
-            f"{key}_rate",
-        ])
-
-    # Common aliases for fiber photometry / neuromodulator channels.
-    candidates.extend([
-        "ne_frequency",
-        "NE_frequency",
-        "ach_frequency",
-        "ACh_frequency",
-        "photometry_frequency",
-        "fp_frequency",
-        "fiber_photometry_frequency",
-    ])
-
-    seen = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        value = read_mat_scalar_variable(mat_file, candidate)
-        if value is not None:
-            return float(value), candidate
-
-    return fallback, "fallback EEG/EMG sampling rate"
-
-
 def load_recording_arrays(recording_dir):
     eeg = np.load(Path(recording_dir) / "eeg.npy", mmap_mode="r")
     emg = np.load(Path(recording_dir) / "emg.npy", mmap_mode="r")
@@ -275,7 +184,8 @@ def downsample_trace(x, t, max_points=25000):
 def robust_z_trace(x, clip=5.0):
     """
     Robust within-window z-score for display traces.
-    Useful for optional z-display, but the current ACh panel keeps raw units.
+    Useful for photometry because raw fluorescence scale can vary strongly
+    across recordings/channels.
     """
     x = np.asarray(x, dtype=float)
     x = x - np.nanmedian(x)
@@ -287,44 +197,6 @@ def robust_z_trace(x, clip=5.0):
         scale = 1.0
 
     return np.clip(x / scale, -float(clip), float(clip))
-
-
-def robust_display_range(x, low_pct=1.0, high_pct=99.0, pad_fraction=0.08):
-    """
-    Return a robust y-axis range for raw traces.
-
-    The trace values are not transformed. Only the displayed y-axis is clipped
-    to a percentile range, which makes slow ACh/photometry dynamics visible
-    even when one or two large artifacts/outliers are present in the window.
-    """
-    x = np.asarray(x, dtype=float)
-    finite = x[np.isfinite(x)]
-
-    if finite.size == 0:
-        return None
-
-    low_pct = float(low_pct)
-    high_pct = float(high_pct)
-
-    low_pct = max(0.0, min(low_pct, 49.9))
-    high_pct = max(50.1, min(high_pct, 100.0))
-
-    y0, y1 = np.nanpercentile(finite, [low_pct, high_pct])
-
-    if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
-        y0 = np.nanmin(finite)
-        y1 = np.nanmax(finite)
-
-    if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
-        center = np.nanmedian(finite) if np.isfinite(np.nanmedian(finite)) else 0.0
-        y0 = center - 1.0
-        y1 = center + 1.0
-
-    pad = (y1 - y0) * float(pad_fraction)
-    if not np.isfinite(pad) or pad <= 0:
-        pad = max(abs(y0), abs(y1), 1.0) * 0.05
-
-    return [float(y0 - pad), float(y1 + pad)]
 
 
 PHOTOMETRY_CANDIDATE_FILES = [
@@ -485,15 +357,7 @@ def save_optional_photometry_from_mat(
 
     if sampling_rate_hz is not None:
         try:
-            _phot_fs = float(sampling_rate_hz)
-            metadata["photometry_sampling_rate_hz"] = _phot_fs
-
-            # Also store a channel-specific key when possible. This is useful for
-            # lab files where the trace is called `ne` and the frequency variable
-            # is `ne_frequency`.
-            _phot_key_low = str(photometry_key).strip().lower()
-            if _phot_key_low:
-                metadata[f"{_phot_key_low}_sampling_rate_hz"] = _phot_fs
+            metadata["photometry_sampling_rate_hz"] = float(sampling_rate_hz)
         except Exception:
             pass
 
@@ -621,13 +485,6 @@ def make_qc_plot(
     spectrogram_window_sec=1.0,
     spectrogram_overlap=0.9,
     show_photometry=True,
-    photometry_y_mode="robust",
-    photometry_low_pct=1.0,
-    photometry_high_pct=99.0,
-    photometry_manual_min=None,
-    photometry_manual_max=None,
-    max_raw_points=80000,
-    spectrogram_max_time_bins=1200,
 ):
     recording_dir = Path(recording_dir)
 
@@ -772,7 +629,7 @@ def make_qc_plot(
         float(fs),
         round(float(start_min), 4),
         round(float(visible_end_min_for_signal), 4),
-        int(max_raw_points),
+        200000,
         file_mtime_or_zero_local(recording_dir / "eeg.npy"),
     )
 
@@ -781,7 +638,7 @@ def make_qc_plot(
         float(fs),
         round(float(start_min), 4),
         round(float(visible_end_min_for_signal), 4),
-        int(max_raw_points),
+        200000,
         file_mtime_or_zero_local(recording_dir / "emg.npy"),
     )
 
@@ -794,7 +651,6 @@ def make_qc_plot(
     t_phot = phot_plot = None
     phot_mode = ""
     phot_label = "Fiber photometry"
-    phot_y_range = None
 
     if plot_photometry:
         try:
@@ -807,33 +663,10 @@ def make_qc_plot(
                 float(phot_fs),
                 round(float(start_min), 4),
                 round(float(visible_end_min_for_signal), 4),
-                int(max_raw_points),
+                200000,
                 file_mtime_or_zero_local(phot_path),
             )
-            # Show the photometry signal in its original/raw units.
-            # Do not robust-z-score it here; preserving the raw trace is useful
-            # for checking bleaching, baseline drift, and absolute acquisition artifacts.
-            phot_plot = phot_plot_raw
-
-            # Important: keep the raw values, but choose a useful y-axis scale.
-            # Without this, one large artifact can make the ACh trace look flat.
-            mode = str(photometry_y_mode).lower().strip()
-            if mode.startswith("robust"):
-                phot_y_range = robust_display_range(
-                    phot_plot,
-                    low_pct=float(photometry_low_pct),
-                    high_pct=float(photometry_high_pct),
-                )
-            elif mode.startswith("manual"):
-                try:
-                    y0 = float(photometry_manual_min)
-                    y1 = float(photometry_manual_max)
-                    if np.isfinite(y0) and np.isfinite(y1) and y1 > y0:
-                        phot_y_range = [y0, y1]
-                except Exception:
-                    phot_y_range = None
-            else:
-                phot_y_range = None
+            phot_plot = robust_z_trace(phot_plot_raw)
         except Exception as e:
             photometry_error = repr(e)
             plot_photometry = False
@@ -855,7 +688,6 @@ def make_qc_plot(
                 float(spectrogram_window_sec),
                 float(spectrogram_overlap),
                 file_mtime_or_zero_local(recording_dir / "eeg.npy"),
-                int(spectrogram_max_time_bins),
             )
             spec_available = True
         except Exception as e:
@@ -885,9 +717,8 @@ def make_qc_plot(
     if plot_photometry:
         phot_row = next_row
         next_row += 1
-        row_heights.append(0.24)
-        scale_label = "robust y-scale" if str(photometry_y_mode).lower().startswith("robust") else ("manual y-scale" if str(photometry_y_mode).lower().startswith("manual") else "full raw range")
-        subplot_titles.append(f"{phot_label} ({phot_mode}, raw display, {scale_label})")
+        row_heights.append(0.18)
+        subplot_titles.append(f"{phot_label} ({phot_mode}, robust z display)")
     else:
         phot_row = None
 
@@ -991,8 +822,8 @@ def make_qc_plot(
                 y=phot_plot,
                 mode="lines",
                 name=phot_label,
-                line=dict(color="#333333", width=1.1),
-                hovertemplate="time=%{x:.2f} min<br>photometry raw=%{y:.4g}<extra></extra>",
+                line=dict(color="#9467bd", width=0.9),
+                hovertemplate="time=%{x:.2f} min<br>photometry z=%{y:.2f}<extra></extra>",
             ),
             row=phot_row,
             col=1,
@@ -1174,8 +1005,7 @@ def make_qc_plot(
     if plot_photometry:
         fig.update_yaxes(
             fixedrange=False,
-            title_text="ACh/FP raw",
-            range=phot_y_range,
+            title_text="ACh/FP z",
             row=phot_row,
             col=1,
         )
@@ -1834,401 +1664,6 @@ FINAL_STATE_TO_CODE = {
 }
 
 
-# =============================================================================
-# PENDING REVIEW EDIT QUEUE
-# =============================================================================
-
-def review_queue_key(recording_id):
-    return f"pending_review_edits_{recording_id}"
-
-
-def review_queue_file(recording_dir):
-    return Path(recording_dir) / "review_edit_queue.csv"
-
-
-def load_pending_review_edits_from_disk(recording_dir, recording_id):
-    """
-    Load pending edits saved on disk.
-
-    This allows queued edits to survive a small rerun/reload, while still avoiding
-    rewriting final_scoring.csv after every single button press.
-    """
-    recording_dir = Path(recording_dir)
-    qfile = review_queue_file(recording_dir)
-
-    if not qfile.exists():
-        return []
-
-    try:
-        q = pd.read_csv(qfile)
-    except Exception:
-        return []
-
-    if len(q) == 0:
-        return []
-
-    if "recording_id" in q.columns:
-        q = q[q["recording_id"].astype(str) == str(recording_id)].copy()
-
-    if "status" in q.columns:
-        q = q[q["status"].astype(str) == "pending"].copy()
-
-    if len(q) == 0:
-        return []
-
-    return q.to_dict("records")
-
-
-def sync_pending_review_edits(recording_dir, recording_id):
-    """
-    Ensure st.session_state has the pending edit list for this recording.
-    """
-    key = review_queue_key(recording_id)
-
-    if key not in st.session_state:
-        st.session_state[key] = load_pending_review_edits_from_disk(
-            recording_dir=recording_dir,
-            recording_id=recording_id,
-        )
-
-    return st.session_state[key]
-
-
-def append_pending_edit_to_disk(recording_dir, edit):
-    recording_dir = Path(recording_dir)
-    qfile = review_queue_file(recording_dir)
-
-    row = pd.DataFrame([edit])
-
-    if qfile.exists():
-        try:
-            old = pd.read_csv(qfile)
-            out = pd.concat([old, row], ignore_index=True)
-        except Exception:
-            out = row
-    else:
-        out = row
-
-    out.to_csv(qfile, index=False)
-
-
-def queue_manual_label_fast(recording_dir, recording_id, start_s, end_s, label, notes=""):
-    """
-    Queue a manual label instead of immediately writing final_scoring.csv.
-
-    This is much faster during review because button clicks only update a small
-    session-state queue and a lightweight visual shade.
-    """
-    recording_dir = Path(recording_dir)
-    start_s = float(start_s)
-    end_s = float(end_s)
-    label = str(label)
-
-    if end_s <= start_s:
-        return False, "Selected end must be after selected start."
-
-    edits = sync_pending_review_edits(recording_dir, recording_id)
-
-    edit_id = pd.Timestamp.now().strftime("edit_%Y%m%d_%H%M%S_%f")
-
-    edit = {
-        "edit_id": edit_id,
-        "recording_id": str(recording_id),
-        "mode": "manual_label",
-        "source_name": "",
-        "label": label,
-        "start_s": start_s,
-        "end_s": end_s,
-        "start_min": start_s / 60.0,
-        "end_min": end_s / 60.0,
-        "notes": str(notes),
-        "status": "pending",
-        "created_at": pd.Timestamp.now().isoformat(),
-    }
-
-    edits.append(edit)
-    st.session_state[review_queue_key(recording_id)] = edits
-
-    append_pending_edit_to_disk(recording_dir, edit)
-
-    return True, f"Queued {label} for {(end_s - start_s):.1f} s. Commit edits when ready."
-
-
-def queue_source_label_fast(recording_dir, recording_id, start_s, end_s, source_name, notes=""):
-    """
-    Queue approval of Manual / Somnotate / Layer 1 for the selected interval.
-    """
-    recording_dir = Path(recording_dir)
-    start_s = float(start_s)
-    end_s = float(end_s)
-    source_name = str(source_name)
-
-    if end_s <= start_s:
-        return False, "Selected end must be after selected start."
-
-    if source_name == "Manual" and not (recording_dir / "manual_scoring_aligned.csv").exists():
-        return False, "Manual scoring file not found."
-
-    if source_name == "Somnotate" and not (recording_dir / "somnotate" / "somnotate_results_timeseries.csv").exists():
-        return False, "Somnotate results file not found."
-
-    if source_name == "Layer 1" and not (recording_dir / "layer1_wake_sleep.csv").exists():
-        return False, "Layer 1 scoring file not found."
-
-    edits = sync_pending_review_edits(recording_dir, recording_id)
-
-    edit_id = pd.Timestamp.now().strftime("edit_%Y%m%d_%H%M%S_%f")
-
-    edit = {
-        "edit_id": edit_id,
-        "recording_id": str(recording_id),
-        "mode": "source_approval",
-        "source_name": source_name,
-        "label": "",
-        "start_s": start_s,
-        "end_s": end_s,
-        "start_min": start_s / 60.0,
-        "end_min": end_s / 60.0,
-        "notes": str(notes),
-        "status": "pending",
-        "created_at": pd.Timestamp.now().isoformat(),
-    }
-
-    edits.append(edit)
-    st.session_state[review_queue_key(recording_id)] = edits
-
-    append_pending_edit_to_disk(recording_dir, edit)
-
-    return True, f"Queued approval of {source_name} for {(end_s - start_s):.1f} s. Commit edits when ready."
-
-
-def get_source_labels_for_final_epochs(recording_dir, source_name, final):
-    """
-    Return one label per row of final_scoring.csv for a requested source.
-    """
-    recording_dir = Path(recording_dir)
-    source_name = str(source_name)
-
-    epoch_df = final[["t0_s", "t1_s"]].copy()
-
-    if source_name == "Manual":
-        source_file = recording_dir / "manual_scoring_aligned.csv"
-        source_df = pd.read_csv(source_file)
-        return labels_at_epoch_midpoints(epoch_df, source_df, "manual_state")
-
-    if source_name == "Somnotate":
-        source_file = recording_dir / "somnotate" / "somnotate_results_timeseries.csv"
-        source_df = pd.read_csv(source_file)
-        return labels_at_epoch_midpoints(epoch_df, source_df, "somnotate_state")
-
-    if source_name == "Layer 1":
-        source_file = recording_dir / "layer1_wake_sleep.csv"
-        source_df = pd.read_csv(source_file)
-        source_labels = labels_at_epoch_midpoints(epoch_df, source_df, "layer1_label")
-
-        converted = []
-        for x in source_labels:
-            x = str(x)
-            if x == "Wake":
-                converted.append("Wake")
-            elif x == "Sleep":
-                # Layer 1 only knows Wake/Sleep. For final 3-state export,
-                # broad Sleep is mapped to NREM unless manually corrected later.
-                converted.append("NREM")
-            else:
-                converted.append("Undefined")
-
-        return np.asarray(converted, dtype=object)
-
-    raise ValueError(f"Unknown source: {source_name}")
-
-
-def commit_pending_review_edits(recording_dir, recording_id):
-    """
-    Apply all pending review edits in one write to final_scoring.csv.
-
-    This avoids the slow pattern:
-        click button -> write final_scoring.csv -> rebuild plot
-
-    Instead:
-        many clicks -> small pending queue -> one commit/write.
-    """
-    recording_dir = Path(recording_dir)
-    edits = sync_pending_review_edits(recording_dir, recording_id)
-
-    edits = [
-        e for e in edits
-        if str(e.get("status", "pending")) == "pending"
-    ]
-
-    if len(edits) == 0:
-        return False, "No pending edits to commit."
-
-    final_file = ensure_final_scoring_fast(recording_dir, recording_id)
-    final = pd.read_csv(final_file)
-
-    if not all(c in final.columns for c in ["t0_s", "t1_s", "final_state"]):
-        return False, "final_scoring.csv is missing required columns."
-
-    # One undo snapshot for the union of all committed intervals.
-    union_mask = pd.Series(False, index=final.index)
-
-    for edit in edits:
-        start_s = float(edit["start_s"])
-        end_s = float(edit["end_s"])
-        mask = (
-            (final["t0_s"].astype(float) < end_s)
-            & (final["t1_s"].astype(float) > start_s)
-        )
-        union_mask = union_mask | mask
-
-    if int(union_mask.sum()) == 0:
-        return False, "No final-scoring epochs overlap the pending edits."
-
-    record_review_undo_snapshot(
-        recording_dir=recording_dir,
-        recording_id=recording_id,
-        final_df=final,
-        mask=union_mask,
-        action_label=f"commit {len(edits)} pending edits",
-    )
-
-    source_label_cache = {}
-    log_rows = []
-
-    for edit in edits:
-        mode = str(edit.get("mode", ""))
-        start_s = float(edit["start_s"])
-        end_s = float(edit["end_s"])
-        notes = str(edit.get("notes", ""))
-
-        mask = (
-            (final["t0_s"].astype(float) < end_s)
-            & (final["t1_s"].astype(float) > start_s)
-        )
-
-        n_epochs = int(mask.sum())
-        if n_epochs == 0:
-            continue
-
-        if mode == "manual_label":
-            label = str(edit.get("label", "Uncertain"))
-            final.loc[mask, "final_state"] = label
-            final.loc[mask, "final_code"] = FINAL_STATE_TO_CODE.get(label, -1)
-            final.loc[mask, "final_source"] = "manual_queued_edit"
-
-        elif mode == "source_approval":
-            source_name = str(edit.get("source_name", ""))
-            if source_name not in source_label_cache:
-                source_label_cache[source_name] = get_source_labels_for_final_epochs(
-                    recording_dir=recording_dir,
-                    source_name=source_name,
-                    final=final,
-                )
-
-            source_labels = np.asarray(source_label_cache[source_name], dtype=object)
-            selected_labels = source_labels[mask.to_numpy()]
-
-            final.loc[mask, "final_state"] = selected_labels
-            final.loc[mask, "final_code"] = [
-                FINAL_STATE_TO_CODE.get(str(x), -1) for x in selected_labels
-            ]
-            final.loc[mask, "final_source"] = f"accepted_{source_name.lower().replace(' ', '_')}_queued"
-
-        else:
-            continue
-
-        final.loc[mask, "review_status"] = "reviewed"
-        final.loc[mask, "review_notes"] = notes
-
-        log_rows.append({
-            "recording_id": recording_id,
-            "start_s": start_s,
-            "end_s": end_s,
-            "mode": mode,
-            "label": str(edit.get("label", "")),
-            "source": str(edit.get("source_name", "")),
-            "notes": notes,
-            "n_epochs": n_epochs,
-            "saved_at": pd.Timestamp.now().isoformat(),
-        })
-
-    final.to_csv(final_file, index=False)
-
-    if log_rows:
-        log_file = recording_dir / "review_edit_log.csv"
-        new_log = pd.DataFrame(log_rows)
-
-        if log_file.exists():
-            try:
-                old_log = pd.read_csv(log_file)
-                out_log = pd.concat([old_log, new_log], ignore_index=True)
-            except Exception:
-                out_log = new_log
-        else:
-            out_log = new_log
-
-        out_log.to_csv(log_file, index=False)
-
-    # Mark disk queue as committed.
-    qfile = review_queue_file(recording_dir)
-    committed_ids = {str(e.get("edit_id", "")) for e in edits}
-
-    if qfile.exists():
-        try:
-            q = pd.read_csv(qfile)
-            if "edit_id" in q.columns:
-                m = q["edit_id"].astype(str).isin(committed_ids)
-                q.loc[m, "status"] = "committed"
-                q.loc[m, "committed_at"] = pd.Timestamp.now().isoformat()
-                q.to_csv(qfile, index=False)
-        except Exception:
-            pass
-
-    st.session_state[review_queue_key(recording_id)] = []
-
-    # After a real commit, it is okay to refresh the cached base figure once.
-    try:
-        make_cached_review_base_qc_plot.clear()
-    except Exception:
-        pass
-
-    return True, f"Committed {len(edits)} pending edits to final_scoring.csv."
-
-
-def clear_pending_review_edits(recording_dir, recording_id):
-    """
-    Clear pending edits without committing.
-    """
-    recording_dir = Path(recording_dir)
-    key = review_queue_key(recording_id)
-
-    st.session_state[key] = []
-
-    qfile = review_queue_file(recording_dir)
-
-    if qfile.exists():
-        try:
-            q = pd.read_csv(qfile)
-            if "recording_id" in q.columns and "status" in q.columns:
-                m = (
-                    (q["recording_id"].astype(str) == str(recording_id))
-                    & (q["status"].astype(str) == "pending")
-                )
-                q.loc[m, "status"] = "discarded"
-                q.loc[m, "discarded_at"] = pd.Timestamp.now().isoformat()
-                q.to_csv(qfile, index=False)
-        except Exception:
-            pass
-
-    shade_key = f"review_recent_shades_{recording_id}"
-    if shade_key in st.session_state:
-        st.session_state[shade_key] = []
-
-    return True, "Cleared pending edits."
-
-
-
 def ensure_final_scoring_fast(recording_dir, recording_id):
     """
     Create final_scoring.csv quickly if it does not exist.
@@ -2504,68 +1939,6 @@ def remember_review_shade(recording_id, start_min, end_min, label, source="manua
 
     # Keep only recent edits to avoid accumulating too many shapes in the plot.
     st.session_state[key] = st.session_state[key][-200:]
-
-
-
-def add_active_selection_shade_to_fig(
-    fig,
-    active_start_min,
-    active_end_min,
-    visible_start_min,
-    visible_end_min,
-):
-    """
-    Draw the currently selected interval as a lightweight guide shade.
-
-    This is not a saved scoring label. It only shows the interval that will be
-    affected if the user presses 1/2/3/s/l/m or one of the scoring buttons.
-    """
-    try:
-        x0 = float(active_start_min)
-        x1 = float(active_end_min)
-        v0 = float(visible_start_min)
-        v1 = float(visible_end_min)
-    except Exception:
-        return fig
-
-    if x1 <= x0:
-        return fig
-
-    # Clamp to visible window.
-    x0 = max(v0, min(x0, v1))
-    x1 = max(v0, min(x1, v1))
-
-    if x1 <= x0:
-        return fig
-
-    # One full-height shape is faster and clearer than one vrect per subplot.
-    fig.add_shape(
-        type="rect",
-        xref="x",
-        yref="paper",
-        x0=x0,
-        x1=x1,
-        y0=0,
-        y1=1,
-        fillcolor="rgba(0, 120, 255, 0.10)",
-        line=dict(color="rgba(0, 90, 220, 0.90)", width=2),
-        layer="above",
-    )
-
-    fig.add_annotation(
-        x=(x0 + x1) / 2,
-        y=1.01,
-        xref="x",
-        yref="paper",
-        text="selected interval",
-        showarrow=False,
-        font=dict(size=11, color="rgba(0, 70, 180, 1.0)"),
-        bgcolor="rgba(255,255,255,0.75)",
-        bordercolor="rgba(0, 90, 220, 0.6)",
-        borderwidth=1,
-    )
-
-    return fig
 
 
 def add_recent_review_shades_to_fig(fig, recording_id):
@@ -2874,13 +2247,6 @@ def make_cached_review_base_qc_plot(
     spectrogram_window_sec,
     spectrogram_overlap,
     show_photometry,
-    photometry_y_mode,
-    photometry_low_pct,
-    photometry_high_pct,
-    photometry_manual_min,
-    photometry_manual_max,
-    max_raw_points,
-    spectrogram_max_time_bins,
     photometry_mtime,
     metadata_mtime,
     eeg_mtime,
@@ -2907,13 +2273,6 @@ def make_cached_review_base_qc_plot(
         spectrogram_window_sec=float(spectrogram_window_sec),
         spectrogram_overlap=float(spectrogram_overlap),
         show_photometry=bool(show_photometry),
-        photometry_y_mode=str(photometry_y_mode),
-        photometry_low_pct=float(photometry_low_pct),
-        photometry_high_pct=float(photometry_high_pct),
-        photometry_manual_min=photometry_manual_min,
-        photometry_manual_max=photometry_manual_max,
-        max_raw_points=int(max_raw_points),
-        spectrogram_max_time_bins=int(spectrogram_max_time_bins),
     )
 
 
@@ -2926,13 +2285,6 @@ def get_cached_review_base_qc_plot(
     spectrogram_window_sec=1.0,
     spectrogram_overlap=0.9,
     show_photometry=True,
-    photometry_y_mode="robust",
-    photometry_low_pct=1.0,
-    photometry_high_pct=99.0,
-    photometry_manual_min=None,
-    photometry_manual_max=None,
-    max_raw_points=80000,
-    spectrogram_max_time_bins=1200,
 ):
     recording_dir = Path(recording_dir)
 
@@ -2956,13 +2308,6 @@ def get_cached_review_base_qc_plot(
         float(spectrogram_window_sec),
         float(spectrogram_overlap),
         bool(show_photometry),
-        str(photometry_y_mode),
-        float(photometry_low_pct),
-        float(photometry_high_pct),
-        photometry_manual_min,
-        photometry_manual_max,
-        int(max_raw_points),
-        int(spectrogram_max_time_bins),
         float(photometry_mtime),
         file_mtime_or_zero(recording_dir / "metadata.json"),
         file_mtime_or_zero(recording_dir / "eeg.npy"),
@@ -3313,7 +2658,7 @@ def make_review_spectrogram_cached(
     window_sec,
     overlap_fraction,
     source_mtime,
-    max_time_bins=1200,
+    max_time_bins=5000,
 ):
     """
     Compute a browser-friendly EEG spectrogram for the currently visible review window.
@@ -3515,12 +2860,6 @@ with tab_import:
 
     epoch_sec = st.number_input("Epoch length, seconds", min_value=0.1, value=1.0, step=0.5)
 
-    inferred_photometry_fs, inferred_photometry_fs_source = infer_photometry_sampling_rate_from_mat(
-        mat_file=mat_file,
-        photometry_key=photometry_key,
-        fallback_fs=float(fs),
-    )
-
     photometry_import_cols = st.columns(2)
     with photometry_import_cols[0]:
         photometry_output_name = st.text_input(
@@ -3532,19 +2871,9 @@ with tab_import:
         photometry_fs = st.number_input(
             "Photometry sampling rate, Hz",
             min_value=1.0,
-            value=float(inferred_photometry_fs),
+            value=float(fs),
             step=1.0,
-            key=f"import_photometry_fs_{str(photometry_key)}_{str(inferred_photometry_fs_source)}",
-            help=(
-                "Use the actual FP sampling rate. If the selected trace is `ne`, "
-                "the app will try to read `ne_frequency` from the .mat file automatically."
-            ),
-        )
-
-    if str(photometry_key).strip():
-        st.caption(
-            f"Photometry sampling rate source: **{inferred_photometry_fs_source}** "
-            f"→ {float(photometry_fs):.3f} Hz"
+            help="Use the actual FP sampling rate if it differs from EEG/EMG. If unsure and the trace was exported together with EEG/EMG, keep the same value.",
         )
 
     code_map = st.text_area(
@@ -4139,62 +3468,109 @@ with tab_somnotate:
 with tab_review:
     st.subheader("Active review / edit final scoring")
 
-    # Single lightweight keyboard shortcut listener.
-    # 0/1/2 score selected interval; Cmd/Ctrl+Z undoes pending edit first.
-    # Keyboard shortcuts for fast review:
-    # 1 = Wake, 2 = NREM, 3 = REM, s = Somnotate, l = Layer 1, m = Manual.
-    # Cmd/Ctrl+Z = undo.
     components.html(
         """
         <script>
         const parentDoc = window.parent.document;
 
-        if (!window.parent.__sleep_stage_qc_fast_shortcuts_123slm_v1) {
-            window.parent.__sleep_stage_qc_fast_shortcuts_123slm_v1 = true;
+        if (!window.parent.__sleep_stage_qc_review_undo_v3) {
+            window.parent.__sleep_stage_qc_review_undo_v3 = true;
 
             window.parent.addEventListener("keydown", function(e) {
-                const active = parentDoc.activeElement;
-                const tag = active ? active.tagName.toLowerCase() : "";
-                const isTyping = (
-                    tag === "input" ||
-                    tag === "textarea" ||
-                    tag === "select" ||
-                    (active && active.isContentEditable)
+                const isUndo = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z";
+
+                if (!isUndo) {
+                    return;
+                }
+
+                e.preventDefault();
+                e.stopPropagation();
+
+                const buttons = Array.from(parentDoc.querySelectorAll("button"));
+                const undoButton = buttons.find(
+                    b => b.innerText && b.innerText.includes("Undo last action")
                 );
 
-                if (isTyping) {
-                    return;
+                if (undoButton) {
+                    undoButton.click();
                 }
-
-                const key = e.key.toLowerCase();
-
-                function clickButtonContaining(options) {
-                    const buttons = Array.from(parentDoc.querySelectorAll("button"));
-                    for (const option of options) {
-                        const btn = buttons.find(
-                            b => b.innerText && b.innerText.trim().includes(option)
-                        );
-                        if (btn) {
-                            btn.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-
-                if ((e.ctrlKey || e.metaKey) && key === "z") {
-                    e.preventDefault();
-                    clickButtonContaining(["Undo last action", "Undo pending", "↶ Undo"]);
-                    return;
-                }
-
-                if (e.ctrlKey || e.metaKey || e.altKey) {
-                    return;
-                }
-
-                // Scoring shortcuts are handled inside the Plotly component,
-                // because only the component knows the current selected interval.
             }, true);
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
+    components.html(
+        """
+        <script>
+        const parentDoc = window.parent.document;
+
+        if (!window.parent.__sleep_stage_qc_undo_shortcut_installed_v2) {
+            window.parent.__sleep_stage_qc_undo_shortcut_installed_v2 = true;
+
+            window.parent.addEventListener("keydown", function(e) {
+                const isUndo = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z";
+
+                if (!isUndo) {
+                    return;
+                }
+
+                const active = parentDoc.activeElement;
+                const tag = active ? active.tagName.toLowerCase() : "";
+
+                // Avoid hijacking text editing inside inputs/textareas.
+                if (tag === "input" || tag === "textarea") {
+                    return;
+                }
+
+                e.preventDefault();
+
+                const buttons = Array.from(parentDoc.querySelectorAll("button"));
+                const undoButton = buttons.find(
+                    b => b.innerText && b.innerText.includes("Undo last action")
+                );
+
+                if (undoButton) {
+                    undoButton.click();
+                }
+            });
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
+    # Keyboard shortcut: Ctrl+Z on Windows/Linux or Cmd+Z on Mac.
+    # This triggers the visible "Undo last pending edit" button.
+    components.html(
+        """
+        <script>
+        const parentDoc = window.parent.document;
+
+        if (!window.parent.__sleep_stage_qc_undo_shortcut_installed) {
+            window.parent.__sleep_stage_qc_undo_shortcut_installed = true;
+
+            window.parent.addEventListener("keydown", function(e) {
+                const isUndo = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z";
+
+                if (!isUndo) {
+                    return;
+                }
+
+                e.preventDefault();
+
+                const buttons = Array.from(parentDoc.querySelectorAll("button"));
+                const undoButton = buttons.find(
+                    b => b.innerText && b.innerText.trim().includes("Undo last pending edit")
+                );
+
+                if (undoButton) {
+                    undoButton.click();
+                }
+            });
         }
         </script>
         """,
@@ -4606,80 +3982,175 @@ with tab_review:
     st.session_state.selected_label_end_min = float(selected_period[1])
 
     # --------------------------------------------------------------
-    # Fast scoring controls are rendered directly below the QC plot.
+    # Compact decision panel: selected period + source/manual choice
     # --------------------------------------------------------------
-    st.caption(
-        "Select a period in the QC plot. The fast scoring buttons are directly below the plot "
-        "so they use the most recent Plotly selection."
-    )
+    st.markdown("#### Decision for selected period")
 
-    # --------------------------------------------------------------
-    # Pending edit queue controls
-    # --------------------------------------------------------------
-    pending_edits_now = sync_pending_review_edits(
-        recording_dir=recording_dir_review,
-        recording_id=recording_id_review,
-    )
-    n_pending_edits_now = len(pending_edits_now)
+    label_start_min_now = float(st.session_state.selected_label_start_min)
+    label_end_min_now = float(st.session_state.selected_label_end_min)
 
-    st.markdown("#### Pending edits")
+    decision_c1, decision_c2, decision_c3 = st.columns([3, 1, 1])
 
-    if n_pending_edits_now == 0:
-        st.caption("No pending edits. Manual labels / approvals will appear here before they are committed.")
-    else:
-        st.warning(
-            f"{n_pending_edits_now} pending edit(s) are queued. "
-            "They are queued, but they are not written to final_scoring.csv until you commit them."
+    with decision_c1:
+        st.info(
+            f"Selected period: **{label_start_min_now:.2f}–{label_end_min_now:.2f} min** "
+            f"({(label_end_min_now - label_start_min_now) * 60:.1f} s)"
         )
 
-        with st.expander("Show pending edits", expanded=False):
-            st.dataframe(pd.DataFrame(pending_edits_now), width="stretch", height=180)
+    with decision_c2:
+        if st.button("Use full visible window"):
+            st.session_state.selected_label_start_min = float(selected_start_min)
+            st.session_state.selected_label_end_min = float(selected_end_min)
+            st.session_state.selected_period_slider_revision = (
+                st.session_state.get("selected_period_slider_revision", 0) + 1
+            )
+            st.rerun()
 
-    pending_c1, pending_c2, pending_c3 = st.columns([1, 1, 2])
-
-    with pending_c1:
-        if st.button("Commit pending edits to final_scoring.csv", key="commit_pending_review_edits"):
-            ok, msg = commit_pending_review_edits(
+    with decision_c3:
+        if st.button("↶ Undo last action", key="undo_last_review_action_button"):
+            ok, msg = undo_last_review_action(
                 recording_dir=recording_dir_review,
                 recording_id=recording_id_review,
             )
+
             if ok:
                 st.success(msg)
-                st.rerun()
             else:
                 st.info(msg)
 
-    with pending_c2:
-        if st.button("Undo last pending edit", key="undo_last_pending_review_edit_button"):
-            ok, msg = undo_last_pending_review_edit(
+    compact_notes = st.text_input(
+        "Notes for this edit",
+        value="review edit",
+        key="compact_selected_period_notes",
+    )
+
+    source_cols = st.columns(3)
+
+    with source_cols[0]:
+        if st.button("Accept Somnotate for selected period", key="accept_somnotate_selected"):
+            ok, msg = apply_source_label_fast(
                 recording_dir=recording_dir_review,
                 recording_id=recording_id_review,
+                start_s=label_start_min_now * 60,
+                end_s=label_end_min_now * 60,
+                source_name="Somnotate",
+                notes=str(compact_notes),
             )
             if ok:
+                shade_label = dominant_state_for_source_interval(
+                    recording_dir=recording_dir_review,
+                    source_name="Somnotate",
+                    start_s=label_start_min_now * 60,
+                    end_s=label_end_min_now * 60,
+                )
+                remember_review_shade(
+                    recording_id=recording_id_review,
+                    start_min=label_start_min_now,
+                    end_min=label_end_min_now,
+                    label=shade_label,
+                    source="accepted_somnotate",
+                )
                 st.success(msg)
-                st.rerun()
             else:
-                st.info(msg)
+                st.error(msg)
 
-    with pending_c3:
-        if st.button("Discard all pending edits", key="discard_all_pending_review_edits"):
-            ok, msg = clear_pending_review_edits(
+    with source_cols[1]:
+        if st.button("Accept Manual for selected period", key="accept_manual_selected"):
+            ok, msg = apply_source_label_fast(
                 recording_dir=recording_dir_review,
                 recording_id=recording_id_review,
+                start_s=label_start_min_now * 60,
+                end_s=label_end_min_now * 60,
+                source_name="Manual",
+                notes=str(compact_notes),
             )
             if ok:
+                shade_label = dominant_state_for_source_interval(
+                    recording_dir=recording_dir_review,
+                    source_name="Manual",
+                    start_s=label_start_min_now * 60,
+                    end_s=label_end_min_now * 60,
+                )
+                remember_review_shade(
+                    recording_id=recording_id_review,
+                    start_min=label_start_min_now,
+                    end_min=label_end_min_now,
+                    label=shade_label,
+                    source="accepted_manual",
+                )
                 st.success(msg)
-                st.rerun()
             else:
-                st.info(msg)
+                st.error(msg)
 
+    with source_cols[2]:
+        if st.button("Accept Layer 1 for selected period", key="accept_layer1_selected"):
+            ok, msg = apply_source_label_fast(
+                recording_dir=recording_dir_review,
+                recording_id=recording_id_review,
+                start_s=label_start_min_now * 60,
+                end_s=label_end_min_now * 60,
+                source_name="Layer 1",
+                notes=str(compact_notes),
+            )
+            if ok:
+                shade_label = dominant_state_for_source_interval(
+                    recording_dir=recording_dir_review,
+                    source_name="Layer 1",
+                    start_s=label_start_min_now * 60,
+                    end_s=label_end_min_now * 60,
+                )
+                remember_review_shade(
+                    recording_id=recording_id_review,
+                    start_min=label_start_min_now,
+                    end_min=label_end_min_now,
+                    label=shade_label,
+                    source="accepted_layer_1",
+                )
+                st.success(msg)
+            else:
+                st.error(msg)
+
+    manual_cols = st.columns(5)
+    quick_label_now = None
+
+    with manual_cols[0]:
+        if st.button("0 = Wake", key="compact_score_wake"):
+            quick_label_now = "Wake"
+
+    with manual_cols[1]:
+        if st.button("1 = NREM", key="compact_score_nrem"):
+            quick_label_now = "NREM"
+
+    with manual_cols[2]:
+        if st.button("2 = REM", key="compact_score_rem"):
+            quick_label_now = "REM"
+
+    with manual_cols[3]:
+        if st.button("Uncertain", key="compact_score_uncertain"):
+            quick_label_now = "Uncertain"
+
+    with manual_cols[4]:
+        if st.button("Artifact", key="compact_score_artifact"):
+            quick_label_now = "Artifact"
+
+    if quick_label_now is not None:
+        if label_end_min_now <= label_start_min_now:
+            st.error("Selected end must be after selected start.")
+        else:
+            ok, msg = apply_manual_label_fast(
+                recording_dir=recording_dir_review,
+                recording_id=recording_id_review,
+                start_s=label_start_min_now * 60,
+                end_s=label_end_min_now * 60,
+                label=quick_label_now,
+                notes=str(compact_notes),
+            )
+
+            st.success(msg) if ok else st.error(msg)
 
     # --------------------------------------------------------------
     # Compact export panel near review controls
     # --------------------------------------------------------------
-    if len(sync_pending_review_edits(recording_dir_review, recording_id_review)) > 0:
-        st.warning("Pending edits are not included in export until committed. Press 'Commit pending edits to final_scoring.csv' before exporting.")
-
     with st.expander("Export scoring", expanded=False):
         manual_file_for_export = recording_dir_review / "manual_scoring_aligned.csv"
         has_manual_for_export = manual_file_for_export.exists()
@@ -4795,7 +4266,7 @@ with tab_review:
           <span><span style="display:inline-block;width:24px;border-top:2px solid #ff7f0e;margin-right:5px;vertical-align:middle;"></span>Somnotate P(NREM)</span>
           <span><span style="display:inline-block;width:24px;border-top:2px solid #2ca02c;margin-right:5px;vertical-align:middle;"></span>Somnotate P(REM)</span>
           <span><span style="display:inline-block;width:24px;border-top:2px solid #9e9e9e;margin-right:5px;vertical-align:middle;"></span>Somnotate uncertainty</span>
-          <span><span style="display:inline-block;width:24px;border-top:2px solid #333333;margin-right:5px;vertical-align:middle;"></span>ACh / fiber photometry raw</span>
+          <span><span style="display:inline-block;width:24px;border-top:2px solid #9467bd;margin-right:5px;vertical-align:middle;"></span>ACh / fiber photometry robust z</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -4805,28 +4276,6 @@ with tab_review:
     # Spectrogram controls for the Review/Edit plot
     # --------------------------------------------------------------
     st.markdown("#### Spectrogram / 15-minute chunk display")
-
-    perf_c1, perf_c2 = st.columns([1, 3])
-    with perf_c1:
-        fast_review_plotly_mode = st.checkbox(
-            "Fast Plotly mode",
-            value=True,
-            key="review_fast_plotly_mode",
-            help=(
-                "Keeps the Review/Edit plot responsive by sending fewer raw points "
-                "to Plotly and by compressing the spectrogram time axis. "
-                "Turn off only if you need maximum visual detail."
-            ),
-        )
-    with perf_c2:
-        if fast_review_plotly_mode:
-            st.caption("Fast mode: ~40k points per raw trace, ~1200 spectrogram time bins, lower spectrogram overlap.")
-        else:
-            st.caption("High-detail mode: more raw points and denser spectrogram; slower when changing windows.")
-
-    review_max_raw_points = 40000 if fast_review_plotly_mode else 120000
-    review_spectrogram_max_time_bins = 1200 if fast_review_plotly_mode else 5000
-    review_spectrogram_overlap = 0.50 if fast_review_plotly_mode else 0.90
 
     spec_c1, spec_c2, spec_c3, spec_c4 = st.columns([1, 1, 1, 2])
 
@@ -4871,217 +4320,6 @@ with tab_review:
                 "Keep the window at 15 min for fast review chunks, or increase it for broader context."
             )
 
-    # ACh/photometry y-axis controls. The plotted trace stays raw; these controls
-    # only change the visible y-axis range so ACh dynamics are not flattened by artifacts.
-    ach_scale_c1, ach_scale_c2, ach_scale_c3, ach_scale_c4 = st.columns([1.4, 1, 1, 1])
-
-    with ach_scale_c1:
-        review_photometry_y_scale_label = st.selectbox(
-            "ACh y scale",
-            [
-                "Robust window autoscale",
-                "Full raw range",
-                "Manual range",
-            ],
-            index=0,
-            key="review_photometry_y_scale_mode",
-            help=(
-                "The ACh trace remains raw. Robust autoscale only clips the displayed y-axis "
-                "to percentiles of the current visible window, so outliers do not flatten the trace."
-            ),
-        )
-
-    review_photometry_y_mode = (
-        "robust" if review_photometry_y_scale_label == "Robust window autoscale"
-        else "manual" if review_photometry_y_scale_label == "Manual range"
-        else "full"
-    )
-
-    with ach_scale_c2:
-        review_photometry_low_pct = st.number_input(
-            "ACh low %",
-            min_value=0.0,
-            max_value=10.0,
-            value=1.0,
-            step=0.5,
-            key="review_photometry_low_percentile",
-            disabled=review_photometry_y_mode != "robust",
-        )
-
-    with ach_scale_c3:
-        review_photometry_high_pct = st.number_input(
-            "ACh high %",
-            min_value=90.0,
-            max_value=100.0,
-            value=99.0,
-            step=0.5,
-            key="review_photometry_high_percentile",
-            disabled=review_photometry_y_mode != "robust",
-        )
-
-    with ach_scale_c4:
-        st.caption(
-            "EEG, EMG and ACh already have independent y-axes. "
-            "Use box/zoom inside one panel to change only that panel's y-scale."
-        )
-
-    if review_photometry_y_mode == "manual":
-        manual_ach_c1, manual_ach_c2 = st.columns(2)
-        with manual_ach_c1:
-            review_photometry_manual_min = st.number_input(
-                "Manual ACh y min",
-                value=float(st.session_state.get("review_photometry_manual_min", -10.0)),
-                step=1.0,
-                key="review_photometry_manual_min",
-            )
-        with manual_ach_c2:
-            review_photometry_manual_max = st.number_input(
-                "Manual ACh y max",
-                value=float(st.session_state.get("review_photometry_manual_max", 10.0)),
-                step=1.0,
-                key="review_photometry_manual_max",
-            )
-    else:
-        review_photometry_manual_min = None
-        review_photometry_manual_max = None
-
-    # --------------------------------------------------------------
-    # Optional: attach/import ACh/fiber-photometry trace for an
-    # already-imported recording.
-    # --------------------------------------------------------------
-    with st.expander("Attach ACh / fiber-photometry trace to this recording", expanded=False):
-        st.caption(
-            "Use this when the ACh/fiber-photometry trace exists in the original .mat file "
-            "under a variable name such as `ne`, but no ach.npy/ne.npy file has been saved "
-            "inside the current recording folder yet."
-        )
-
-        st.write("Current recording folder")
-        st.code(str(recording_dir_review))
-
-        existing_photometry = find_photometry_trace(recording_dir_review, metadata_review)
-        if existing_photometry is not None:
-            st.success(
-                f"Current detected photometry file: {Path(existing_photometry['path']).name} "
-                f"| fs={existing_photometry.get('fs', 'unknown')} Hz"
-            )
-        else:
-            likely_files = []
-            for pattern in ["*ach*", "*ACh*", "*ne*", "*NE*", "*photo*", "*fp*"]:
-                likely_files.extend(sorted(recording_dir_review.glob(pattern)))
-            likely_files = list(dict.fromkeys(likely_files))
-
-            if likely_files:
-                st.warning(
-                    "No usable .npy photometry file was detected, but these similarly named files exist:"
-                )
-                st.dataframe(
-                    pd.DataFrame({
-                        "file": [p.name for p in likely_files],
-                        "suffix": [p.suffix for p in likely_files],
-                        "full_path": [str(p) for p in likely_files],
-                    }),
-                    use_container_width=True,
-                )
-            else:
-                st.info("No ach/ne/photometry/fp-like files found in this recording folder yet.")
-
-        attach_mat_file = st.text_input(
-            "Original .mat file containing the photometry variable",
-            value=str(metadata_review.get("source_mat_file", "")),
-            key=f"attach_photometry_mat_file_{recording_id_review}",
-        )
-
-        mat_keys = safe_mat_keys(attach_mat_file) if attach_mat_file else []
-
-        if attach_mat_file and mat_keys:
-            default_key_index = mat_keys.index("ne") if "ne" in mat_keys else 0
-            attach_photometry_key = st.selectbox(
-                "Photometry variable inside .mat",
-                mat_keys,
-                index=default_key_index,
-                key=f"attach_photometry_key_{recording_id_review}",
-            )
-        else:
-            if attach_mat_file:
-                st.warning("Could not read variables from this .mat file. Check the path.")
-            attach_photometry_key = st.text_input(
-                "Photometry variable inside .mat",
-                value="ne",
-                key=f"attach_photometry_key_text_{recording_id_review}",
-            )
-
-        attach_inferred_fs, attach_inferred_fs_source = infer_photometry_sampling_rate_from_mat(
-            mat_file=attach_mat_file,
-            photometry_key=attach_photometry_key,
-            fallback_fs=float(metadata_review.get("photometry_sampling_rate_hz", metadata_review.get("sampling_rate_hz", 1017.2526))),
-        )
-
-        attach_c1, attach_c2 = st.columns(2)
-        with attach_c1:
-            attach_output_name = st.text_input(
-                "Save as file name inside recording folder",
-                value="ach.npy",
-                key=f"attach_photometry_output_name_{recording_id_review}",
-                help="Use ach.npy or ne.npy. The Review plot auto-detects both.",
-            )
-        with attach_c2:
-            attach_photometry_fs = st.number_input(
-                "Photometry sampling rate, Hz",
-                min_value=1.0,
-                value=float(attach_inferred_fs),
-                step=1.0,
-                key=f"attach_photometry_fs_{recording_id_review}_{str(attach_photometry_key)}_{str(attach_inferred_fs_source)}",
-                help=(
-                    "The app tries to read the matching frequency variable from the .mat file. "
-                    "For `ne`, this is usually `ne_frequency`."
-                ),
-            )
-
-        if str(attach_photometry_key).strip():
-            st.caption(
-                f"Photometry sampling rate source: **{attach_inferred_fs_source}** "
-                f"→ {float(attach_photometry_fs):.3f} Hz"
-            )
-
-        if st.button("Import / attach photometry trace", key=f"attach_photometry_button_{recording_id_review}"):
-            if not attach_mat_file:
-                st.error("Paste the original .mat file path first.")
-            elif not Path(attach_mat_file).expanduser().exists():
-                st.error(f".mat file not found: {attach_mat_file}")
-            elif not str(attach_photometry_key).strip():
-                st.error("Enter or select the photometry variable name, for example `ne`.")
-            else:
-                try:
-                    out_phot = save_optional_photometry_from_mat(
-                        mat_file=attach_mat_file,
-                        project_root=project_root_review,
-                        recording_id=recording_id_review,
-                        photometry_key=attach_photometry_key,
-                        output_name=attach_output_name,
-                        sampling_rate_hz=attach_photometry_fs,
-                    )
-
-                    # Also remember the source .mat in metadata for future imports.
-                    metadata_path_review = recording_dir_review / "metadata.json"
-                    metadata_after = json.loads(metadata_path_review.read_text()) if metadata_path_review.exists() else {}
-                    metadata_after["source_mat_file"] = str(attach_mat_file)
-                    metadata_after["photometry_file"] = Path(out_phot).name
-                    metadata_after["photometry_sampling_rate_hz"] = float(attach_photometry_fs)
-                    metadata_after["photometry_sampling_rate_source"] = str(attach_inferred_fs_source)
-                    metadata_after["photometry_label"] = f"ACh / fiber photometry ({attach_photometry_key})"
-                    metadata_path_review.write_text(json.dumps(metadata_after, indent=2))
-
-                    st.cache_data.clear()
-                    st.success(f"Saved photometry trace to: {out_phot}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not import photometry trace: {repr(e)}")
-                    st.write(
-                        "Check that the variable name is correct. In many of your files it may be `ne`, "
-                        "but variable names are case-sensitive."
-                    )
-
     try:
         fig_review = get_cached_review_base_qc_plot(
             recording_dir=recording_dir_review,
@@ -5090,43 +4328,25 @@ with tab_review:
             show_spectrogram=show_review_spectrogram,
             spectrogram_fmax=review_spectrogram_fmax,
             spectrogram_window_sec=1.0,
-            spectrogram_overlap=float(review_spectrogram_overlap),
+            spectrogram_overlap=0.9,
             show_photometry=show_review_photometry,
-            photometry_y_mode=review_photometry_y_mode,
-            photometry_low_pct=float(review_photometry_low_pct),
-            photometry_high_pct=float(review_photometry_high_pct),
-            photometry_manual_min=review_photometry_manual_min,
-            photometry_manual_max=review_photometry_manual_max,
-            max_raw_points=int(review_max_raw_points),
-            spectrogram_max_time_bins=int(review_spectrogram_max_time_bins),
         )
 
-        # Active selected interval = the interval that scoring buttons/shortcuts will affect.
-        active_selection_start_min = float(
-            st.session_state.get("selected_label_start_min", selected_period[0])
-        )
-        active_selection_end_min = float(
-            st.session_state.get("selected_label_end_min", selected_period[1])
-        )
-
-        fig_review = add_active_selection_shade_to_fig(
-            fig_review,
-            active_start_min=active_selection_start_min,
-            active_end_min=active_selection_end_min,
-            visible_start_min=selected_start_min,
-            visible_end_min=selected_end_min,
+        # Red outline = pending selected period.
+        fig_review.add_vrect(
+            x0=float(selected_period[0]),
+            x1=float(selected_period[1]),
+            fillcolor="rgba(255, 0, 0, 0.04)",
+            line_width=1,
+            line_color="rgba(255, 0, 0, 0.75)",
+            row="all",
+            col=1,
         )
 
         # Add invisible selection helpers.
         # Row 1 helpers allow selecting a scoring bout using box-select.
         layer1_for_selection = read_csv_fast(recording_dir_review / "layer1_wake_sleep.csv") if "read_csv_fast" in globals() else pd.read_csv(recording_dir_review / "layer1_wake_sleep.csv")
         layer1_for_selection["time_min"] = layer1_for_selection["t0_s"] / 60
-        # Keep invisible selection-helper points only inside the visible window.
-        # This reduces Plotly JSON size and makes manual selection more responsive.
-        layer1_for_selection = layer1_for_selection[
-            (layer1_for_selection["time_min"].astype(float) >= float(selected_start_min))
-            & (layer1_for_selection["time_min"].astype(float) <= float(selected_end_min))
-        ].copy()
         selection_x = layer1_for_selection["time_min"].to_numpy(dtype=float)
 
         scoring_row_y = {
@@ -5277,85 +4497,11 @@ with tab_review:
         # Convert through Plotly JSON encoder so NumPy arrays become JSON-safe.
         fig_review_json_str = pio.to_json(fig_review, validate=False)
 
-        # --------------------------------------------------------------
-        # Tiny navigation strip immediately above the plot
-        # --------------------------------------------------------------
-        def _jump_review_window_close(delta_min):
-            new_start = max(
-                0.0,
-                min(float(max_window_start), float(selected_start_min) + float(delta_min)),
-            )
-            new_end = min(float(duration_min_review), new_start + float(fixed_window_min))
-
-            st.session_state.review_manual_start_min = float(new_start)
-            st.session_state.review_manual_window_min = float(fixed_window_min)
-
-            # Reset active scoring interval to the new visible window.
-            # This prevents accidentally scoring the previous window after moving.
-            st.session_state.selected_label_start_min = float(new_start)
-            st.session_state.selected_label_end_min = float(new_end)
-
-            st.session_state.review_window_slider_revision = (
-                st.session_state.get("review_window_slider_revision", 0) + 1
-            )
-            st.session_state.selected_period_slider_revision = (
-                st.session_state.get("selected_period_slider_revision", 0) + 1
-            )
-
-            st.rerun()
-
-        close_nav_top_c1, close_nav_top_c2, close_nav_top_c3, close_nav_top_c4, close_nav_top_c5 = st.columns([1, 1, 3, 1, 1])
-
-        with close_nav_top_c1:
-            if st.button("◀ 15 min", key=f"close_top_back_15_{recording_id_review}"):
-                _jump_review_window_close(-15.0)
-
-        with close_nav_top_c2:
-            if st.button("◀ 5 min", key=f"close_top_back_5_{recording_id_review}"):
-                _jump_review_window_close(-5.0)
-
-        with close_nav_top_c3:
-            st.caption(
-                f"Window: {selected_start_min:.2f}–{selected_end_min:.2f} min"
-            )
-
-        with close_nav_top_c4:
-            if st.button("5 min ▶", key=f"close_top_forward_5_{recording_id_review}"):
-                _jump_review_window_close(5.0)
-
-        with close_nav_top_c5:
-            if st.button("15 min ▶", key=f"close_top_forward_15_{recording_id_review}"):
-                _jump_review_window_close(15.0)
-
-
         interaction_event = plotly_relayout_viewer(
             fig_json_str=fig_review_json_str,
             height=980,
             key=review_plot_key,
         )
-
-        # Tiny navigation strip immediately below the plot
-        close_nav_bottom_c1, close_nav_bottom_c2, close_nav_bottom_c3, close_nav_bottom_c4, close_nav_bottom_c5 = st.columns([1, 1, 3, 1, 1])
-
-        with close_nav_bottom_c1:
-            if st.button("◀ 15 min", key=f"close_bottom_back_15_{recording_id_review}"):
-                _jump_review_window_close(-15.0)
-
-        with close_nav_bottom_c2:
-            if st.button("◀ 5 min", key=f"close_bottom_back_5_{recording_id_review}"):
-                _jump_review_window_close(-5.0)
-
-        with close_nav_bottom_c3:
-            st.caption("Use these buttons to move through the recording without scrolling.")
-
-        with close_nav_bottom_c4:
-            if st.button("5 min ▶", key=f"close_bottom_forward_5_{recording_id_review}"):
-                _jump_review_window_close(5.0)
-
-        with close_nav_bottom_c5:
-            if st.button("15 min ▶", key=f"close_bottom_forward_15_{recording_id_review}"):
-                _jump_review_window_close(15.0)
-
 
         selection_state = None
 
@@ -5377,137 +4523,7 @@ with tab_review:
         if interaction_event is not None and isinstance(interaction_event, dict):
             event_type = str(interaction_event.get("event_type", ""))
 
-            if event_type == "nav":
-                try:
-                    delta_min = float(interaction_event.get("delta_min", 0.0))
-                except Exception:
-                    delta_min = 0.0
-
-                event_timestamp = str(interaction_event.get("timestamp", ""))
-                event_signature = f"nav:{delta_min}:{event_timestamp}"
-                already_processed = (
-                    st.session_state.get(plotly_event_memory_key) == event_signature
-                )
-
-                if not already_processed:
-                    st.session_state[plotly_event_memory_key] = event_signature
-
-                    new_start = max(
-                        0.0,
-                        min(float(max_window_start), float(selected_start_min) + float(delta_min)),
-                    )
-                    new_end = min(float(duration_min_review), new_start + float(selected_window_min))
-
-                    st.session_state.review_manual_start_min = float(new_start)
-                    st.session_state.review_manual_window_min = float(selected_window_min)
-
-                    st.session_state.selected_label_start_min = float(new_start)
-                    st.session_state.selected_label_end_min = float(new_end)
-
-                    st.session_state.review_window_slider_revision = (
-                        st.session_state.get("review_window_slider_revision", 0) + 1
-                    )
-                    st.session_state.selected_period_slider_revision = (
-                        st.session_state.get("selected_period_slider_revision", 0) + 1
-                    )
-
-                    st.rerun()
-
-            elif event_type == "shortcut_no_selection":
-                st.warning(
-                    "Select an interval by dragging directly on the plot first. "
-                    "The app will not score the whole visible window automatically."
-                )
-
-            elif event_type == "shortcut":
-                shortcut = str(interaction_event.get("shortcut", "")).lower()
-                event_timestamp = str(interaction_event.get("timestamp", ""))
-
-                event_signature = f"shortcut:{shortcut}:{event_timestamp}"
-                already_processed = (
-                    st.session_state.get(plotly_event_memory_key) == event_signature
-                )
-
-                if not already_processed:
-                    st.session_state[plotly_event_memory_key] = event_signature
-
-                    try:
-                        shortcut_x0 = float(interaction_event.get("x0"))
-                        shortcut_x1 = float(interaction_event.get("x1"))
-                    except Exception:
-                        shortcut_x0 = None
-                        shortcut_x1 = None
-
-                    if shortcut_x0 is None or shortcut_x1 is None:
-                        st.warning(
-                            "Shortcut ignored: selected interval was not received. "
-                            "Drag on the plot again and then press the shortcut."
-                        )
-                    else:
-                        shortcut_x0 = max(
-                            float(selected_start_min),
-                            min(shortcut_x0, float(selected_end_min)),
-                        )
-                        shortcut_x1 = max(
-                            float(selected_start_min),
-                            min(shortcut_x1, float(selected_end_min)),
-                        )
-
-                        if shortcut_x1 <= shortcut_x0:
-                            st.warning("Shortcut ignored: selected interval is invalid.")
-                        else:
-                            st.session_state.selected_label_start_min = float(shortcut_x0)
-                            st.session_state.selected_label_end_min = float(shortcut_x1)
-
-                            label_map = {
-                                "wake": "Wake",
-                                "nrem": "NREM",
-                                "rem": "REM",
-                            }
-
-                            source_map = {
-                                "somnotate": "Somnotate",
-                                "layer1": "Layer 1",
-                                "manual": "Manual",
-                            }
-
-                            notes = f"mouse/keyboard shortcut: {shortcut}"
-
-                            if shortcut in label_map:
-                                ok, msg = apply_manual_label_fast(
-                                    recording_dir=recording_dir_review,
-                                    recording_id=recording_id_review,
-                                    start_s=shortcut_x0 * 60.0,
-                                    end_s=shortcut_x1 * 60.0,
-                                    label=label_map[shortcut],
-                                    notes=notes,
-                                )
-
-                            elif shortcut in source_map:
-                                ok, msg = apply_source_label_fast(
-                                    recording_dir=recording_dir_review,
-                                    recording_id=recording_id_review,
-                                    start_s=shortcut_x0 * 60.0,
-                                    end_s=shortcut_x1 * 60.0,
-                                    source_name=source_map[shortcut],
-                                    notes=notes,
-                                )
-
-                            else:
-                                ok, msg = False, f"Unknown shortcut: {shortcut}"
-
-                            if ok:
-                                try:
-                                    make_cached_review_base_qc_plot.clear()
-                                except Exception:
-                                    pass
-
-                                st.session_state.review_last_fast_action_msg = msg
-                                st.rerun()
-                            else:
-                                st.error(msg)
-
-            elif event_type == "relayout":
+            if event_type == "relayout":
                 try:
                     new_x0 = float(interaction_event.get("x0"))
                     new_x1 = float(interaction_event.get("x1"))
@@ -5560,93 +4576,39 @@ with tab_review:
                         st.rerun()
 
             elif event_type == "selection":
-                # Deprecated. Mouse selection is now handled inside the custom
-                # Plotly component so selecting an interval does not rerun Streamlit.
-                pass
+                try:
+                    sel_x0 = float(interaction_event.get("x0"))
+                    sel_x1 = float(interaction_event.get("x1"))
+                except Exception:
+                    sel_x0 = None
+                    sel_x1 = None
 
-            elif event_type == "shortcut":
-                shortcut = str(interaction_event.get("shortcut", "")).lower()
-                event_timestamp = str(interaction_event.get("timestamp", ""))
+                if sel_x0 is not None and sel_x1 is not None:
+                    sel_x0 = max(float(selected_start_min), min(sel_x0, float(selected_end_min)))
+                    sel_x1 = max(float(selected_start_min), min(sel_x1, float(selected_end_min)))
 
-                # Avoid processing the same shortcut event again after st.rerun().
-                event_signature = f"shortcut:{shortcut}:{event_timestamp}"
-                already_processed = (
-                    st.session_state.get(plotly_event_memory_key) == event_signature
-                )
+                    if sel_x1 > sel_x0:
+                        current_sel0 = float(st.session_state.get("selected_label_start_min", selected_period[0]))
+                        current_sel1 = float(st.session_state.get("selected_label_end_min", selected_period[1]))
 
-                if not already_processed:
-                    st.session_state[plotly_event_memory_key] = event_signature
+                        selection_changed = (
+                            abs(sel_x0 - current_sel0) > plotly_event_tol_min
+                            or abs(sel_x1 - current_sel1) > plotly_event_tol_min
+                        )
 
-                    shortcut_sel0 = float(
-                        st.session_state.get("selected_label_start_min", selected_period[0])
-                    )
-                    shortcut_sel1 = float(
-                        st.session_state.get("selected_label_end_min", selected_period[1])
-                    )
+                        event_signature = f"selection:{sel_x0:.3f}:{sel_x1:.3f}"
+                        already_processed = (
+                            st.session_state.get(plotly_event_memory_key) == event_signature
+                        )
 
-                    # Clamp to the current visible window so shortcuts never score
-                    # a previous window after navigation.
-                    shortcut_sel0 = max(
-                        float(selected_start_min),
-                        min(shortcut_sel0, float(selected_end_min)),
-                    )
-                    shortcut_sel1 = max(
-                        float(selected_start_min),
-                        min(shortcut_sel1, float(selected_end_min)),
-                    )
-
-                    if shortcut_sel1 <= shortcut_sel0:
-                        st.error("Shortcut ignored: selected interval is invalid.")
-                    else:
-                        shortcut_notes = f"keyboard shortcut: {shortcut}"
-
-                        label_map = {
-                            "wake": "Wake",
-                            "nrem": "NREM",
-                            "rem": "REM",
-                        }
-
-                        source_map = {
-                            "somnotate": "Somnotate",
-                            "layer1": "Layer 1",
-                            "manual": "Manual",
-                        }
-
-                        if shortcut in label_map:
-                            ok, msg = apply_manual_label_fast(
-                                recording_dir=recording_dir_review,
-                                recording_id=recording_id_review,
-                                start_s=shortcut_sel0 * 60.0,
-                                end_s=shortcut_sel1 * 60.0,
-                                label=label_map[shortcut],
-                                notes=shortcut_notes,
+                        if selection_changed and not already_processed:
+                            st.session_state[plotly_event_memory_key] = event_signature
+                            st.session_state.selected_label_start_min = float(sel_x0)
+                            st.session_state.selected_label_end_min = float(sel_x1)
+                            st.session_state.selected_period_slider_revision = (
+                                st.session_state.get("selected_period_slider_revision", 0) + 1
                             )
-
-                        elif shortcut in source_map:
-                            ok, msg = apply_source_label_fast(
-                                recording_dir=recording_dir_review,
-                                recording_id=recording_id_review,
-                                start_s=shortcut_sel0 * 60.0,
-                                end_s=shortcut_sel1 * 60.0,
-                                source_name=source_map[shortcut],
-                                notes=shortcut_notes,
-                            )
-
-                        else:
-                            ok, msg = False, f"Unknown shortcut: {shortcut}"
-
-                        if ok:
-                            # Refresh final scoring row after applying the shortcut.
-                            try:
-                                make_cached_review_base_qc_plot.clear()
-                            except Exception:
-                                pass
-
-                            st.session_state.review_last_fast_action_msg = msg
                             st.rerun()
-                        else:
-                            st.error(msg)
-
 
         parsed = parse_review_plot_selection(selection_state)
 
@@ -5694,164 +4656,6 @@ with tab_review:
                         st.session_state.get("selected_period_slider_revision", 0) + 1
                     )
                     # No explicit st.rerun() here.
-
-        # --------------------------------------------------------------
-        # Fast action bar directly below the plot
-        # --------------------------------------------------------------
-        st.markdown("#### Fast scoring controls")
-
-        action_sel0 = float(st.session_state.get("selected_label_start_min", selected_start_min))
-        action_sel1 = float(st.session_state.get("selected_label_end_min", selected_end_min))
-
-        # Always clamp the action interval to the currently visible signal window.
-        action_sel0 = max(float(selected_start_min), min(action_sel0, float(selected_end_min)))
-        action_sel1 = max(float(selected_start_min), min(action_sel1, float(selected_end_min)))
-
-        if action_sel1 <= action_sel0:
-            action_sel1 = min(float(selected_end_min), action_sel0 + 0.5)
-
-        st.session_state.selected_label_start_min = float(action_sel0)
-        st.session_state.selected_label_end_min = float(action_sel1)
-
-        sel_duration_s = (action_sel1 - action_sel0) * 60.0
-
-        st.info(
-            f"Active selected period: **{action_sel0:.2f}–{action_sel1:.2f} min** "
-            f"({sel_duration_s:.1f} s). Buttons below will apply to this interval."
-        )
-
-        quick_top_c1, quick_top_c2, quick_top_c3, quick_top_c4 = st.columns([1, 1, 1, 2])
-
-        with quick_top_c1:
-            if st.button("Use visible window", key=f"bottom_use_visible_window_{recording_id_review}"):
-                st.session_state.selected_label_start_min = float(selected_start_min)
-                st.session_state.selected_label_end_min = float(selected_end_min)
-                st.session_state.selected_period_slider_revision = (
-                    st.session_state.get("selected_period_slider_revision", 0) + 1
-                )
-                st.rerun()
-
-        with quick_top_c2:
-            if st.button("Undo pending", key=f"bottom_undo_pending_{recording_id_review}"):
-                ok, msg = undo_last_pending_review_edit(
-                    recording_dir=recording_dir_review,
-                    recording_id=recording_id_review,
-                )
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.info(msg)
-
-        with quick_top_c3:
-            if st.button("Commit edits", type="primary", key=f"bottom_commit_pending_{recording_id_review}"):
-                ok, msg = commit_pending_review_edits(
-                    recording_dir=recording_dir_review,
-                    recording_id=recording_id_review,
-                )
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.info(msg)
-
-        with quick_top_c4:
-            bottom_notes = st.text_input(
-                "Notes",
-                value="review edit",
-                key=f"bottom_selected_period_notes_{recording_id_review}",
-                label_visibility="collapsed",
-                placeholder="Notes for this edit",
-            )
-
-        accept_cols = st.columns(3)
-
-        with accept_cols[0]:
-            if st.button("Accept Somnotate", key=f"bottom_accept_somnotate_{recording_id_review}"):
-                ok, msg = queue_source_label_fast(
-                    recording_dir=recording_dir_review,
-                    recording_id=recording_id_review,
-                    start_s=action_sel0 * 60.0,
-                    end_s=action_sel1 * 60.0,
-                    source_name="Somnotate",
-                    notes=str(bottom_notes),
-                )
-                st.success(msg) if ok else st.error(msg)
-
-        with accept_cols[1]:
-            if st.button("Accept Manual", key=f"bottom_accept_manual_{recording_id_review}"):
-                ok, msg = queue_source_label_fast(
-                    recording_dir=recording_dir_review,
-                    recording_id=recording_id_review,
-                    start_s=action_sel0 * 60.0,
-                    end_s=action_sel1 * 60.0,
-                    source_name="Manual",
-                    notes=str(bottom_notes),
-                )
-                st.success(msg) if ok else st.error(msg)
-
-        with accept_cols[2]:
-            if st.button("Accept Layer 1", key=f"bottom_accept_layer1_{recording_id_review}"):
-                ok, msg = queue_source_label_fast(
-                    recording_dir=recording_dir_review,
-                    recording_id=recording_id_review,
-                    start_s=action_sel0 * 60.0,
-                    end_s=action_sel1 * 60.0,
-                    source_name="Layer 1",
-                    notes=str(bottom_notes),
-                )
-                st.success(msg) if ok else st.error(msg)
-
-        score_cols = st.columns(5)
-        bottom_quick_label = None
-
-        with score_cols[0]:
-            if st.button("1 = Wake", key=f"bottom_score_wake_{recording_id_review}", type="primary"):
-                bottom_quick_label = "Wake"
-
-        with score_cols[1]:
-            if st.button("2 = NREM", key=f"bottom_score_nrem_{recording_id_review}", type="primary"):
-                bottom_quick_label = "NREM"
-
-        with score_cols[2]:
-            if st.button("3 = REM", key=f"bottom_score_rem_{recording_id_review}", type="primary"):
-                bottom_quick_label = "REM"
-
-        with score_cols[3]:
-            if st.button("Uncertain", key=f"bottom_score_uncertain_{recording_id_review}"):
-                bottom_quick_label = "Uncertain"
-
-        with score_cols[4]:
-            if st.button("Artifact", key=f"bottom_score_artifact_{recording_id_review}"):
-                bottom_quick_label = "Artifact"
-
-        if bottom_quick_label is not None:
-            ok, msg = queue_manual_label_fast(
-                recording_dir=recording_dir_review,
-                recording_id=recording_id_review,
-                start_s=action_sel0 * 60.0,
-                end_s=action_sel1 * 60.0,
-                label=bottom_quick_label,
-                notes=str(bottom_notes),
-            )
-            st.success(msg) if ok else st.error(msg)
-
-        bottom_pending = sync_pending_review_edits(
-            recording_dir=recording_dir_review,
-            recording_id=recording_id_review,
-        )
-
-        if len(bottom_pending) > 0:
-            st.caption(
-                f"{len(bottom_pending)} pending edit(s). "
-                "They are queued for commit; the big plot is not recolored after every click to keep review fast."
-            )
-
-            with st.expander("Show pending edits here", expanded=False):
-                st.dataframe(pd.DataFrame(bottom_pending), width="stretch", height=180)
-        else:
-            st.caption("No pending edits yet.")
-
 
         if "clicked_bout_start_min" in st.session_state:
             st.success(
