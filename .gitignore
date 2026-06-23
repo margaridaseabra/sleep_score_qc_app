@@ -45,3 +45,63 @@ app_backup*.py
 *backup*.py
 *backup*.sh
 *_backup_*
+
+# Local docs backups
+README_old*.md
+START_HERE_old*.md
+*_old_streamlit_backup.md
+
+# Local / generated files
+__pycache__/
+*.pyc
+.DS_Store
+
+# Large data / recordings
+*.mat
+*.npy
+*.npz
+*.h5
+*.hdf5
+recordings/
+Data/
+prepared_data/
+
+# Local backups and patches
+*.zip
+*backup*.py
+*backup*.sh
+*_backup_*
+dash_app_backup*/
+app_backup*.py
+final_scoring_before_empty_reset.csv
+final_scoring_backup_*.csv
+
+# Local docs backups
+README_old*.md
+START_HERE_old*.md
+*_old_streamlit_backup.md
+
+# Local / generated files
+__pycache__/
+*.pyc
+.DS_Store
+
+# Large data / recordings
+*.mat
+*.npy
+*.npz
+*.h5
+*.hdf5
+recordings/
+Data/
+prepared_data/
+
+# Local backups and patches
+*.zip
+*backup*.py
+*backup*.sh
+*_backup_*
+dash_app_backup*/
+app_backup*.py
+final_scoring_before_empty_reset.csv
+final_scoring_backup_*.csv
