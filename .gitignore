@@ -105,3 +105,11 @@ dash_app_backup*/
 app_backup*.py
 final_scoring_before_empty_reset.csv
 final_scoring_backup_*.csv
+
+.local_backups_not_committed/
+*backup*.py
+*backup*.sh
+*_backup_*
+dash_app_backup*/
+*.zip
+dash_migration_v2_patch/
