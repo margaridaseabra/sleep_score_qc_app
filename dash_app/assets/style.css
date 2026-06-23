@@ -291,3 +291,15 @@ input, textarea, select {
   background: #111827;
   border-color: #1f2937;
 }
+
+.video-qc-card {
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--border-color, #d9dde7);
+  border-radius: 12px;
+  background: var(--card-bg, #ffffff);
+}
+
+.video-qc-card video {
+  display: block;
+}

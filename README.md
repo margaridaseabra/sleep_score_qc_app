@@ -66,6 +66,12 @@ conda env create -f environment.yml
 conda activate sleep_stage_qc_v2
 ```
 
+If the environment already exists under a different name, activate that environment instead. For example:
+
+```bash
+conda activate sleep_app
+```
+
 ### 3. Launch the Dash app
 
 ```bash
