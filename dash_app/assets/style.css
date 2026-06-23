@@ -255,3 +255,39 @@ input, textarea, select {
   background: #1f2937 !important;
   color: #c4b5fd !important;
 }
+
+.qc-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+}
+
+.theme-dark .qc-mode-bar {
+  background: #111827;
+  border-color: #1f2937;
+}
+
+.qc-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 10px 0 12px 0;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+}
+
+.theme-dark .qc-mode-bar {
+  background: #111827;
+  border-color: #1f2937;
+}

@@ -329,26 +329,41 @@ def robust_range(x: np.ndarray, low=1, high=99, pad=0.08):
 # Recording loading
 # -----------------------------------------------------------------------------
 def ensure_final_scoring(recording_dir: Path, recording_id: str) -> Path:
+    """
+    Create final_scoring.csv if missing.
+
+    Important:
+    Final scoring starts EMPTY by default.
+    The app should not automatically copy Layer 1, Somnotate, or Manual scoring into Final.
+    The reviewer must explicitly add labels.
+    """
     final_file = recording_dir / "final_scoring.csv"
+
     if final_file.exists():
         return final_file
+
     layer1_file = recording_dir / "layer1_wake_sleep.csv"
+
     if not layer1_file.exists():
         raise FileNotFoundError(layer1_file)
+
     layer1 = pd.read_csv(layer1_file)
+
     out = pd.DataFrame()
     out["recording_id"] = recording_id
     out["epoch_id"] = np.arange(len(layer1))
     out["t0_s"] = layer1["t0_s"].astype(float)
     out["t1_s"] = layer1["t1_s"].astype(float)
-    # Final scoring starts empty by default.
-    # Manual / Layer 1 / Somnotate rows are shown separately; the Final row is filled only when the reviewer accepts or edits labels.
+
+    # Empty by default
     out["final_state"] = "Undefined"
     out["final_code"] = -1
     out["final_source"] = "empty_default"
     out["review_status"] = "not_reviewed"
     out["review_notes"] = ""
+
     out.to_csv(final_file, index=False)
+
     return final_file
 
 
@@ -680,7 +695,7 @@ def make_review_figure(
         height=980,
         margin=dict(l=75, r=25, t=95, b=45),
         hovermode="x unified",
-        dragmode="select",
+        dragmode="pan",
         uirevision=f"{recording_id}-{start_min}-{window_min}",
         showlegend=True,
         legend=dict(
@@ -850,6 +865,25 @@ def export_final(project_root: str, recording_id: str):
     return True, f"Exported CSV:\n{csv_out}\nMAT export skipped because scipy.io.savemat is unavailable."
 
 
+
+def refresh_qc_figure_after_scoring(project_root, recording_id, window_data):
+    """
+    Redraw the full QC figure after scoring.
+
+    This is needed because the faint colours over the raw traces are drawn
+    from Final scoring. If we only patch the scoring row, the raw-signal
+    background does not update.
+    """
+    if not project_root or not recording_id:
+        return no_update
+
+    window_data = window_data or {}
+    start = float(window_data.get("start_min", 0.0))
+    wmin = float(window_data.get("window_min", 15.0))
+
+    return make_review_figure(project_root, recording_id, start, wmin)
+
+
 def patch_scoring_heatmap(project_root: str, recording_id: str, window_data: dict[str, Any]):
     rec = load_recording(project_root, recording_id)
     start = float(window_data.get("start_min", 0.0))
@@ -928,6 +962,20 @@ app.layout = html.Div(
             dcc.Tab(label="4. Dissociation", value="tab-stats"),
             dcc.Tab(label="About", value="tab-about"),
         ]),
+
+        html.Div(
+            className="qc-mode-bar",
+            children=[
+                html.Div("QC mouse mode:", style={"fontWeight": "700"}),
+                html.Button("Pan / move recording", id="global-qc-mode-pan", n_clicks=0),
+                html.Button("Select window for scoring", id="global-qc-mode-select-window", n_clicks=0),
+                html.Div(
+                    id="global-qc-mode-status",
+                    className="status-line",
+                    children="Pan is active by default. Press Select window for scoring, then drag on the QC plot.",
+                ),
+            ],
+        ),
         html.Div(id="tab-content", style={"paddingTop": "12px"}),
     ],
 )
@@ -971,7 +1019,20 @@ app.validation_layout = html.Div([
     html.Button(id="forward-5"), html.Button(id="forward-15"), html.Div(id="window-label"),
     html.Button(id="qc-refresh-diss-events"), html.Button(id="qc-prev-diss-event"),
     PDropdown(id="qc-diss-event-dropdown"), html.Button(id="qc-next-diss-event"), html.Div(id="qc-diss-event-status"),
-    dcc.Graph(id="qc-graph"), html.Div(id="selected-interval-label"),
+    
+                html.Div(className="qc-mode-bar", children=[
+                    html.Div("Mouse mode:", style={"fontWeight": "700"}),
+                    html.Button("Pan / move recording", id="qc-mode-pan", n_clicks=0),
+                    html.Button("Select window for scoring", id="qc-mode-select-window", n_clicks=0),
+                    html.Div(id="qc-mode-status", className="status-line"),
+                ]),
+dcc.Graph(id="qc-graph"),
+    html.Button(id="qc-mode-pan"),
+    html.Button(id="qc-mode-select-window"),
+    html.Div(id="qc-mode-status"),
+    dcc.RangeSlider(id="qc-window-range-slider"),
+    html.Div(id="qc-window-range-label"),
+    html.Div(id="selected-interval-label"),
     html.Button(id="score-wake"), html.Button(id="score-nrem"), html.Button(id="score-rem"),
     html.Button(id="score-somnotate"), html.Button(id="score-layer1"), html.Button(id="score-manual"),
     html.Button(id="score-window-somnotate"), html.Button(id="score-window-layer1"), html.Button(id="score-window-manual"),
@@ -1087,6 +1148,28 @@ def render_tab(tab, project_root, _refresh):
                     html.Div(id="window-label", style={"textAlign":"center","fontWeight":"bold"}),
                     html.Button("5 min ▶", id="forward-5"), html.Button("15 min ▶", id="forward-15"),
                 ]),
+
+                html.Div(className="timeline-card", children=[
+                    html.Div(
+                        style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"},
+                        children=[
+                            html.Div("Recording position", style={"fontWeight": "700"}),
+                            html.Div("Drag the highlighted window to move through the recording.", className="app-subtitle"),
+                        ],
+                    ),
+                    dcc.RangeSlider(
+                        id="qc-window-range-slider",
+                        min=0,
+                        max=1,
+                        step=0.25,
+                        value=[0, 1],
+                        allowCross=False,
+                        disabled=True,
+                        marks={0: "0", 1: "1"},
+                        tooltip={"placement": "bottom", "always_visible": False},
+                    ),
+                    html.Div(id="qc-window-range-label", className="status-line"),
+                ]),
                 html.Div(className="queue-box", children=[
                     html.H4("Dissociation review queue"),
                     html.Div("Run dissociation analysis first, then refresh here to jump through the most suspicious events.", className="app-subtitle"),
@@ -1116,7 +1199,7 @@ def render_tab(tab, project_root, _refresh):
                     html.Button("Undo last action", id="btn-undo"),
                     html.Button("Export final scoring", id="btn-export"),
                     html.Button("Reset Final to empty", id="btn-reset-final-empty"),
-                    html.Div("Shortcuts: 1 Wake, 2 NREM, 3 REM, s Somnotate, l Layer 1, m Manual"),
+                    html.Div("Shortcuts: P Pan, S Select window, 1 Wake, 2 NREM, 3 REM, A Somnotate/automatic, L Layer 1, M Manual"),
                 ]),
                 html.Div(id="score-status", className="status-line", style={"whiteSpace":"pre-wrap"}),
             ]),
@@ -1395,6 +1478,85 @@ def load_recording_cb(n, project_root, recording_id):
         )
 
 
+
+@app.callback(
+    Output("qc-window-range-slider", "min"),
+    Output("qc-window-range-slider", "max"),
+    Output("qc-window-range-slider", "value"),
+    Output("qc-window-range-slider", "marks"),
+    Output("qc-window-range-slider", "disabled"),
+    Output("qc-window-range-label", "children"),
+    Input("window-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+)
+def sync_qc_window_range_slider(window, project_root, recording_id):
+    """
+    Show where the current QC window sits inside the full recording.
+    The highlighted slider interval is the visible window.
+    """
+    if not project_root or not recording_id:
+        return 0, 1, [0, 1], {0: "0", 1: "1"}, True, "Load a recording to use the timeline."
+
+    try:
+        rec = load_recording(project_root, recording_id)
+        duration_min = float(rec["duration_s"]) / 60.0
+
+        start = float((window or {}).get("start_min", 0.0))
+        window_min = float((window or {}).get("window_min", 15.0))
+        end = min(duration_min, start + window_min)
+
+        start = max(0.0, min(start, duration_min))
+        end = max(start + 0.1, min(end, duration_min))
+
+        # Keep marks sparse and readable.
+        marks = {}
+        for x in np.linspace(0, duration_min, 5):
+            marks[round(float(x), 2)] = f"{x:.0f}"
+
+        label = f"Visible window: {start:.2f}–{end:.2f} min / total {duration_min:.2f} min"
+
+        return 0, max(duration_min, 1.0), [round(start, 3), round(end, 3)], marks, False, label
+
+    except Exception as e:
+        return 0, 1, [0, 1], {0: "0", 1: "1"}, True, f"Timeline unavailable: {type(e).__name__}: {e}"
+
+
+@app.callback(
+    Output("window-store", "data", allow_duplicate=True),
+    Input("qc-window-range-slider", "value"),
+    State("window-store", "data"),
+    prevent_initial_call=True,
+)
+def move_window_from_qc_timeline(value, current_window):
+    """
+    Move the visible QC window by dragging the small recording timeline.
+    """
+    if not value or len(value) < 2:
+        return no_update
+
+    try:
+        start = float(value[0])
+        end = float(value[1])
+    except Exception:
+        return no_update
+
+    if end <= start:
+        return no_update
+
+    window_min = end - start
+
+    old_start = float((current_window or {}).get("start_min", -9999))
+    old_window = float((current_window or {}).get("window_min", -9999))
+
+    # Avoid feedback loops when the callback only reflects the current value.
+    if abs(old_start - start) < 0.01 and abs(old_window - window_min) < 0.01:
+        return no_update
+
+    return {"start_min": start, "window_min": window_min}
+
+
+
 @app.callback(
     Output("window-store", "data", allow_duplicate=True),
     Input("back-15", "n_clicks"), Input("back-5", "n_clicks"), Input("forward-5", "n_clicks"), Input("forward-15", "n_clicks"),
@@ -1421,28 +1583,83 @@ def update_window(window, project_root, recording_id):
     return make_review_figure(project_root, recording_id, start, wmin), f"Window: {start:.2f}–{end:.2f} min", None
 
 
-@app.callback(Output("selected-interval-store", "data"), Output("selected-interval-label", "children"), Output("qc-graph", "figure", allow_duplicate=True), Input("qc-graph", "selectedData"), State("qc-graph", "figure"), prevent_initial_call=True)
+@app.callback(
+    Output("selected-interval-store", "data"),
+    Output("selected-interval-label", "children"),
+    Output("qc-graph", "figure", allow_duplicate=True),
+    Input("qc-graph", "selectedData"),
+    State("qc-graph", "figure"),
+    prevent_initial_call=True,
+)
 def update_selection(selected, fig):
-    if not selected: return no_update, no_update, no_update
+    if not selected:
+        return no_update, no_update, no_update
+
     x0 = x1 = None
+
     if "range" in selected:
         r = selected["range"]
-        if "x" in r: x0, x1 = r["x"]
+
+        if "x" in r:
+            x0, x1 = r["x"]
         else:
             for k, v in r.items():
-                if str(k).lower().startswith("x") and isinstance(v, list) and len(v)>=2:
-                    x0, x1 = v[0], v[1]; break
+                if str(k).lower().startswith("x") and isinstance(v, list) and len(v) >= 2:
+                    x0, x1 = v[0], v[1]
+                    break
+
     if x0 is None and selected.get("points"):
         xs = [p.get("x") for p in selected["points"] if "x" in p]
-        if len(xs)>=2: x0, x1 = min(xs), max(xs)
-    if x0 is None or x1 is None: return no_update, "Could not read selected interval.", no_update
-    x0 = float(x0); x1 = float(x1)
-    if x1 < x0: x0, x1 = x1, x0
-    if x1 <= x0: return no_update, "Invalid selected interval.", no_update
+        if len(xs) >= 2:
+            x0, x1 = min(xs), max(xs)
+
+    if x0 is None or x1 is None:
+        return no_update, "Could not read selected interval.", no_update
+
+    x0 = float(x0)
+    x1 = float(x1)
+
+    if x1 < x0:
+        x0, x1 = x1, x0
+
+    if x1 <= x0:
+        return no_update, "Invalid selected interval.", no_update
+
     patch = Patch()
-    patch["layout"]["shapes"] = [{"type":"rect", "xref":"x", "yref":"paper", "x0":x0, "x1":x1, "y0":0, "y1":1, "fillcolor":"rgba(0,120,255,0.12)", "line":{"color":"rgba(0,90,220,0.95)", "width":2}, "layer":"above"}]
-    dur = (x1-x0)*60
-    return {"start_min":x0, "end_min":x1}, f"Selected interval: {x0:.2f}–{x1:.2f} min ({dur:.1f} s)", patch
+
+    # Preserve existing final-score background shapes.
+    existing_shapes = []
+    try:
+        existing_shapes = [
+            s for s in fig.get("layout", {}).get("shapes", [])
+            if s.get("name") != "selected_interval"
+        ]
+    except Exception:
+        existing_shapes = []
+
+    selected_shape = {
+        "type": "rect",
+        "name": "selected_interval",
+        "xref": "x",
+        "yref": "paper",
+        "x0": x0,
+        "x1": x1,
+        "y0": 0,
+        "y1": 1,
+        "fillcolor": "rgba(0,120,255,0.13)",
+        "line": {"color": "rgba(0,90,220,0.95)", "width": 2},
+        "layer": "above",
+    }
+
+    patch["layout"]["shapes"] = existing_shapes + [selected_shape]
+
+    dur = (x1 - x0) * 60.0
+
+    return (
+        {"start_min": x0, "end_min": x1},
+        f"Selected interval: {x0:.2f}–{x1:.2f} min ({dur:.1f} s)",
+        patch,
+    )
 
 
 @app.callback(Output("score-status", "children"), Output("qc-graph", "figure", allow_duplicate=True), Input("score-wake", "n_clicks"), Input("score-nrem", "n_clicks"), Input("score-rem", "n_clicks"), Input("score-somnotate", "n_clicks"), Input("score-layer1", "n_clicks"), Input("score-manual", "n_clicks"), Input("score-window-somnotate", "n_clicks"), Input("score-window-layer1", "n_clicks"), Input("score-window-manual", "n_clicks"), Input("btn-reset-final-empty", "n_clicks"), Input("btn-undo", "n_clicks"), Input("btn-export", "n_clicks"), State("selected-interval-store", "data"), State("project-root-store", "data"), State("recording-id-store", "data"), State("window-store", "data"), prevent_initial_call=True)
@@ -1455,7 +1672,7 @@ def score_or_export(*args):
 
     if trig == "btn-undo":
         ok, msg = undo_last_action(project_root, recording_id)
-        return msg, patch_scoring_heatmap(project_root, recording_id, window) if ok else no_update
+        return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update
 
     if trig == "btn-export":
         ok, msg = export_final(project_root, recording_id)
@@ -1463,7 +1680,7 @@ def score_or_export(*args):
 
     if trig == "btn-reset-final-empty":
         ok, msg = reset_final_to_empty(project_root, recording_id)
-        return msg, patch_scoring_heatmap(project_root, recording_id, window) if ok else no_update
+        return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update
 
     # Determine whether to apply to selected interval or full visible window.
     window_buttons = {"score-window-somnotate", "score-window-layer1", "score-window-manual"}
@@ -1496,7 +1713,7 @@ def score_or_export(*args):
 
     if ok:
         msg = f"{msg} Applied to {scope_text}: {start:.2f}–{end:.2f} min."
-    return msg, patch_scoring_heatmap(project_root, recording_id, window) if ok else no_update
+    return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update
 
 
 # -----------------------------------------------------------------------------
@@ -1523,6 +1740,36 @@ def run_somnotate(n_exist, n_train, n_import, project_root, rec_ids, target_fs, 
     return f"$ {' '.join(cmd)}\n\n{out}"
 
 
+
+
+
+# -----------------------------------------------------------------------------
+# QC mouse mode: pan vs select scoring window
+# -----------------------------------------------------------------------------
+@app.callback(
+    Output("qc-graph", "figure", allow_duplicate=True),
+    Output("qc-mode-status", "children"),
+    Input("qc-mode-pan", "n_clicks"),
+    Input("qc-mode-select-window", "n_clicks"),
+    State("qc-graph", "figure"),
+    prevent_initial_call=True,
+)
+def set_qc_mouse_mode_select_window(n_pan, n_select, fig):
+    if not fig:
+        return no_update, "Load a recording first."
+
+    trig = callback_context.triggered_id
+
+    patch = Patch()
+
+    if trig == "qc-mode-select-window":
+        patch["layout"]["dragmode"] = "select"
+        patch["layout"]["selectdirection"] = "h"
+        return patch, "Select mode active: drag horizontally over the signal to choose a scoring window."
+
+    patch["layout"]["dragmode"] = "pan"
+    patch["layout"]["selectdirection"] = "h"
+    return patch, "Pan mode active: drag the plot to move through the recording."
 
 
 # -----------------------------------------------------------------------------
@@ -1903,6 +2150,7 @@ def state_bouts_from_epoch_table(df, state_col, start_min, end_min):
 
 
 def add_scoring_background_to_raw_panels(fig, rec, start_min, end_min, raw_rows, source="Final"):
+    source = "Final"  # force final-score shading
     """
     Add light scoring-colour shading over raw signal panels.
 
@@ -2201,6 +2449,36 @@ app.clientside_callback(
     Output("project-status", "data-shortcuts"),
     Input("main-tabs", "value"),
 )
+
+
+
+
+# -----------------------------------------------------------------------------
+# Global QC mouse mode controls
+# -----------------------------------------------------------------------------
+@app.callback(
+    Output("qc-graph", "figure", allow_duplicate=True),
+    Output("global-qc-mode-status", "children"),
+    Input("global-qc-mode-pan", "n_clicks"),
+    Input("global-qc-mode-select-window", "n_clicks"),
+    State("qc-graph", "figure"),
+    prevent_initial_call=True,
+)
+def set_global_qc_mouse_mode_select_window(n_pan, n_select, fig):
+    if not fig:
+        return no_update, "Load a recording in QC / Review first."
+
+    trig = callback_context.triggered_id
+    patch = Patch()
+
+    if trig == "global-qc-mode-select-window":
+        patch["layout"]["dragmode"] = "select"
+        patch["layout"]["selectdirection"] = "h"
+        return patch, "Select mode active: drag horizontally on the QC plot to choose a scoring window."
+
+    patch["layout"]["dragmode"] = "pan"
+    patch["layout"]["selectdirection"] = "h"
+    return patch, "Pan mode active: drag the QC plot to move through the recording."
 
 
 if __name__ == "__main__":
