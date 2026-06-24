@@ -777,7 +777,7 @@ def make_review_figure(
             row=spec_row,
             col=1,
         )
-        fig.update_yaxes(title_text="Hz", range=[0.5, 30.0], row=spec_row, col=1)
+        fig.update_yaxes(title_text="Hz", range=[0.5, 20.0], row=spec_row, col=1)
     else:
         fig.add_annotation(
             text="Spectrogram unavailable. Install scipy or check EEG signal length.",
@@ -790,7 +790,7 @@ def make_review_figure(
             row=spec_row,
             col=1,
         )
-        fig.update_yaxes(title_text="Hz", range=[0.5, 30.0], row=spec_row, col=1)
+        fig.update_yaxes(title_text="Hz", range=[0.5, 20.0], row=spec_row, col=1)
 
     # -----------------------------
     # Raw EMG — black
