@@ -122,6 +122,7 @@ The viewer can show:
 
 - scoring rows
 - raw EEG
+- EEG spectrogram
 - raw EMG
 - optional ACh/fiber photometry
 - state probabilities
@@ -160,7 +161,7 @@ Examples:
 | Video starts 10 s after EEG | `10` |
 | Video starts 5 s before EEG | `-5` |
 
-The video panel has buttons to jump the video to the current QC window start or to the selected scoring interval.
+The video panel has buttons to jump the video to the current QC window start or to play only the selected scoring interval. When playing a selected interval, the video automatically pauses at the end of that selected period.
 
 ### 3. Somnotate
 

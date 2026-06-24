@@ -113,3 +113,7 @@ final_scoring_backup_*.csv
 dash_app_backup*/
 *.zip
 dash_migration_v2_patch/
+
+.local_backups_not_committed/
+dash_app/app_backup*.py
+*.zip

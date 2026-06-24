@@ -28,6 +28,11 @@ except Exception:
     loadmat = None
     savemat = None
 
+try:
+    from scipy.signal import spectrogram as scipy_spectrogram
+except Exception:
+    scipy_spectrogram = None
+
 
 APP_DIR = Path(__file__).resolve().parents[1]
 PIPELINES_DIR = APP_DIR / "pipelines"
@@ -436,6 +441,80 @@ def robust_range(x: np.ndarray, low=1, high=99, pad=0.08):
     return [a - p, b + p]
 
 
+def compute_eeg_spectrogram_window(
+    npy_path: Path,
+    fs: float,
+    start_s: float,
+    end_s: float,
+    max_freq_hz: float = 30.0,
+    nperseg_s: float = 4.0,
+    overlap_fraction: float = 0.75,
+    max_time_bins: int = 900,
+):
+    """Compute an EEG spectrogram for the visible review window.
+
+    Returns x in minutes, frequency in Hz, and log-power in dB. The function is
+    intentionally windowed so it stays responsive in the Dash QC viewer.
+    """
+    if scipy_spectrogram is None:
+        return None
+
+    try:
+        x = np.load(npy_path, mmap_mode="r")
+        i0 = max(0, int(np.floor(start_s * fs)))
+        i1 = min(len(x), int(np.ceil(end_s * fs)))
+        if i1 <= i0:
+            return None
+
+        y = np.asarray(x[i0:i1], dtype=float)
+        y = y[np.isfinite(y)] if np.any(~np.isfinite(y)) else y
+        if len(y) < max(64, int(fs)):
+            return None
+
+        y = y - np.nanmedian(y)
+
+        nperseg = int(max(64, round(float(nperseg_s) * float(fs))))
+        nperseg = min(nperseg, len(y))
+        noverlap = int(round(nperseg * float(overlap_fraction)))
+        noverlap = min(max(0, noverlap), max(0, nperseg - 1))
+
+        f, t, sxx = scipy_spectrogram(
+            y,
+            fs=float(fs),
+            window="hann",
+            nperseg=nperseg,
+            noverlap=noverlap,
+            detrend="constant",
+            scaling="density",
+            mode="psd",
+        )
+
+        fmask = (f >= 0.5) & (f <= float(max_freq_hz))
+        if not np.any(fmask):
+            return None
+
+        f = f[fmask]
+        z = sxx[fmask, :]
+        z = 10.0 * np.log10(np.maximum(z, np.finfo(float).tiny))
+
+        finite = z[np.isfinite(z)]
+        if finite.size:
+            lo, hi = np.percentile(finite, [5, 95])
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                z = np.clip(z, lo, hi)
+
+        t_min = (float(start_s) + t) / 60.0
+
+        if z.shape[1] > max_time_bins:
+            step = int(np.ceil(z.shape[1] / max_time_bins))
+            z = z[:, ::step]
+            t_min = t_min[::step]
+
+        return t_min, f, z
+    except Exception:
+        return None
+
+
 # -----------------------------------------------------------------------------
 # Recording loading
 # -----------------------------------------------------------------------------
@@ -586,34 +665,40 @@ def make_review_figure(
     # Panel order:
     # 1 scoring rows
     # 2 raw EEG
-    # 3 raw EMG
-    # 4 ACh / photometry if available
+    # 3 EEG spectrogram
+    # 4 raw EMG
+    # 5 ACh / photometry if available
     # last probabilities / features
+    spec_row = 3
+    has_spec = scipy_spectrogram is not None
+
     if has_phot:
+        nrows = 6
+        score_row = 1
+        eeg_row = 2
+        spec_row = 3
+        emg_row = 4
+        ach_row = 5
+        prob_row = 6
+        row_heights = [0.12, 0.20, 0.20, 0.18, 0.15, 0.15]
+        titles = ["Scoring rows", "EEG", "EEG spectrogram (0.5–20 Hz)", "EMG", "ACh / fiber photometry", "Probabilities"]
+    else:
         nrows = 5
         score_row = 1
         eeg_row = 2
-        emg_row = 3
-        ach_row = 4
-        prob_row = 5
-        row_heights = [0.15, 0.25, 0.22, 0.20, 0.18]
-        titles = ["Scoring rows", "EEG", "EMG", "ACh / fiber photometry", "Probabilities"]
-    else:
-        nrows = 4
-        score_row = 1
-        eeg_row = 2
-        emg_row = 3
+        spec_row = 3
+        emg_row = 4
         ach_row = None
-        prob_row = 4
-        row_heights = [0.18, 0.30, 0.25, 0.27]
-        titles = ["Scoring rows", "EEG", "EMG", "Probabilities"]
+        prob_row = 5
+        row_heights = [0.13, 0.24, 0.24, 0.20, 0.19]
+        titles = ["Scoring rows", "EEG", "EEG spectrogram (0.5–20 Hz)", "EMG", "Probabilities"]
 
     fig = make_subplots(
         rows=nrows,
         cols=1,
         shared_xaxes=False,  # independent zoom per panel
         row_heights=row_heights,
-        vertical_spacing=0.035,
+        vertical_spacing=0.032,
         subplot_titles=titles,
     )
 
@@ -664,6 +749,48 @@ def make_review_figure(
     yrg = robust_range(eeg)
     if yrg:
         fig.update_yaxes(range=yrg, row=eeg_row, col=1)
+
+    # -----------------------------
+    # EEG spectrogram
+    # -----------------------------
+    spec = compute_eeg_spectrogram_window(
+        rec["recording_dir"] / "eeg.npy",
+        fs,
+        start_min * 60,
+        end_min * 60,
+        max_freq_hz=30.0,
+    )
+
+    if spec is not None:
+        spec_t, spec_f, spec_z = spec
+        fig.add_trace(
+            go.Heatmap(
+                x=spec_t,
+                y=spec_f,
+                z=spec_z,
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="dB", len=0.18),
+                name="EEG spectrogram",
+                hovertemplate="Time=%{x:.2f} min<br>Frequency=%{y:.1f} Hz<br>Power=%{z:.1f} dB<extra></extra>",
+            ),
+            row=spec_row,
+            col=1,
+        )
+        fig.update_yaxes(title_text="Hz", range=[0.5, 30.0], row=spec_row, col=1)
+    else:
+        fig.add_annotation(
+            text="Spectrogram unavailable. Install scipy or check EEG signal length.",
+            xref=f"x{spec_row}",
+            yref=f"y{spec_row}",
+            x=(start_min + end_min) / 2.0,
+            y=15.0,
+            showarrow=False,
+            font=dict(size=12, color="#666"),
+            row=spec_row,
+            col=1,
+        )
+        fig.update_yaxes(title_text="Hz", range=[0.5, 30.0], row=spec_row, col=1)
 
     # -----------------------------
     # Raw EMG — black
@@ -803,7 +930,7 @@ def make_review_figure(
     # Layout
     # -----------------------------
     fig.update_layout(
-        height=980,
+        height=1120,
         margin=dict(l=75, r=25, t=95, b=45),
         hovermode="x unified",
         dragmode="pan",
@@ -1330,6 +1457,13 @@ def render_tab(tab, project_root, _refresh):
                 dcc.Graph(id="qc-graph", style={"display":"none"}, config={"scrollZoom": False, "displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["select2d", "pan2d", "zoom2d", "resetScale2d"]}),
                 html.Div(id="selected-interval-label", className="status-line"),
 
+                html.H4("Apply source to whole visible window"),
+                html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(3, 1fr)", "gap":"6px", "marginBottom":"12px"}, children=[
+                    html.Button("Apply Somnotate to visible window", id="score-window-somnotate"),
+                    html.Button("Apply Layer 1 to visible window", id="score-window-layer1"),
+                    html.Button("Apply Manual to visible window", id="score-window-manual"),
+                ]),
+
                 html.Div(className="video-qc-card", children=[
                     html.H4("Video QC"),
                     html.Div(
@@ -1348,7 +1482,7 @@ def render_tab(tab, project_root, _refresh):
                         style={"display": "grid", "gridTemplateColumns": "1fr 1fr 2fr", "gap": "8px", "alignItems": "center", "marginTop": "8px"},
                         children=[
                             html.Button("Jump video to window start", id="jump-video-window", n_clicks=0),
-                            html.Button("Jump video to selected interval", id="jump-video-selected", n_clicks=0),
+                            html.Button("Play selected video interval", id="jump-video-selected", n_clicks=0),
                             html.Div(id="video-status", className="status-line"),
                         ],
                     ),
@@ -1365,12 +1499,6 @@ def render_tab(tab, project_root, _refresh):
                 html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(6, 1fr)", "gap":"6px"}, children=[
                     html.Button("1 = Wake", id="score-wake"), html.Button("2 = NREM", id="score-nrem"), html.Button("3 = REM", id="score-rem"),
                     html.Button("S = Somnotate", id="score-somnotate"), html.Button("L = Layer 1", id="score-layer1"), html.Button("M = Manual", id="score-manual"),
-                ]),
-                html.H4("Apply source to whole visible window"),
-                html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(3, 1fr)", "gap":"6px"}, children=[
-                    html.Button("Apply Somnotate to visible window", id="score-window-somnotate"),
-                    html.Button("Apply Layer 1 to visible window", id="score-window-layer1"),
-                    html.Button("Apply Manual to visible window", id="score-window-manual"),
                 ]),
                 html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr 2fr","gap":"6px", "marginTop":"8px"}, children=[
                     html.Button("Undo last action", id="btn-undo"),
@@ -1941,12 +2069,30 @@ def request_video_seek(n_window, n_selected, window_data, selected_data, offset_
     if trig == "jump-video-selected":
         if not selected_data:
             return {"error": "Select an interval first."}
-        recording_time_s = float(selected_data.get("start_min", 0.0)) * 60.0
+        recording_start_s = float(selected_data.get("start_min", 0.0)) * 60.0
+        recording_end_s = float(selected_data.get("end_min", selected_data.get("start_min", 0.0))) * 60.0
+        auto_play = True
     else:
-        recording_time_s = float((window_data or {}).get("start_min", 0.0)) * 60.0
+        window_data = window_data or {}
+        start_min = float(window_data.get("start_min", 0.0))
+        window_min = float(window_data.get("window_min", 15.0))
+        recording_start_s = start_min * 60.0
+        recording_end_s = (start_min + window_min) * 60.0
+        auto_play = False
 
-    video_time_s = max(0.0, recording_time_s - offset_s)
-    return {"time_s": video_time_s, "recording_time_s": recording_time_s, "offset_s": offset_s, "source": trig}
+    video_start_s = max(0.0, recording_start_s - offset_s)
+    video_end_s = max(video_start_s, recording_end_s - offset_s)
+
+    return {
+        "time_s": video_start_s,
+        "end_time_s": video_end_s,
+        "duration_s": max(0.0, video_end_s - video_start_s),
+        "recording_time_s": recording_start_s,
+        "recording_end_s": recording_end_s,
+        "offset_s": offset_s,
+        "source": trig,
+        "auto_play": auto_play,
+    }
 
 
 app.clientside_callback(
@@ -1962,13 +2108,45 @@ app.clientside_callback(
         if (!video) {
             return "No video player loaded. Save a valid video path first.";
         }
-        const t = Math.max(0, Number(data.time_s || 0));
+
+        const start = Math.max(0, Number(data.time_s || 0));
+        const end = Math.max(start, Number(data.end_time_s || start));
+        const duration = Math.max(0, end - start);
+        const autoPlay = Boolean(data.auto_play);
+
         try {
-            video.currentTime = t;
+            if (video._qcStopHandler) {
+                video.removeEventListener("timeupdate", video._qcStopHandler);
+                video._qcStopHandler = null;
+            }
+
+            video.currentTime = start;
+
+            if (duration > 0) {
+                const stopHandler = function() {
+                    if (video.currentTime >= end - 0.03) {
+                        video.pause();
+                        try { video.currentTime = end; } catch (e) {}
+                        video.removeEventListener("timeupdate", stopHandler);
+                        video._qcStopHandler = null;
+                    }
+                };
+                video._qcStopHandler = stopHandler;
+                video.addEventListener("timeupdate", stopHandler);
+            }
+
+            if (autoPlay && duration > 0) {
+                const p = video.play();
+                if (p && p.catch) {
+                    p.catch(function() {});
+                }
+                return "Playing selected video interval: " + start.toFixed(2) + "–" + end.toFixed(2) + " s.";
+            }
+
             video.pause();
-            return "Video jumped to " + t.toFixed(2) + " s.";
+            return "Video jumped to " + start.toFixed(2) + " s.";
         } catch (e) {
-            return "Could not jump video: " + e;
+            return "Could not control video: " + e;
         }
     }
     """,
