@@ -33,6 +33,11 @@ try:
 except Exception:
     scipy_spectrogram = None
 
+try:
+    import pyedflib
+except Exception:
+    pyedflib = None
+
 
 APP_DIR = Path(__file__).resolve().parents[1]
 PIPELINES_DIR = APP_DIR / "pipelines"
@@ -322,6 +327,66 @@ def safe_mat_keys(mat_file: str | Path) -> list[str]:
         except Exception:
             pass
     return []
+
+
+def safe_edf_info(edf_file: str | Path) -> str:
+    """Return a compact EDF/BDF channel summary for the import tab."""
+    p = Path(edf_file).expanduser()
+
+    if pyedflib is None:
+        return (
+            "EDF/BDF support needs pyedflib, but pyedflib is not importable in this "
+            "environment. Install it with:\n\n"
+            "pip install pyedflib\n"
+            "# or conda install -c conda-forge pyedflib"
+        )
+
+    if not p.exists():
+        return f"EDF/BDF file not found: {p}"
+
+    reader = None
+    try:
+        reader = pyedflib.EdfReader(str(p))
+        labels = list(reader.getSignalLabels())
+        freqs = np.asarray(reader.getSampleFrequencies(), dtype=float)
+        n_samples = np.asarray(reader.getNSamples(), dtype=int)
+        duration_s = float(getattr(reader, "file_duration", 0.0) or 0.0)
+        if duration_s <= 0 and len(freqs) and np.all(freqs > 0):
+            duration_s = float(np.nanmax(n_samples / freqs))
+
+        lines = [
+            f"Detected EDF/BDF file: {p.name}",
+            f"Signals: {len(labels)} | duration: {duration_s:.2f} s ({duration_s / 60.0:.2f} min)",
+            "",
+            "Channels:",
+        ]
+
+        for i, label in enumerate(labels):
+            fs = freqs[i] if i < len(freqs) else np.nan
+            ns = n_samples[i] if i < len(n_samples) else 0
+            lines.append(f"  {i}: {label}  |  fs={fs:g} Hz  |  samples={ns}")
+
+        try:
+            ann_onsets, ann_durations, ann_text = reader.readAnnotations()
+            if len(ann_text):
+                preview = ", ".join([str(x) for x in ann_text[:8]])
+                lines += ["", f"Annotations: {len(ann_text)} found", f"First annotations: {preview}"]
+        except Exception:
+            pass
+
+        lines += [
+            "",
+            "Use the channel label or index in the EEG/EMG fields below, then click Import recording.",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Could not read EDF/BDF file: {type(e).__name__}: {e}"
+    finally:
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
 
 
 def load_manifest(project_root: str | Path | None) -> pd.DataFrame | None:
@@ -1088,6 +1153,50 @@ def reset_final_to_empty(project_root: str, recording_id: str):
     final.to_csv(final_file, index=False)
     return True, f"Reset Final scoring to empty for {len(final)} epochs."
 
+def fill_empty_final_with_somnotate(project_root: str, recording_id: str, export_after: bool = False):
+    """Fill only empty/Undefined Final epochs with Somnotate labels.
+
+    Existing reviewed labels are preserved. This is useful when the user wants
+    an empty recording to start from Somnotate, while still keeping manual edits
+    safe.
+    """
+    rec = load_recording(project_root, recording_id)
+    if rec.get("som") is None:
+        return False, "Somnotate scoring not found for this recording."
+
+    final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
+    final = pd.read_csv(final_file)
+    epoch_df = final[["t0_s", "t1_s"]].copy()
+    source_labels = labels_at_epoch_midpoints(epoch_df, rec["som"], "somnotate_state")
+    source_labels = np.asarray(source_labels, dtype=object)
+
+    state = final.get("final_state", pd.Series("Undefined", index=final.index)).fillna("Undefined").astype(str)
+    code = pd.to_numeric(final.get("final_code", pd.Series(-1, index=final.index)), errors="coerce").fillna(-1)
+    empty_mask = state.isin(["", "Undefined", "Uncertain", "nan", "None"]) | (code < 0)
+
+    valid_source = pd.Series(source_labels).fillna("Undefined").astype(str)
+    valid_mask = ~valid_source.isin(["", "Undefined", "Uncertain", "nan", "None"])
+    mask = empty_mask & valid_mask.to_numpy()
+
+    if int(mask.sum()) == 0:
+        return False, "No empty Final epochs with valid Somnotate labels were found."
+
+    record_undo_snapshot(rec["recording_dir"], final, mask, "fill empty final with Somnotate")
+    selected = source_labels[mask.to_numpy()]
+    final.loc[mask, "final_state"] = selected
+    final.loc[mask, "final_code"] = [FINAL_EXPORT_CODE.get(str(x), -1) for x in selected]
+    final.loc[mask, "final_source"] = "dash_fill_empty_somnotate"
+    final.loc[mask, "review_status"] = "auto_filled"
+    final.loc[mask, "review_notes"] = "empty final filled from Somnotate"
+    final.to_csv(final_file, index=False)
+
+    msg = f"Filled {int(mask.sum())} empty Final epochs with Somnotate. Existing reviewed labels were preserved."
+    if export_after:
+        ok_export, export_msg = export_final(project_root, recording_id)
+        msg += "\n" + export_msg
+    return True, msg
+
+
 def export_final(project_root: str, recording_id: str):
     rec = load_recording(project_root, recording_id)
     final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
@@ -1224,7 +1333,7 @@ app.layout = html.Div(
         ]),
 
         dcc.Tabs(id="main-tabs", value="tab-review", children=[
-            dcc.Tab(label="1. Import .mat + Layer 1", value="tab-import"),
+            dcc.Tab(label="1. Import .mat / EDF + Layer 1", value="tab-import"),
             dcc.Tab(label="2. QC / Review", value="tab-review"),
             dcc.Tab(label="3. Somnotate", value="tab-somnotate"),
             dcc.Tab(label="4. Dissociation", value="tab-stats"),
@@ -1305,6 +1414,7 @@ dcc.Graph(id="qc-graph"),
     html.Button(id="score-somnotate"), html.Button(id="score-layer1"), html.Button(id="score-manual"),
     html.Button(id="score-window-somnotate"), html.Button(id="score-window-layer1"), html.Button(id="score-window-manual"),
     html.Button(id="btn-reset-final-empty"), html.Button(id="btn-undo"), html.Button(id="btn-export"),
+    html.Button(id="btn-fill-empty-somnotate"), html.Button(id="btn-fill-empty-somnotate-export"), html.Button(id="btn-export-bottom"),
     html.Div(id="score-status"),
     PInput(id="video-file-input"), PInput(id="video-offset-input"), html.Button(id="save-video-settings"),
     html.Button(id="jump-video-window"), html.Button(id="jump-video-selected"),
@@ -1369,24 +1479,24 @@ def render_tab(tab, project_root, _refresh):
 
     if tab == "tab-import":
         return html.Div(className="card", children=[
-            html.H3("Import preprocessed .mat recording"),
+            html.H3("Import recording (.mat or EDF/BDF)"),
             html.Div("Fields are persistent, so clicking buttons should not clear your paths.", className="app-subtitle"),
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"10px"}, children=[
-                html.Div([html.Label(".mat file"), PInput(id="mat-file", type="text", placeholder="/full/path/to/file.mat", style={"width":"100%"})]),
+                html.Div([html.Label("Recording file (.mat, .edf, .bdf)"), PInput(id="mat-file", type="text", placeholder="/full/path/to/file.mat or /full/path/to/file.edf", style={"width":"100%"})]),
                 html.Div([html.Label("Recording ID"), PInput(id="import-recording-id", type="text", value="test_recording", style={"width":"100%"})]),
-                html.Div([html.Label("Sampling rate Hz"), PInput(id="import-fs", type="number", value=1017.2526, style={"width":"100%"})]),
+                html.Div([html.Label("Sampling rate Hz (MAT fallback; EDF reads this automatically)"), PInput(id="import-fs", type="number", value=1017.2526, style={"width":"100%"})]),
                 html.Div([html.Label("Mouse ID"), PInput(id="import-mouse-id", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Group"), PInput(id="import-group", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Condition"), PInput(id="import-condition", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Week"), PInput(id="import-week", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Epoch sec"), PInput(id="import-epoch-sec", type="number", value=1.0, style={"width":"100%"})]),
             ]),
-            html.Button("Detect .mat variables", id="detect-mat", n_clicks=0, style={"marginTop":"10px"}),
+            html.Button("Detect variables / EDF channels", id="detect-mat", n_clicks=0, style={"marginTop":"10px"}),
             html.Div(id="mat-keys-status", className="status-line", style={"whiteSpace":"pre-wrap"}),
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"10px", "marginTop":"8px"}, children=[
-                html.Div([html.Label("EEG variable"), PInput(id="eeg-key", type="text", value="eeg", style={"width":"100%"})]),
-                html.Div([html.Label("EMG variable"), PInput(id="emg-key", type="text", value="emg", style={"width":"100%"})]),
-                html.Div([html.Label("ACh / photometry variable, optional"), PInput(id="ach-key", type="text", value="ne", style={"width":"100%"})]),
+                html.Div([html.Label("EEG variable or EDF channel"), PInput(id="eeg-key", type="text", value="eeg", style={"width":"100%"})]),
+                html.Div([html.Label("EMG variable or EDF channel"), PInput(id="emg-key", type="text", value="emg", style={"width":"100%"})]),
+                html.Div([html.Label("ACh / photometry variable or EDF channel, optional"), PInput(id="ach-key", type="text", value="ne", style={"width":"100%"})]),
                 html.Div([html.Label("EEG sampling frequency variable, optional"), PInput(id="eeg-fs-key", type="text", value="eeg_frequency", style={"width":"100%"})]),
                 html.Div([html.Label("ACh sampling frequency variable, optional"), PInput(id="ach-fs-key", type="text", value="ne_frequency", style={"width":"100%"})]),
                 html.Div([html.Label("Optional scoring variable"), PInput(id="scoring-key", type="text", style={"width":"100%"})]),
@@ -1394,7 +1504,7 @@ def render_tab(tab, project_root, _refresh):
             html.Label("Manual scoring code map"),
             PTextarea(id="code-map", value='{"0":"Wake","1":"NREM","2":"REM","15":"Wake","-1":"Undefined"}', style={"width":"100%", "height":"70px"}),
             html.Div(style={"display":"grid","gridTemplateColumns":"repeat(3, 1fr)","gap":"8px", "marginTop":"10px"}, children=[
-                html.Button("1. Import .mat", id="btn-import-mat", n_clicks=0),
+                html.Button("1. Import recording", id="btn-import-mat", n_clicks=0),
                 html.Button("2. Compute epoch features", id="btn-compute-features", n_clicks=0),
                 html.Button("3. Run Layer 1 Wake/Sleep", id="btn-run-layer1", n_clicks=0),
             ]),
@@ -1415,10 +1525,16 @@ def render_tab(tab, project_root, _refresh):
                     html.Div(id="load-status", className="status-line"),
                 ]),
                 legend_bar(),
-                html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 3fr 1fr 1fr","gap":"6px","alignItems":"center", "margin":"8px 0"}, children=[
-                    html.Button("◀ 15 min", id="back-15"), html.Button("◀ 5 min", id="back-5"),
-                    html.Div(id="window-label", style={"textAlign":"center","fontWeight":"bold"}),
-                    html.Button("5 min ▶", id="forward-5"), html.Button("15 min ▶", id="forward-15"),
+                html.Div(className="queue-box", children=[
+                    html.H4("Dissociation review queue"),
+                    html.Div("Run dissociation analysis first, then refresh here to jump through the most suspicious events.", className="app-subtitle"),
+                    html.Div(style={"display":"grid", "gridTemplateColumns":"1fr 1fr 3fr 1fr", "gap":"8px", "alignItems":"center", "marginTop":"8px"}, children=[
+                        html.Button("Refresh events", id="qc-refresh-diss-events", n_clicks=0),
+                        html.Button("Previous", id="qc-prev-diss-event", n_clicks=0),
+                        PDropdown(id="qc-diss-event-dropdown", options=[], placeholder="Choose dissociation event", style={"width":"100%"}),
+                        html.Button("Next", id="qc-next-diss-event", n_clicks=0),
+                    ]),
+                    html.Div(id="qc-diss-event-status", className="status-line"),
                 ]),
 
                 html.Div(className="timeline-card", children=[
@@ -1442,17 +1558,13 @@ def render_tab(tab, project_root, _refresh):
                     ),
                     html.Div(id="qc-window-range-label", className="status-line"),
                 ]),
-                html.Div(className="queue-box", children=[
-                    html.H4("Dissociation review queue"),
-                    html.Div("Run dissociation analysis first, then refresh here to jump through the most suspicious events.", className="app-subtitle"),
-                    html.Div(style={"display":"grid", "gridTemplateColumns":"1fr 1fr 3fr 1fr", "gap":"8px", "alignItems":"center", "marginTop":"8px"}, children=[
-                        html.Button("Refresh events", id="qc-refresh-diss-events", n_clicks=0),
-                        html.Button("Previous", id="qc-prev-diss-event", n_clicks=0),
-                        PDropdown(id="qc-diss-event-dropdown", options=[], placeholder="Choose dissociation event", style={"width":"100%"}),
-                        html.Button("Next", id="qc-next-diss-event", n_clicks=0),
-                    ]),
-                    html.Div(id="qc-diss-event-status", className="status-line"),
+
+                html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 3fr 1fr 1fr","gap":"6px","alignItems":"center", "margin":"8px 0"}, children=[
+                    html.Button("◀ 15 min", id="back-15"), html.Button("◀ 5 min", id="back-5"),
+                    html.Div(id="window-label", style={"textAlign":"center","fontWeight":"bold"}),
+                    html.Button("5 min ▶", id="forward-5"), html.Button("15 min ▶", id="forward-15"),
                 ]),
+
                 html.Div(id="empty-qc-message", children=[html.H4("No recording loaded yet"), html.P("Load a project and choose a recording first.")], className="empty-panel"),
                 dcc.Graph(id="qc-graph", style={"display":"none"}, config={"scrollZoom": False, "displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["select2d", "pan2d", "zoom2d", "resetScale2d"]}),
                 html.Div(id="selected-interval-label", className="status-line"),
@@ -1498,13 +1610,25 @@ def render_tab(tab, project_root, _refresh):
                 html.H4("Apply label to selected interval"),
                 html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(6, 1fr)", "gap":"6px"}, children=[
                     html.Button("1 = Wake", id="score-wake"), html.Button("2 = NREM", id="score-nrem"), html.Button("3 = REM", id="score-rem"),
-                    html.Button("S = Somnotate", id="score-somnotate"), html.Button("L = Layer 1", id="score-layer1"), html.Button("M = Manual", id="score-manual"),
+                    html.Button("A = Somnotate", id="score-somnotate"), html.Button("L = Layer 1", id="score-layer1"), html.Button("M = Manual", id="score-manual"),
                 ]),
                 html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr 2fr","gap":"6px", "marginTop":"8px"}, children=[
                     html.Button("Undo last action", id="btn-undo"),
                     html.Button("Export final scoring", id="btn-export"),
                     html.Button("Reset Final to empty", id="btn-reset-final-empty"),
                     html.Div("Shortcuts: P Pan, S Select window, 1 Wake, 2 NREM, 3 REM, A Somnotate/automatic, L Layer 1, M Manual"),
+                ]),
+                html.Div(className="card", style={"marginTop": "16px"}, children=[
+                    html.H4("Final scoring utilities"),
+                    html.Div(
+                        "Use these at the end of review, or to initialise an empty Final row from Somnotate. Existing reviewed labels are not overwritten.",
+                        className="app-subtitle",
+                    ),
+                    html.Div(style={"display":"grid", "gridTemplateColumns":"1fr 1fr 1fr", "gap":"8px", "marginTop":"8px"}, children=[
+                        html.Button("Fill empty Final with Somnotate", id="btn-fill-empty-somnotate", n_clicks=0),
+                        html.Button("Fill empty Final with Somnotate + export", id="btn-fill-empty-somnotate-export", n_clicks=0),
+                        html.Button("Export final scoring", id="btn-export-bottom", n_clicks=0),
+                    ]),
                 ]),
                 html.Div(id="score-status", className="status-line", style={"whiteSpace":"pre-wrap"}),
             ]),
@@ -1580,8 +1704,8 @@ def render_tab(tab, project_root, _refresh):
 def import_button_feedback(n_detect, n_import, n_features, n_layer1):
     trig = callback_context.triggered_id
     messages = {
-        "detect-mat": "Reading .mat variables...",
-        "btn-import-mat": "Importing .mat recording... this can take a moment.",
+        "detect-mat": "Reading variables / EDF channels...",
+        "btn-import-mat": "Importing recording... this can take a moment.",
         "btn-compute-features": "Computing epoch features...",
         "btn-run-layer1": "Running Layer 1 Wake/Sleep...",
     }
@@ -1618,18 +1742,26 @@ def diss_button_feedback(n):
 @app.callback(Output("mat-keys-status", "children"), Input("detect-mat", "n_clicks"), State("mat-file", "value"), prevent_initial_call=True)
 def detect_mat_vars(n, mat_file):
     if mat_file is None or str(mat_file).strip() == "" or str(mat_file).strip().lower() == "none":
-        return "Please paste the full path to a .mat file first."
+        return "Please paste the full path to a .mat, .edf, or .bdf file first."
 
-    mat_path = Path(str(mat_file)).expanduser()
+    data_path = Path(str(mat_file)).expanduser()
 
-    if not mat_path.exists():
-        return f".mat file not found: {mat_path}"
+    if not data_path.exists():
+        return f"Recording file not found: {data_path}"
 
-    keys = safe_mat_keys(str(mat_path))
+    suffix = data_path.suffix.lower()
+
+    if suffix in {".edf", ".bdf"}:
+        return safe_edf_info(str(data_path))
+
+    if suffix != ".mat":
+        return f"Unsupported file extension '{suffix}'. Use .mat, .edf, or .bdf."
+
+    keys = safe_mat_keys(str(data_path))
     if not keys:
         return "Could not read variables. Check path/file."
 
-    return "Detected variables:\n" + ", ".join(keys)
+    return "Detected MAT variables:\n" + ", ".join(keys)
 
 
 @app.callback(Output("manifest-table-import", "children"), Input("manifest-refresh", "data"), State("project-root-store", "data"))
@@ -1653,25 +1785,49 @@ def run_import_pipeline(n1,n2,n3,project_root,mat_file,rec_id,fs,eeg_key,emg_key
     if trigger == "btn-import-mat":
         if mat_file is None or str(mat_file).strip() == "" or str(mat_file).strip().lower() == "none":
             return (
-                "Please paste the full path to a .mat file before pressing Import .mat.\n\n"
-                "Example:\n"
-                "/Users/margaridaseabra/Desktop/Margarida-batch2-june26/recordings/300526-m63-bas-1/my_recording.mat",
+                "Please paste the full path to a .mat, .edf, or .bdf file before pressing Import recording.\n\n"
+                "Examples:\n"
+                "/Users/margaridaseabra/Desktop/Margarida-batch2-june26/recordings/300526-m63-bas-1/my_recording.mat\n"
+                "/Users/margaridaseabra/Desktop/Margarida-batch2-june26/recordings/300526-m63-bas-1/my_recording.edf",
                 refresh,
             )
 
-        mat_path = Path(str(mat_file)).expanduser()
+        data_path = Path(str(mat_file)).expanduser()
 
-        if not mat_path.exists():
-            return f".mat file not found:\n{mat_path}", refresh
+        if not data_path.exists():
+            return f"Recording file not found:\n{data_path}", refresh
 
-        cmd = [sys.executable, str(PIPELINES_DIR/"01_import_mat_recording.py"), "--mat-file", str(mat_path), "--project-root", str(project_root), "--recording-id", str(rec_id), "--eeg-key", str(eeg_key), "--emg-key", str(emg_key), "--fs", str(fs), "--epoch-sec", str(epoch_sec), "--code-map", str(code_map or "{}"), "--mouse-id", str(mouse_id or ""), "--group", str(group or ""), "--condition", str(condition or ""), "--week", str(week or "")]
-        if ach_key:
-            cmd += ["--ach-key", str(ach_key)]
-        if eeg_fs_key:
-            cmd += ["--eeg-fs-key", str(eeg_fs_key)]
-        if ach_fs_key:
-            cmd += ["--ach-fs-key", str(ach_fs_key)]
-        if scoring_key: cmd += ["--scoring-key", str(scoring_key)]
+        suffix = data_path.suffix.lower()
+
+        if suffix in {".edf", ".bdf"}:
+            cmd = [
+                sys.executable,
+                str(PIPELINES_DIR/"01_import_edf_recording.py"),
+                "--edf-file", str(data_path),
+                "--project-root", str(project_root),
+                "--recording-id", str(rec_id),
+                "--eeg-channel", str(eeg_key or ""),
+                "--emg-channel", str(emg_key or ""),
+                "--epoch-sec", str(epoch_sec),
+                "--annotation-map", str(code_map or "{}"),
+                "--mouse-id", str(mouse_id or ""),
+                "--group", str(group or ""),
+                "--condition", str(condition or ""),
+                "--week", str(week or ""),
+            ]
+            if ach_key:
+                cmd += ["--ach-channel", str(ach_key)]
+        elif suffix == ".mat":
+            cmd = [sys.executable, str(PIPELINES_DIR/"01_import_mat_recording.py"), "--mat-file", str(data_path), "--project-root", str(project_root), "--recording-id", str(rec_id), "--eeg-key", str(eeg_key), "--emg-key", str(emg_key), "--fs", str(fs), "--epoch-sec", str(epoch_sec), "--code-map", str(code_map or "{}"), "--mouse-id", str(mouse_id or ""), "--group", str(group or ""), "--condition", str(condition or ""), "--week", str(week or "")]
+            if ach_key:
+                cmd += ["--ach-key", str(ach_key)]
+            if eeg_fs_key:
+                cmd += ["--eeg-fs-key", str(eeg_fs_key)]
+            if ach_fs_key:
+                cmd += ["--ach-fs-key", str(ach_fs_key)]
+            if scoring_key: cmd += ["--scoring-key", str(scoring_key)]
+        else:
+            return f"Unsupported file extension '{suffix}'. Use .mat, .edf, or .bdf.", refresh
     elif trigger == "btn-compute-features":
         cmd = [sys.executable, str(PIPELINES_DIR/"02_compute_epoch_features.py"), "--project-root", str(project_root), "--recording-id", str(rec_id), "--epoch-sec", str(epoch_sec)]
     elif trigger == "btn-run-layer1":
@@ -1967,25 +2123,71 @@ def update_selection(selected, fig):
     )
 
 
-@app.callback(Output("score-status", "children"), Output("qc-graph", "figure", allow_duplicate=True), Input("score-wake", "n_clicks"), Input("score-nrem", "n_clicks"), Input("score-rem", "n_clicks"), Input("score-somnotate", "n_clicks"), Input("score-layer1", "n_clicks"), Input("score-manual", "n_clicks"), Input("score-window-somnotate", "n_clicks"), Input("score-window-layer1", "n_clicks"), Input("score-window-manual", "n_clicks"), Input("btn-reset-final-empty", "n_clicks"), Input("btn-undo", "n_clicks"), Input("btn-export", "n_clicks"), State("selected-interval-store", "data"), State("project-root-store", "data"), State("recording-id-store", "data"), State("window-store", "data"), prevent_initial_call=True)
+def parse_interval_from_selected_data(selected):
+    """Read the current Plotly selectedData payload as a min-based interval.
+
+    This is used by the scoring callback as a direct fallback/override for
+    keyboard scoring. It prevents a fast keyboard press from using an older
+    selected-interval store while Dash is still processing the newest lasso/box
+    selection callback.
+    """
+    if not selected:
+        return None
+
+    x0 = x1 = None
+    try:
+        if "range" in selected:
+            r = selected.get("range") or {}
+            if "x" in r and isinstance(r["x"], (list, tuple)) and len(r["x"]) >= 2:
+                x0, x1 = r["x"][0], r["x"][1]
+            else:
+                for k, v in r.items():
+                    if str(k).lower().startswith("x") and isinstance(v, (list, tuple)) and len(v) >= 2:
+                        x0, x1 = v[0], v[1]
+                        break
+
+        if x0 is None and selected.get("points"):
+            xs = [pt.get("x") for pt in selected.get("points", []) if "x" in pt]
+            if len(xs) >= 2:
+                x0, x1 = min(xs), max(xs)
+
+        if x0 is None or x1 is None:
+            return None
+
+        x0 = float(x0)
+        x1 = float(x1)
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if x1 <= x0:
+            return None
+        return {"start_min": x0, "end_min": x1}
+    except Exception:
+        return None
+
+
+@app.callback(Output("score-status", "children"), Output("qc-graph", "figure", allow_duplicate=True), Output("selected-interval-store", "data", allow_duplicate=True), Output("selected-interval-label", "children", allow_duplicate=True), Output("qc-graph", "selectedData", allow_duplicate=True), Input("score-wake", "n_clicks"), Input("score-nrem", "n_clicks"), Input("score-rem", "n_clicks"), Input("score-somnotate", "n_clicks"), Input("score-layer1", "n_clicks"), Input("score-manual", "n_clicks"), Input("score-window-somnotate", "n_clicks"), Input("score-window-layer1", "n_clicks"), Input("score-window-manual", "n_clicks"), Input("btn-reset-final-empty", "n_clicks"), Input("btn-undo", "n_clicks"), Input("btn-export", "n_clicks"), Input("btn-fill-empty-somnotate", "n_clicks"), Input("btn-fill-empty-somnotate-export", "n_clicks"), Input("btn-export-bottom", "n_clicks"), State("selected-interval-store", "data"), State("qc-graph", "selectedData"), State("project-root-store", "data"), State("recording-id-store", "data"), State("window-store", "data"), prevent_initial_call=True)
 def score_or_export(*args):
-    selected, project_root, recording_id, window = args[-4], args[-3], args[-2], args[-1]
+    selected_store, graph_selected, project_root, recording_id, window = args[-5], args[-4], args[-3], args[-2], args[-1]
     if not project_root or not recording_id:
-        return "No recording loaded.", no_update
+        return "No recording loaded.", no_update, no_update, no_update, no_update
 
     trig = callback_context.triggered_id
 
     if trig == "btn-undo":
         ok, msg = undo_last_action(project_root, recording_id)
-        return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update
+        return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update, no_update, no_update, no_update
 
-    if trig == "btn-export":
+    if trig in {"btn-export", "btn-export-bottom"}:
         ok, msg = export_final(project_root, recording_id)
-        return msg, no_update
+        return msg, no_update, no_update, no_update, no_update
 
     if trig == "btn-reset-final-empty":
         ok, msg = reset_final_to_empty(project_root, recording_id)
-        return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update
+        return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update, None if ok else no_update, "Selection cleared." if ok else no_update, None if ok else no_update
+
+    if trig in {"btn-fill-empty-somnotate", "btn-fill-empty-somnotate-export"}:
+        ok, msg = fill_empty_final_with_somnotate(project_root, recording_id, export_after=(trig == "btn-fill-empty-somnotate-export"))
+        return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update, None if ok else no_update, "Selection cleared." if ok else no_update, None if ok else no_update
 
     # Determine whether to apply to selected interval or full visible window.
     window_buttons = {"score-window-somnotate", "score-window-layer1", "score-window-manual"}
@@ -1995,8 +2197,9 @@ def score_or_export(*args):
         end = start + wmin
         scope_text = "visible window"
     else:
+        selected = parse_interval_from_selected_data(graph_selected) or selected_store
         if not selected:
-            return "Select an interval first, or use the visible-window buttons.", no_update
+            return "Select an interval first, wait for the selected interval text to update, then score. Fast keyboard scoring is blocked until a confirmed/current selection is available.", no_update, no_update, no_update, no_update
         start = float(selected["start_min"])
         end = float(selected["end_min"])
         scope_text = "selected interval"
@@ -2014,11 +2217,20 @@ def score_or_export(*args):
     elif trig in {"score-manual", "score-window-manual"}:
         ok, msg = apply_source_label(project_root, recording_id, start, end, "Manual")
     else:
-        return "Unknown action.", no_update
+        return "Unknown action.", no_update, no_update, no_update, no_update
 
     if ok:
         msg = f"{msg} Applied to {scope_text}: {start:.2f}–{end:.2f} min."
-    return msg, refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update
+
+    clear_selection = ok and scope_text == "selected interval"
+    selection_message = "Selection cleared after scoring. Select a new interval before using keyboard scoring again." if clear_selection else no_update
+    return (
+        msg,
+        refresh_qc_figure_after_scoring(project_root, recording_id, window) if ok else no_update,
+        None if clear_selection else no_update,
+        selection_message,
+        None if clear_selection else no_update,
+    )
 
 
 # -----------------------------------------------------------------------------
