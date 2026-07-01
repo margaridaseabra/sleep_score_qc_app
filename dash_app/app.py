@@ -1271,19 +1271,171 @@ def fill_empty_final_with_somnotate(project_root: str, recording_id: str, export
     return True, msg
 
 
+def _edf_safe_label(label: str, fallback: str) -> str:
+    """EDF signal labels are short; keep them readable and browser/Sirenia-safe."""
+    s = str(label or fallback).strip() or fallback
+    # EDF labels are conventionally limited to 16 ASCII characters.
+    s = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in s)
+    return s[:16] or fallback[:16]
+
+
+def _edf_physical_range(values: np.ndarray) -> tuple[float, float]:
+    """Choose a safe physical min/max for EDF export."""
+    y = np.asarray(values, dtype=float)
+    finite = y[np.isfinite(y)]
+
+    if finite.size == 0:
+        return -1.0, 1.0
+
+    lo = float(np.nanmin(finite))
+    hi = float(np.nanmax(finite))
+
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return -1.0, 1.0
+
+    if hi <= lo:
+        pad = max(abs(lo) * 0.01, 1.0)
+        return lo - pad, hi + pad
+
+    pad = max((hi - lo) * 0.001, 1e-9)
+    return lo - pad, hi + pad
+
+
+def _load_signal_for_edf(path: Path) -> np.ndarray:
+    """Load a saved .npy signal and replace non-finite values before EDF writing."""
+    x = np.asarray(np.load(path, mmap_mode="r"), dtype=np.float64).ravel()
+
+    if np.any(~np.isfinite(x)):
+        finite = x[np.isfinite(x)]
+        fill = float(np.nanmedian(finite)) if finite.size else 0.0
+        x = np.nan_to_num(x, nan=fill, posinf=fill, neginf=fill)
+
+    return x
+
+
+def export_recording_edf(rec: dict[str, Any], final: pd.DataFrame, edf_out: Path) -> tuple[bool, str]:
+    """Export EEG/EMG/optional photometry as EDF+ with Final scoring annotations.
+
+    The CSV and MAT exports contain the exact epoch table. The EDF export is mainly
+    for opening the recording in EDF-compatible viewers: it writes the signal
+    channels plus one EDF+ annotation per reviewed Final epoch. Undefined/Uncertain
+    epochs are skipped so the annotation track stays clean.
+    """
+    if pyedflib is None:
+        return False, "EDF export skipped because pyedflib is not installed/importable."
+
+    rd = Path(rec["recording_dir"])
+    fs = float(rec["fs"])
+
+    signal_specs: list[tuple[str, Path, float, str]] = [
+        ("EEG", rd / "eeg.npy", fs, "uV"),
+        ("EMG", rd / "emg.npy", fs, "uV"),
+    ]
+
+    phot = find_photometry(rec)
+    if phot is not None:
+        phot_path, phot_fs, phot_label = phot
+        # Avoid adding EEG/EMG twice if metadata points there accidentally.
+        if Path(phot_path).resolve() not in {(rd / "eeg.npy").resolve(), (rd / "emg.npy").resolve()}:
+            signal_specs.append((str(phot_label or "Photometry"), Path(phot_path), float(phot_fs), "a.u."))
+
+    signals: list[np.ndarray] = []
+    headers: list[dict[str, Any]] = []
+
+    for i, (label, path, sig_fs, dimension) in enumerate(signal_specs):
+        if not path.exists():
+            continue
+
+        y = _load_signal_for_edf(path)
+        if y.size == 0:
+            continue
+
+        physical_min, physical_max = _edf_physical_range(y)
+        signals.append(y)
+        headers.append({
+            "label": _edf_safe_label(label, f"ch{i+1}"),
+            "dimension": dimension,
+            "sample_frequency": float(sig_fs),
+            "physical_min": float(physical_min),
+            "physical_max": float(physical_max),
+            "digital_min": -32768,
+            "digital_max": 32767,
+            "transducer": "",
+            "prefilter": "",
+        })
+
+    if not signals:
+        return False, "EDF export skipped because no eeg.npy/emg.npy signal files were found."
+
+    edf_out.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        writer = pyedflib.EdfWriter(
+            str(edf_out),
+            n_channels=len(signals),
+            file_type=pyedflib.FILETYPE_EDFPLUS,
+        )
+        try:
+            writer.setSignalHeaders(headers)
+            writer.writeSamples(signals)
+
+            exported_annotations = 0
+            for _, row in final.iterrows():
+                state = str(row.get("final_state", "Undefined") or "Undefined")
+                code = int(pd.to_numeric(row.get("final_code", -1), errors="coerce")) if pd.notna(row.get("final_code", -1)) else -1
+
+                if state in {"", "Undefined", "Uncertain", "nan", "None"} or code < 0:
+                    continue
+
+                t0 = float(row.get("t0_s", 0.0))
+                t1 = float(row.get("t1_s", t0))
+                duration = max(0.0, t1 - t0)
+                writer.writeAnnotation(t0, duration, state)
+                exported_annotations += 1
+        finally:
+            writer.close()
+
+        return True, f"EDF+ exported with {len(signals)} signal channel(s) and {exported_annotations} Final scoring annotation(s):\n{edf_out}"
+
+    except Exception as e:
+        return False, f"EDF export failed: {type(e).__name__}: {e}"
+
+
 def export_final(project_root: str, recording_id: str):
     rec = load_recording(project_root, recording_id)
     final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
     final = pd.read_csv(final_file)
     out_dir = rec["recording_dir"] / "exports"
     out_dir.mkdir(exist_ok=True)
+
     csv_out = out_dir / f"{recording_id}_final_scoring_dash.csv"
     mat_out = out_dir / f"{recording_id}_final_scoring_dash.mat"
+    edf_out = out_dir / f"{recording_id}_signals_with_final_scoring.edf"
+
+    messages = []
+
     final.to_csv(csv_out, index=False)
+    messages.append(f"CSV exported:\n{csv_out}")
+
     if savemat is not None:
-        savemat(mat_out, {"scoring": final["final_code"].to_numpy(dtype=np.int16), "t0_s": final["t0_s"].to_numpy(float), "t1_s": final["t1_s"].to_numpy(float)})
-        return True, f"Exported:\n{csv_out}\n{mat_out}"
-    return True, f"Exported CSV:\n{csv_out}\nMAT export skipped because scipy.io.savemat is unavailable."
+        savemat(
+            mat_out,
+            {
+                "scoring": final["final_code"].to_numpy(dtype=np.int16),
+                "final_code": final["final_code"].to_numpy(dtype=np.int16),
+                "final_state": final["final_state"].fillna("Undefined").astype(str).to_numpy(dtype=object),
+                "t0_s": final["t0_s"].to_numpy(float),
+                "t1_s": final["t1_s"].to_numpy(float),
+            },
+        )
+        messages.append(f"MAT exported:\n{mat_out}")
+    else:
+        messages.append("MAT export skipped because scipy.io.savemat is unavailable.")
+
+    ok_edf, edf_msg = export_recording_edf(rec, final, edf_out)
+    messages.append(edf_msg)
+
+    return True, "\n\n".join(messages)
 
 
 
@@ -1712,20 +1864,20 @@ def render_tab(tab, project_root, _refresh):
                 ]),
                 html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr 2fr","gap":"6px", "marginTop":"8px"}, children=[
                     html.Button("Undo last action", id="btn-undo"),
-                    html.Button("Export final scoring", id="btn-export"),
+                    html.Button("Export final scoring CSV + MAT + EDF", id="btn-export"),
                     html.Button("Reset Final to empty", id="btn-reset-final-empty"),
                     html.Div("Shortcuts: P Pan, S Select window, 1 Wake, 2 NREM, 3 REM, A Somnotate/automatic, L Layer 1, M Manual"),
                 ]),
                 html.Div(className="card", style={"marginTop": "16px"}, children=[
                     html.H4("Final scoring utilities"),
                     html.Div(
-                        "Use these at the end of review, or to initialise an empty Final row from Somnotate. Existing reviewed labels are not overwritten.",
+                        "Use these at the end of review, or to initialise an empty Final row from Somnotate. Existing reviewed labels are not overwritten. The export button writes CSV, MAT, and EDF+ when pyedflib is available.",
                         className="app-subtitle",
                     ),
                     html.Div(style={"display":"grid", "gridTemplateColumns":"1fr 1fr 1fr", "gap":"8px", "marginTop":"8px"}, children=[
                         html.Button("Fill empty Final with Somnotate", id="btn-fill-empty-somnotate", n_clicks=0),
                         html.Button("Fill empty Final with Somnotate + export", id="btn-fill-empty-somnotate-export", n_clicks=0),
-                        html.Button("Export final scoring", id="btn-export-bottom", n_clicks=0),
+                        html.Button("Export final scoring CSV + MAT + EDF", id="btn-export-bottom", n_clicks=0),
                     ]),
                 ]),
                 html.Div(id="score-status", className="status-line", style={"whiteSpace":"pre-wrap"}),

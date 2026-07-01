@@ -249,6 +249,20 @@ If the repository still contains `sleep_stage_qc_v2_app.py`, treat it as legacy 
 
 ---
 
+---
+
+## Safe keyboard scoring and final utilities
+
+The QC / Review tab is designed so keyboard scoring uses the current confirmed selected interval. After a selected interval is scored, the selection is cleared, so a new interval must be selected before the next keyboard scoring action. This reduces the risk of accidentally scoring an older selection.
+
+The bottom of the QC / Review page includes **Final scoring utilities**:
+
+- **Fill empty Final with Somnotate**: fills only epochs where Final is still empty/Undefined; existing reviewed labels are preserved.
+- **Fill empty Final with Somnotate + export**: fills empty epochs from Somnotate, then exports the final scoring.
+- **Export final scoring**: exports the current Final scoring without changing labels.
+
+The QC page layout is ordered for review: dissociation review queue first, recording-position controls directly above the plot, then scoring/video/export tools below.
+
 ## Troubleshooting
 
 ### The app opens but no recordings appear
