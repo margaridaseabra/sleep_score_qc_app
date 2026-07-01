@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -242,8 +243,9 @@ def video_panel_children(video_file: str | Path | None, offset_s: float | int | 
         messages.append(html.Div(f"Video file not found: {p}", className="status-line"))
     elif suffix == ".avi":
         messages.append(html.Div(
-            "AVI files are accepted, but many browsers cannot play them directly. "
-            "If the player is blank, convert this file to MP4 and save the MP4 path instead.",
+            "AVI path saved. If the .avi file is not loading in this browser, "
+            "try another browser or convert the video to .mp4 using the helper command below, "
+            "then save the new .mp4 path instead.",
             className="status-line",
         ))
     elif suffix not in {".mp4", ".m4v", ".mov"}:
@@ -297,6 +299,78 @@ def save_video_metadata(project_root: str | Path, recording_id: str, video_file:
         return True, f"Saved video settings. {video_format_message(video_file)}"
     except Exception as e:
         return False, f"Could not save video settings: {type(e).__name__}: {e}"
+
+
+def next_available_mp4_path(avi_path: Path) -> Path:
+    """Return a non-overwriting MP4 path next to the AVI file."""
+    base = avi_path.with_suffix(".mp4")
+    if not base.exists():
+        return base
+
+    candidate = avi_path.with_name(f"{avi_path.stem}_converted.mp4")
+    if not candidate.exists():
+        return candidate
+
+    for i in range(2, 1000):
+        candidate = avi_path.with_name(f"{avi_path.stem}_converted_{i}.mp4")
+        if not candidate.exists():
+            return candidate
+
+    raise RuntimeError("Could not choose a free MP4 output filename.")
+
+
+def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str | None]:
+    """Convert an AVI file to browser-friendly H.264 MP4 using ffmpeg.
+
+    Returns (ok, message, output_path).
+    """
+    raw = str(video_file or "").strip()
+    if not raw:
+        return False, "Choose an AVI file first.", None
+
+    avi_path = Path(raw).expanduser().resolve()
+    if not avi_path.exists() or not avi_path.is_file():
+        return False, f"AVI file not found: {avi_path}", None
+
+    if avi_path.suffix.lower() != ".avi":
+        return False, "Automatic conversion is only needed for .avi files. MP4/MOV can be saved directly.", None
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return (
+            False,
+            "ffmpeg was not found. Install it with: brew install ffmpeg",
+            None,
+        )
+
+    out_path = next_available_mp4_path(avi_path)
+
+    cmd = [
+        ffmpeg,
+        "-i", str(avi_path),
+        "-map", "0:v:0",
+        "-an",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "fast",
+        "-crf", "23",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+
+    try:
+        p = subprocess.run(cmd, text=True, capture_output=True)
+    except Exception as e:
+        return False, f"Could not run ffmpeg: {type(e).__name__}: {e}", None
+
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip()
+        if len(err) > 3500:
+            err = err[-3500:]
+        return False, f"ffmpeg conversion failed. Terminal output:\n{err}", None
+
+    return True, f"Converted AVI to MP4 and saved new video path:\n{out_path}", str(out_path)
 
 
 def safe_float(x, default=0.0) -> float:
@@ -1417,7 +1491,7 @@ dcc.Graph(id="qc-graph"),
     html.Button(id="btn-fill-empty-somnotate"), html.Button(id="btn-fill-empty-somnotate-export"), html.Button(id="btn-export-bottom"),
     html.Div(id="score-status"),
     PInput(id="video-file-input"), PInput(id="video-offset-input"), html.Button(id="save-video-settings"),
-    html.Button(id="jump-video-window"), html.Button(id="jump-video-selected"),
+    html.Button(id="jump-video-window"), html.Button(id="jump-video-selected"), html.Button(id="convert-video-mp4"),
     html.Div(id="video-status"), html.Div(id="video-player-container"),
     dcc.Store(id="video-seek-store"), html.Div(id="video-seek-feedback"),
 
@@ -1579,7 +1653,7 @@ def render_tab(tab, project_root, _refresh):
                 html.Div(className="video-qc-card", children=[
                     html.H4("Video QC"),
                     html.Div(
-                        "Optional: link an .mp4/.mov/.avi video to this recording. MP4 is the most reliable browser format; AVI paths are saved but may need conversion to MP4.",
+                        "Optional: link an .mp4/.mov/.avi video to this recording. MP4 is the most reliable browser format. If an .avi file does not load in the browser, try another browser or convert the .avi video to .mp4 with the Terminal command below.",
                         className="app-subtitle",
                     ),
                     html.Div(
@@ -1591,19 +1665,43 @@ def render_tab(tab, project_root, _refresh):
                         ],
                     ),
                     html.Div(
-                        style={"display": "grid", "gridTemplateColumns": "1fr 1fr 2fr", "gap": "8px", "alignItems": "center", "marginTop": "8px"},
+                        style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1.4fr 2fr", "gap": "8px", "alignItems": "center", "marginTop": "8px"},
                         children=[
                             html.Button("Jump video to window start", id="jump-video-window", n_clicks=0),
                             html.Button("Play selected video interval", id="jump-video-selected", n_clicks=0),
-                            html.Div(id="video-status", className="status-line"),
+                            html.Button("Convert AVI to MP4 + save path", id="convert-video-mp4", n_clicks=0),
+                            dcc.Loading(type="circle", children=html.Div(id="video-status", className="status-line")),
                         ],
+                    ),
+                    html.Div(
+                        "During conversion, keep the app tab open. Large AVI files can take several minutes; the button shows a spinner while ffmpeg is running.",
+                        className="app-subtitle",
+                        style={"marginTop": "6px"},
                     ),
                     html.Div(id="video-player-container", style={"marginTop": "10px"}),
                     dcc.Store(id="video-seek-store"),
                     html.Div(id="video-seek-feedback", className="status-line"),
                     html.Details(children=[
-                        html.Summary("AVI conversion helper"),
-                        html.Pre("ffmpeg -i input_video.avi -c:v libx264 -crf 23 -preset fast -c:a aac output_video.mp4", className="log-box"),
+                        html.Summary("AVI not loading? Convert AVI to MP4"),
+                        html.Div(
+                            "If your .avi file is not loading in this browser, click “Convert AVI to MP4 + save path” above. You can also do the same conversion manually in Terminal with this command. Replace videoname.avi and videoname.mp4 with your real file names or full paths.",
+                            className="app-subtitle",
+                            style={"marginTop": "6px", "marginBottom": "6px"},
+                        ),
+                        html.Pre(
+                            "\n".join([
+                                'ffmpeg -i "videoname.avi" \\',
+                                '  -map 0:v:0 \\',
+                                '  -an \\',
+                                '  -c:v libx264 \\',
+                                '  -pix_fmt yuv420p \\',
+                                '  -preset fast \\',
+                                '  -crf 23 \\',
+                                '  -movflags +faststart \\',
+                                '  "videoname.mp4"',
+                            ]),
+                            className="log-box",
+                        ),
                     ]),
                 ]),
 
@@ -2244,12 +2342,13 @@ def score_or_export(*args):
     Output("video-status", "children"),
     Input("recording-id-store", "data"),
     Input("save-video-settings", "n_clicks"),
+    Input("convert-video-mp4", "n_clicks"),
     State("project-root-store", "data"),
     State("video-file-input", "value"),
     State("video-offset-input", "value"),
     prevent_initial_call=True,
 )
-def update_video_panel(recording_id, save_clicks, project_root, video_file_value, video_offset_value):
+def update_video_panel(recording_id, save_clicks, convert_clicks, project_root, video_file_value, video_offset_value):
     if not project_root or not recording_id:
         return "", 0.0, html.Div("Load a recording to enable video QC.", className="app-subtitle"), "Load a recording first."
 
@@ -2260,6 +2359,19 @@ def update_video_panel(recording_id, save_clicks, project_root, video_file_value
         offset_s = safe_float(video_offset_value, 0.0)
         ok, msg = save_video_metadata(project_root, recording_id, video_file, offset_s)
         return video_file, offset_s, video_panel_children(video_file, offset_s), msg
+
+    if trig == "convert-video-mp4":
+        original_video_file = str(video_file_value or "").strip()
+        offset_s = safe_float(video_offset_value, 0.0)
+        ok, msg, converted_path = convert_avi_to_browser_mp4(original_video_file)
+        if not ok or not converted_path:
+            return original_video_file, offset_s, video_panel_children(original_video_file, offset_s), msg
+
+        ok_save, save_msg = save_video_metadata(project_root, recording_id, converted_path, offset_s)
+        combined_msg = msg if ok_save else f"{msg}\nCould not save converted path: {save_msg}"
+        if ok_save:
+            combined_msg = f"{msg}\n{save_msg}"
+        return converted_path, offset_s, video_panel_children(converted_path, offset_s), combined_msg
 
     video_file, offset_s = load_video_metadata(project_root, recording_id)
     return video_file, offset_s, video_panel_children(video_file, offset_s), video_format_message(video_file)
