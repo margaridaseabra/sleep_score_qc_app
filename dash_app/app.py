@@ -492,11 +492,34 @@ def available_recordings(project_root: str | Path | None) -> list[dict[str, str]
     return [{"label": str(x), "value": str(x)} for x in manifest["recording_id"].astype(str).tolist()]
 
 
-def available_models() -> list[dict[str, str]]:
-    if not SOMNOTATE_MODELS_DIR.exists():
-        return []
-    models = sorted(SOMNOTATE_MODELS_DIR.glob("*.pickle"))
-    return [{"label": p.name, "value": str(p)} for p in models]
+def available_models(project_root: str | Path | None = None) -> list[dict[str, str]]:
+    """Return Somnotate .pickle models from the app and the loaded project.
+
+    Models trained from inside the app are saved under
+    project_root/somnotate_models, while lab-shared models can still live in
+    APP_DIR/somnotate_models.
+    """
+    folders = []
+    if SOMNOTATE_MODELS_DIR.exists():
+        folders.append(SOMNOTATE_MODELS_DIR)
+    if project_root:
+        p = Path(project_root).expanduser() / "somnotate_models"
+        if p.exists():
+            folders.append(p)
+
+    seen = set()
+    models = []
+    for folder in folders:
+        for p in sorted(folder.glob("*.pickle")):
+            rp = str(p.expanduser().resolve())
+            if rp in seen:
+                continue
+            seen.add(rp)
+            # Include the parent folder so project-trained and app-shared models
+            # with the same filename remain distinguishable in the dropdown.
+            label = f"{p.name}  —  {p.parent.name}"
+            models.append({"label": label, "value": str(p)})
+    return models
 
 
 def state_display_codes(labels: list[str] | np.ndarray, row_name: str = "") -> np.ndarray:
@@ -1648,8 +1671,9 @@ dcc.Graph(id="qc-graph"),
     dcc.Store(id="video-seek-store"), html.Div(id="video-seek-feedback"),
 
     # Somnotate tab
-    PInput(id="som-recording-ids"), PInput(id="som-target-fs"), PInput(id="som-root"),
+    PInput(id="som-recording-ids"), PInput(id="som-target-fs"), PDropdown(id="som-epoch-sec"), PInput(id="som-root"),
     PInput(id="som-conda-env"), PInput(id="som-python"), PDropdown(id="som-model-file"),
+    html.Div(id="som-epoch-warning"),
     dcc.Checklist(id="som-existing-steps"), html.Button(id="btn-som-existing"),
     PInput(id="som-train-ids"), PInput(id="som-test-ids"), PInput(id="som-model-name"),
     dcc.Checklist(id="som-train-steps"), html.Button(id="btn-som-train"), html.Button(id="btn-som-import-results"),
@@ -1885,18 +1909,38 @@ def render_tab(tab, project_root, _refresh):
         ])
 
     if tab == "tab-somnotate":
-        models = available_models()
+        models = available_models(project_root)
         return html.Div(className="card", children=[
             html.H3("Somnotate"),
             html.Div("These buttons call the external Somnotate pipeline. A spinner and command log will appear while each workflow runs.", className="app-subtitle"),
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"10px"}, children=[
                 html.Div([html.Label("Recording IDs, comma-separated"), PInput(id="som-recording-ids", type="text", value=",".join([o["value"] for o in rec_options[:1]]), style={"width":"100%"})]),
                 html.Div([html.Label("Target fs"), PInput(id="som-target-fs", type="number", value=512.0, style={"width":"100%"})]),
+                html.Div([html.Label("Somnotate epoch sec"), PDropdown(
+                    id="som-epoch-sec",
+                    options=[
+                        {"label": "1 s epochs", "value": "1.0"},
+                        {"label": "2 s epochs", "value": "2.0"},
+                    ],
+                    value="1.0",
+                    clearable=False,
+                    style={"width":"100%"},
+                )]),
                 html.Div([html.Label("Somnotate repository path"), PInput(id="som-root", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Somnotate conda env"), PInput(id="som-conda-env", type="text", value="somnotate_env", style={"width":"100%"})]),
                 html.Div([html.Label("Optional Somnotate Python executable"), PInput(id="som-python", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Existing model"), PDropdown(id="som-model-file", options=models, value=models[0]["value"] if models else None)]),
             ]),
+            html.Div(
+                id="som-epoch-warning",
+                className="status-line",
+                style={"whiteSpace": "pre-wrap", "marginTop": "8px"},
+                children=(
+                    "Somnotate epoch warning: models are epoch-length specific. "
+                    "Use 1 s models with 1 s epochs and 2 s models with 2 s epochs. "
+                    "The app saves metadata for newly trained models and blocks known mismatches."
+                ),
+            ),
             html.H4("Use existing model"),
             dcc.Checklist(id="som-existing-steps", options=[{"label":x,"value":x} for x in ["prepare","preprocess","score","probabilities","import-results"]], value=["prepare","preprocess","score","probabilities","import-results"], inline=True),
             html.Button("Run existing-model workflow", id="btn-som-existing", n_clicks=0),
@@ -2634,21 +2678,80 @@ app.clientside_callback(
 # -----------------------------------------------------------------------------
 # Somnotate callbacks
 # -----------------------------------------------------------------------------
-@app.callback(Output("som-log", "children"), Input("btn-som-existing", "n_clicks"), Input("btn-som-train", "n_clicks"), Input("btn-som-import-results", "n_clicks"), State("project-root-store", "data"), State("som-recording-ids", "value"), State("som-target-fs", "value"), State("som-root", "value"), State("som-conda-env", "value"), State("som-python", "value"), State("som-model-file", "value"), State("som-existing-steps", "value"), State("som-train-ids", "value"), State("som-test-ids", "value"), State("som-model-name", "value"), State("som-train-steps", "value"), prevent_initial_call=True)
-def run_somnotate(n_exist, n_train, n_import, project_root, rec_ids, target_fs, som_root, som_env, som_py, model_file, steps, train_ids, test_ids, model_name, train_steps):
+
+
+def read_somnotate_model_epoch_metadata(model_file: str | Path | None) -> tuple[float | None, str]:
+    if not model_file:
+        return None, ""
+    p = Path(str(model_file)).expanduser()
+    candidates = [p.with_suffix(".metadata.json"), p.with_name(p.name + ".metadata.json")]
+    for meta_path in candidates:
+        if meta_path.exists():
+            try:
+                meta = read_json(meta_path)
+                val = meta.get("somnotate_epoch_sec", meta.get("epoch_sec", meta.get("time_resolution")))
+                if val is not None:
+                    return float(val), str(meta_path)
+                return None, str(meta_path)
+            except Exception:
+                return None, str(meta_path)
+    return None, ""
+
+
+@app.callback(
+    Output("som-epoch-warning", "children"),
+    Input("som-model-file", "value"),
+    Input("som-epoch-sec", "value"),
+)
+def update_somnotate_epoch_warning(model_file, som_epoch_sec):
+    selected_epoch = safe_float(som_epoch_sec, 1.0)
+    base = (
+        "Somnotate epoch warning: models are epoch-length specific. "
+        "Use 1 s models with 1 s epochs and 2 s models with 2 s epochs. "
+    )
+    if not model_file:
+        return base + f"You selected {selected_epoch:g} s epochs. Select a model, or train a new matching model."
+
+    model_epoch, meta_path = read_somnotate_model_epoch_metadata(model_file)
+    if model_epoch is None:
+        return (
+            base
+            + f"You selected {selected_epoch:g} s epochs. This model has no readable epoch metadata, "
+            + "so only use it if you know it was trained with the same epoch length."
+        )
+
+    if abs(model_epoch - selected_epoch) > 1e-6:
+        return (
+            "⚠️ Somnotate epoch mismatch. "
+            f"Selected model metadata says {model_epoch:g} s epochs, "
+            f"but the app is set to {selected_epoch:g} s epochs. "
+            "Choose a matching model or change Somnotate epoch sec before running. "
+            "Known mismatches are blocked by the pipeline. "
+            f"Metadata: {meta_path}"
+        )
+
+    return (
+        f"Somnotate epoch OK: selected epoch = {selected_epoch:g} s and model metadata = {model_epoch:g} s. "
+        "New models trained from this tab will also save epoch metadata."
+    )
+
+
+@app.callback(Output("som-log", "children"), Input("btn-som-existing", "n_clicks"), Input("btn-som-train", "n_clicks"), Input("btn-som-import-results", "n_clicks"), State("project-root-store", "data"), State("som-recording-ids", "value"), State("som-target-fs", "value"), State("som-epoch-sec", "value"), State("som-root", "value"), State("som-conda-env", "value"), State("som-python", "value"), State("som-model-file", "value"), State("som-existing-steps", "value"), State("som-train-ids", "value"), State("som-test-ids", "value"), State("som-model-name", "value"), State("som-train-steps", "value"), prevent_initial_call=True)
+def run_somnotate(n_exist, n_train, n_import, project_root, rec_ids, target_fs, som_epoch_sec, som_root, som_env, som_py, model_file, steps, train_ids, test_ids, model_name, train_steps):
     if not project_root: return "Load project first."
     trig = callback_context.triggered_id
     base = [sys.executable, str(PIPELINES_DIR/"10_somnotate_layer.py")]
+    epoch_arg = str(som_epoch_sec or "1.0")
     if trig == "btn-som-existing":
-        cmd = base + ["use-existing-model", "--project-root", str(project_root), "--recording-ids", str(rec_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-file", str(model_file or ""), "--target-fs", str(target_fs or 512)]
+        cmd = base + ["use-existing-model", "--project-root", str(project_root), "--recording-ids", str(rec_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-file", str(model_file or ""), "--target-fs", str(target_fs or 512), "--epoch-sec", epoch_arg]
         if som_py: cmd += ["--somnotate-python", str(som_py)]
         for s in steps or []: cmd += [f"--{s}"]
     elif trig == "btn-som-train":
-        cmd = base + ["train-model", "--project-root", str(project_root), "--train-recording-ids", str(train_ids or ""), "--test-recording-ids", str(test_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-name", str(model_name or "model"), "--target-fs", str(target_fs or 512)]
+        cmd = base + ["train-model", "--project-root", str(project_root), "--train-recording-ids", str(train_ids or ""), "--test-recording-ids", str(test_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-name", str(model_name or "model"), "--target-fs", str(target_fs or 512), "--epoch-sec", epoch_arg]
         if som_py: cmd += ["--somnotate-python", str(som_py)]
         for s in train_steps or []: cmd += [f"--{s}"]
     elif trig == "btn-som-import-results":
-        cmd = base + ["import-results", "--project-root", str(project_root), "--recording-ids", str(rec_ids or "")]
+        cmd = base + ["import-results", "--project-root", str(project_root), "--recording-ids", str(rec_ids or ""), "--epoch-sec", epoch_arg]
     else:
         return no_update
     code, out = run_command(cmd)
