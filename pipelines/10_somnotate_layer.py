@@ -38,6 +38,22 @@ def run_step(cmd: list[str], title: str, cwd: Path | None = None) -> subprocess.
     if result.returncode != 0:
         if result.stderr:
             print(result.stderr)
+
+        combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if ("features" in combined_output and "expecting" in combined_output and "LinearDiscriminantAnalysis" in combined_output):
+            print()
+            print("Somnotate feature-count mismatch detected.")
+            print("This usually means the selected model was trained with a different")
+            print("Somnotate epoch length / time_resolution or preprocessing configuration")
+            print("than the one selected in the app.")
+            print()
+            print("For example, at 512 Hz with EEG+EMG:")
+            print("  1 s Somnotate epochs often produce 156 features.")
+            print("  5 s legacy Somnotate epochs often produce 788 features.")
+            print()
+            print("Fix: choose the epoch length that matches the model, or train a new")
+            print("model at the epoch length you want to use.")
+
         raise RuntimeError(f"Failed: {title}")
     if result.stderr:
         # Some Somnotate scripts emit warnings to stderr even on success.
@@ -847,7 +863,7 @@ def add_epoch_arg(p: argparse.ArgumentParser) -> None:
         "--epoch-sec",
         type=float,
         default=1.0,
-        choices=[1.0, 2.0],
+        choices=[1.0, 2.0, 5.0],
         help="Somnotate epoch length/time resolution in seconds. Models are epoch-specific.",
     )
 

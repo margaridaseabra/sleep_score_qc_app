@@ -1673,7 +1673,7 @@ dcc.Graph(id="qc-graph"),
     # Somnotate tab
     PInput(id="som-recording-ids"), PInput(id="som-target-fs"), PDropdown(id="som-epoch-sec"), PInput(id="som-root"),
     PInput(id="som-conda-env"), PInput(id="som-python"), PDropdown(id="som-model-file"),
-    html.Div(id="som-epoch-warning"),
+    html.Div(id="som-epoch-warning"), html.Div(id="som-existing-epoch-summary"), html.Div(id="som-train-epoch-summary"),
     dcc.Checklist(id="som-existing-steps"), html.Button(id="btn-som-existing"),
     PInput(id="som-train-ids"), PInput(id="som-test-ids"), PInput(id="som-model-name"),
     dcc.Checklist(id="som-train-steps"), html.Button(id="btn-som-train"), html.Button(id="btn-som-import-results"),
@@ -1916,13 +1916,14 @@ def render_tab(tab, project_root, _refresh):
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"10px"}, children=[
                 html.Div([html.Label("Recording IDs, comma-separated"), PInput(id="som-recording-ids", type="text", value=",".join([o["value"] for o in rec_options[:1]]), style={"width":"100%"})]),
                 html.Div([html.Label("Target fs"), PInput(id="som-target-fs", type="number", value=512.0, style={"width":"100%"})]),
-                html.Div([html.Label("Somnotate epoch sec"), PDropdown(
+                html.Div([html.Label("Somnotate epoch sec — applies to scoring and training"), PDropdown(
                     id="som-epoch-sec",
                     options=[
                         {"label": "1 s epochs", "value": "1.0"},
                         {"label": "2 s epochs", "value": "2.0"},
+                        {"label": "5 s epochs (legacy Somnotate models)", "value": "5.0"},
                     ],
-                    value="1.0",
+                    value="5.0",
                     clearable=False,
                     style={"width":"100%"},
                 )]),
@@ -1937,14 +1938,26 @@ def render_tab(tab, project_root, _refresh):
                 style={"whiteSpace": "pre-wrap", "marginTop": "8px"},
                 children=(
                     "Somnotate epoch warning: models are epoch-length specific. "
-                    "Use 1 s models with 1 s epochs and 2 s models with 2 s epochs. "
+                    "Use models with the same epoch length used for preprocessing/training. For example: 1 s models with 1 s epochs, 2 s models with 2 s epochs, and legacy 5 s Somnotate models with 5 s epochs. "
                     "The app saves metadata for newly trained models and blocks known mismatches."
                 ),
             ),
             html.H4("Use existing model"),
+            html.Div(
+                id="som-existing-epoch-summary",
+                className="status-line",
+                style={"whiteSpace": "pre-wrap", "margin": "4px 0 8px 0"},
+                children="Existing-model scoring uses the Somnotate epoch sec selected above.",
+            ),
             dcc.Checklist(id="som-existing-steps", options=[{"label":x,"value":x} for x in ["prepare","preprocess","score","probabilities","import-results"]], value=["prepare","preprocess","score","probabilities","import-results"], inline=True),
             html.Button("Run existing-model workflow", id="btn-som-existing", n_clicks=0),
             html.H4("Train new model"),
+            html.Div(
+                id="som-train-epoch-summary",
+                className="status-line",
+                style={"whiteSpace": "pre-wrap", "margin": "4px 0 8px 0"},
+                children="Training uses the Somnotate epoch sec selected above. Change it to 1 s, 2 s, or 5 s before pressing Train new model.",
+            ),
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"10px"}, children=[
                 html.Div([html.Label("Train recording IDs"), PInput(id="som-train-ids", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Test recording IDs, optional"), PInput(id="som-test-ids", type="text", style={"width":"100%"})]),
@@ -2699,6 +2712,25 @@ def read_somnotate_model_epoch_metadata(model_file: str | Path | None) -> tuple[
 
 
 @app.callback(
+    Output("som-existing-epoch-summary", "children"),
+    Output("som-train-epoch-summary", "children"),
+    Input("som-epoch-sec", "value"),
+)
+def update_somnotate_epoch_summaries(som_epoch_sec):
+    selected_epoch = safe_float(som_epoch_sec, 1.0)
+    existing_msg = (
+        f"Existing-model scoring will run Somnotate with {selected_epoch:g} s epochs. "
+        f"Select only a model trained with {selected_epoch:g} s epochs, or use a legacy model only if you know it matches."
+    )
+    train_msg = (
+        f"New model training will create a {selected_epoch:g} s Somnotate model. "
+        "This epoch length is saved next to the trained model in a .metadata.json file. "
+        "Change the dropdown above before pressing Train new model."
+    )
+    return existing_msg, train_msg
+
+
+@app.callback(
     Output("som-epoch-warning", "children"),
     Input("som-model-file", "value"),
     Input("som-epoch-sec", "value"),
@@ -2707,7 +2739,7 @@ def update_somnotate_epoch_warning(model_file, som_epoch_sec):
     selected_epoch = safe_float(som_epoch_sec, 1.0)
     base = (
         "Somnotate epoch warning: models are epoch-length specific. "
-        "Use 1 s models with 1 s epochs and 2 s models with 2 s epochs. "
+        "Use models with the same epoch length used for preprocessing/training. For example: 1 s models with 1 s epochs, 2 s models with 2 s epochs, and legacy 5 s Somnotate models with 5 s epochs. "
     )
     if not model_file:
         return base + f"You selected {selected_epoch:g} s epochs. Select a model, or train a new matching model."
