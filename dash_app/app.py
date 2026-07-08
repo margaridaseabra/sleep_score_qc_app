@@ -1,8 +1,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2026,9 +2028,33 @@ def render_tab(tab, project_root, _refresh):
             html.Div("Find where Layer 1, Somnotate, Manual and Final scoring disagree, then jump to those periods from the QC viewer.", className="app-subtitle"),
             html.Div(style={"display":"flex","gap":"8px","alignItems":"center", "flexWrap":"wrap"}, children=[
                 html.Label("Recording:"), PDropdown(id="stats-recording", options=rec_options, value=rec_options[0]["value"] if rec_options else None, style={"width":"360px"}),
-                html.Label("Threshold:"), PInput(id="diss-threshold", type="number", value=0.20, step=0.05, style={"width":"100px"}),
+                html.Label("Event threshold:"), PInput(id="diss-threshold", type="number", value=0.20, step=0.05, style={"width":"100px"}),
                 html.Button("Run dissociation analysis", id="btn-run-diss", n_clicks=0),
             ]),
+            html.Div(
+                className="status-line",
+                style={"whiteSpace": "pre-wrap", "marginTop": "8px"},
+                children=[
+                    html.B("What does the threshold do? "),
+                    html.Span(
+                        "The pipeline gives each epoch a dissociation score from 0 to 1. "
+                        "Epochs with score ≥ threshold are grouped into review events. "
+                        "Lower values catch more possible problems; higher values show fewer, stronger disagreements. "
+                        "Start around 0.20 for broad review and increase to 0.30 if the event list is too noisy."
+                    ),
+                ],
+            ),
+            html.Div(
+                className="status-line",
+                style={"whiteSpace": "pre-wrap", "marginTop": "4px"},
+                children=[
+                    html.B("Label note: "),
+                    html.Span(
+                        "Somnotate = Wake/NREM/REM. Somnotate Wake/Sleep = the same Somnotate output collapsed to Wake vs Sleep, "
+                        "so it can be compared with Layer 1. Somnotate Wake/Sleep is not a separate model."
+                    ),
+                ],
+            ),
             html.Div(id="diss-action-status", className="status-line"),
             dcc.Loading(type="circle", children=html.Div(id="diss-log")),
             html.Div(id="diss-pairwise"),
@@ -3322,6 +3348,506 @@ def find_first_numeric_col(df, candidates):
     return None
 
 
+
+def normalize_state_label(x, collapse_sleep=False):
+    """Return a clean display label for sleep-state values."""
+    if x is None:
+        return "Undefined"
+    try:
+        if pd.isna(x):
+            return "Undefined"
+    except Exception:
+        pass
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "none", "null", "undefined", "uncertain", "unknown"}:
+        return "Undefined"
+    low = s.lower().replace("_", " ").replace("-", " ")
+    if "wake" in low:
+        out = "Wake"
+    elif "rem" in low and "nrem" not in low:
+        out = "REM"
+    elif "nrem" in low or low in {"nr", "non rem"}:
+        out = "NREM"
+    elif "sleep" in low:
+        out = "Sleep"
+    elif "artifact" in low:
+        out = "Artifact"
+    else:
+        out = s
+    if collapse_sleep and out in {"NREM", "REM", "Sleep"}:
+        return "Sleep"
+    return out
+
+
+def is_unreviewed_state(x):
+    return normalize_state_label(x) in {"Undefined", "Uncertain", ""}
+
+
+def simplify_source_key(k):
+    return re.sub(r"[^a-z0-9]+", "", str(k).lower())
+
+
+SOURCE_KEY_ALIASES = {
+    "Layer 1": {
+        "layer1", "layer1state", "layer1label", "layer1ws", "layer1wakesleep", "l1", "layerone"
+    },
+    "Somnotate": {
+        "somnotate", "somnotatestate", "somnotatefull", "somnotatewnr", "som", "somstate"
+    },
+    "Somnotate Wake/Sleep": {
+        "somnotatews", "somnotatewakesleep", "somnotatebinary", "somws", "somnotatecollapsed"
+    },
+    "Final": {
+        "final", "finalstate", "appfinal", "reviewed", "reviewedstate"
+    },
+    "Manual": {
+        "manual", "manualstate", "manualscore", "manualscoring"
+    },
+}
+
+
+def parse_states_at_peak(value):
+    """Parse the event states_at_peak field into a source->state dictionary.
+
+    The exact string format has changed across app versions, so this accepts
+    dictionaries, JSON-like strings, and key=value / key: value summaries.
+    """
+    if value is None:
+        return {}
+    try:
+        if pd.isna(value):
+            return {}
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        raw = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return {}
+        raw = None
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(text)
+                if isinstance(parsed, dict):
+                    raw = parsed
+                    break
+            except Exception:
+                pass
+        if raw is None:
+            raw = {}
+            # Accept formats such as "Layer 1=Wake | Somnotate=REM" or
+            # "layer1: Wake, somnotate: REM".
+            parts = re.split(r"\s*[|;\n]+\s*", text)
+            if len(parts) == 1:
+                parts = re.split(r"\s*,\s*(?=[A-Za-z0-9 _/-]+\s*[:=])", text)
+            for part in parts:
+                if not part:
+                    continue
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                elif ":" in part:
+                    k, v = part.split(":", 1)
+                else:
+                    continue
+                k = k.strip().strip("'\"")
+                v = v.strip().strip("'\"{}[]")
+                if k:
+                    raw[k] = v
+    out = {}
+    for k, v in raw.items():
+        sk = simplify_source_key(k)
+        matched = None
+        for canonical, aliases in SOURCE_KEY_ALIASES.items():
+            if sk in aliases:
+                matched = canonical
+                break
+        if matched is None:
+            # Keep unknown keys, but make them readable.
+            matched = str(k).replace("_", " ").strip()
+        out[matched] = normalize_state_label(v)
+    return out
+
+
+def event_source_series(events, source_name):
+    """Return event-level state values for a source, using columns or states_at_peak."""
+    if events is None or len(events) == 0:
+        return pd.Series(dtype=object)
+
+    candidates = {
+        "Layer 1": ["layer1_state", "layer1_label", "layer_1_state", "Layer 1", "layer1"],
+        "Somnotate": ["somnotate_state", "som_state", "Somnotate", "somnotate"],
+        "Somnotate Wake/Sleep": ["somnotate_ws", "somnotate_wake_sleep", "somnotate_ws_state", "Somnotate WS"],
+        "Final": ["final_state", "app_final_state", "Final", "final"],
+        "Manual": ["manual_state", "Manual", "manual"],
+    }.get(source_name, [])
+
+    for col in candidates:
+        if col in events.columns:
+            return events[col].map(normalize_state_label)
+
+    if "states_at_peak" in events.columns:
+        vals = []
+        for x in events["states_at_peak"]:
+            d = parse_states_at_peak(x)
+            vals.append(normalize_state_label(d.get(source_name, "Undefined")))
+        return pd.Series(vals, index=events.index, dtype=object)
+
+    return pd.Series(["Undefined"] * len(events), index=events.index, dtype=object)
+
+
+def biological_interpretation(som_state, layer_state, final_state=None):
+    som = normalize_state_label(som_state)
+    layer = normalize_state_label(layer_state, collapse_sleep=True)
+    final = normalize_state_label(final_state) if final_state is not None else "Undefined"
+    if som == "REM" and layer == "Wake":
+        return "REM/Wake conflict: check EMG, movement, and whether REM was overcalled or Layer 1 was too wake-biased."
+    if som == "NREM" and layer == "Wake":
+        return "NREM/Wake conflict: often quiet wake vs NREM ambiguity."
+    if som == "Wake" and layer == "Sleep":
+        return "Wake/Sleep conflict: possible low-EMG wake, drowsiness, or Layer 1 sleep overcall."
+    if som == "REM" and final in {"Wake", "NREM"}:
+        return "Reviewer corrected Somnotate REM; inspect as possible false REM or transition."
+    if som == "REM" and final == "REM":
+        return "Reviewer kept Somnotate REM at this peak."
+    return "General scoring disagreement or low-confidence period."
+
+
+def render_flagged_state_patterns(events):
+    """Summarize what biological state combinations dominate flagged events."""
+    if events is None or len(events) == 0:
+        return html.Div(className="card", children=[html.H4("Somnotate vs Layer 1 biological patterns"), html.Div("No flagged events to summarize.", className="app-subtitle")])
+
+    df = events.copy()
+    df["somnotate_peak"] = event_source_series(df, "Somnotate")
+    df["layer1_peak"] = event_source_series(df, "Layer 1").map(lambda x: normalize_state_label(x, collapse_sleep=True))
+    df["final_peak"] = event_source_series(df, "Final")
+
+    # Keep only biologically interpretable Layer 1 comparisons.
+    # Layer 1 = Undefined usually means that the state could not be parsed or is missing,
+    # not a meaningful Wake/Sleep conflict. Excluding it keeps this summary focused on
+    # interpretable patterns such as Somnotate REM / Layer 1 Wake.
+    before_filter_n = len(df)
+    usable = df[df["layer1_peak"] != "Undefined"].copy()
+    excluded_layer1_undefined_n = before_filter_n - len(usable)
+
+    # Also drop rows where Somnotate is undefined, because the biological pattern
+    # needs a named Somnotate state to be interpretable.
+    usable = usable[usable["somnotate_peak"] != "Undefined"].copy()
+
+    if len(usable) == 0:
+        # Do not show a large warning card when Layer 1 is mostly Undefined.
+        # In that case the biologically useful comparison is Somnotate vs Final,
+        # which is rendered separately below/above this section.
+        return html.Div(style={"display": "none"})
+
+    usable["pattern"] = "Somnotate " + usable["somnotate_peak"].astype(str) + " / Layer 1 " + usable["layer1_peak"].astype(str)
+    counts = usable.groupby(["somnotate_peak", "layer1_peak", "pattern"], dropna=False).size().reset_index(name="events")
+    counts = counts.sort_values("events", ascending=False).head(12)
+    total = len(usable)
+    counts["% interpretable events"] = (100.0 * counts["events"] / max(total, 1)).round(1)
+    counts["interpretation"] = [biological_interpretation(s, l) for s, l in zip(counts["somnotate_peak"], counts["layer1_peak"])]
+    table = counts[["pattern", "events", "% interpretable events", "interpretation"]].copy()
+
+    most = table.iloc[0]
+    summary = (
+        f"Most common interpretable flagged pattern: {most['pattern']} "
+        f"({int(most['events'])} events, {most['% interpretable events']:.1f}% of events with defined Layer 1 and Somnotate states)."
+    )
+    if excluded_layer1_undefined_n:
+        summary += f" Excluded {excluded_layer1_undefined_n} events where Layer 1 was Undefined."
+
+    return html.Div(className="card", children=[
+        html.H4("Somnotate vs Layer 1 biological patterns"),
+        html.Div(summary, className="app-subtitle", style={"marginBottom": "8px"}),
+        dash_table.DataTable(
+            data=table.to_dict("records"),
+            columns=[{"name": c, "id": c} for c in table.columns],
+            page_size=8,
+            sort_action="native",
+            style_table={"overflowX": "auto"},
+            style_cell={"fontSize": 12, "padding": "8px", "textAlign": "left", "whiteSpace": "normal", "height": "auto", "maxWidth": "440px"},
+            style_header={"fontWeight": "bold", "background": "#F3F4F6", "border": "1px solid #E5E7EB"},
+            style_data={"border": "1px solid #E5E7EB"},
+            style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#FAFAFA"}],
+        ),
+    ])
+
+
+def somnotate_final_interpretation(som_state, final_state):
+    """Short biological/review interpretation for Somnotate vs Final differences."""
+    som = normalize_state_label(som_state)
+    final = normalize_state_label(final_state)
+
+    if som == "REM" and final == "Wake":
+        return "Somnotate REM was corrected to Wake: inspect EMG/movement and possible false REM."
+    if som == "REM" and final == "NREM":
+        return "Somnotate REM was corrected to NREM: inspect theta/delta balance and REM transition boundaries."
+    if som == "NREM" and final == "Wake":
+        return "Somnotate NREM was corrected to Wake: quiet wake vs NREM ambiguity or sleep overcall."
+    if som == "NREM" and final == "REM":
+        return "Reviewer upgraded NREM to REM: possible missed REM or transition into REM."
+    if som == "Wake" and final == "NREM":
+        return "Somnotate Wake was corrected to NREM: low-EMG quiet sleep may have been missed."
+    if som == "Wake" and final == "REM":
+        return "Somnotate Wake was corrected to REM: check for REM with movement or model miss."
+    return "Somnotate and Final differ at the event peak; inspect raw EEG/EMG and neighboring epochs."
+
+
+def render_somnotate_final_patterns(events):
+    """Summarize biologically meaningful Somnotate vs reviewed Final differences."""
+    if events is None or len(events) == 0:
+        return html.Div(className="card", children=[
+            html.H4("Somnotate vs Final biological patterns"),
+            html.Div("No flagged events to compare yet.", className="app-subtitle"),
+        ])
+
+    df = events.copy()
+    df["somnotate_peak"] = event_source_series(df, "Somnotate")
+    df["final_peak"] = event_source_series(df, "Final")
+    df["layer1_peak"] = event_source_series(df, "Layer 1").map(lambda x: normalize_state_label(x, collapse_sleep=True))
+
+    df["somnotate_peak"] = df["somnotate_peak"].map(normalize_state_label)
+    df["final_peak"] = df["final_peak"].map(normalize_state_label)
+
+    total_events = len(df)
+    has_som = df["somnotate_peak"] != "Undefined"
+    final_reviewed = ~df["final_peak"].map(is_unreviewed_state)
+    usable = df[has_som & final_reviewed].copy()
+    unreviewed_n = int((has_som & ~final_reviewed).sum())
+    no_som_n = int((~has_som).sum())
+
+    if len(usable) == 0:
+        pieces = [
+            "No flagged events have both a defined Somnotate state and a reviewed Final state yet."
+        ]
+        if unreviewed_n:
+            pieces.append(f"{unreviewed_n} flagged events have Somnotate defined but Final is still Undefined/unreviewed.")
+        if no_som_n:
+            pieces.append(f"{no_som_n} flagged events have no defined Somnotate state at the peak.")
+        return html.Div(className="card", children=[
+            html.H4("Somnotate vs Final biological patterns"),
+            html.Div(" ".join(pieces), className="app-subtitle"),
+        ])
+
+    agreement_n = int((usable["somnotate_peak"] == usable["final_peak"]).sum())
+    disagree = usable[usable["somnotate_peak"] != usable["final_peak"]].copy()
+    disagreement_n = len(disagree)
+
+    cards = html.Div(className="dashboard-grid", children=[
+        compact_metric_card("Flagged events with reviewed Final", len(usable)),
+        compact_metric_card("Somnotate = Final", f"{agreement_n} ({100*agreement_n/max(len(usable),1):.1f}%)"),
+        compact_metric_card("Somnotate ≠ Final", f"{disagreement_n} ({100*disagreement_n/max(len(usable),1):.1f}%)"),
+        compact_metric_card("Final still unreviewed", unreviewed_n),
+    ])
+
+    if disagreement_n == 0:
+        return html.Div(className="card", children=[
+            html.H4("Somnotate vs Final biological patterns"),
+            html.Div(
+                "Among flagged events with reviewed Final scoring, Somnotate and Final agree at the event peak. "
+                "This suggests the current flagged events are not mainly reviewer corrections of Somnotate state labels.",
+                className="app-subtitle",
+                style={"marginBottom": "8px"},
+            ),
+            cards,
+        ])
+
+    disagree["pattern"] = "Somnotate " + disagree["somnotate_peak"].astype(str) + " / Final " + disagree["final_peak"].astype(str)
+    rows = []
+    for (som, final, pattern), sub in disagree.groupby(["somnotate_peak", "final_peak", "pattern"], dropna=False):
+        layer_mode = sub["layer1_peak"].mode()
+        rows.append({
+            "pattern": pattern,
+            "events": int(len(sub)),
+            "% Somnotate-Final disagreements": round(100.0 * len(sub) / max(disagreement_n, 1), 1),
+            "main Layer 1 context": str(layer_mode.iloc[0]) if len(layer_mode) else "Undefined",
+            "interpretation": somnotate_final_interpretation(som, final),
+        })
+
+    table = pd.DataFrame(rows).sort_values("events", ascending=False).head(12)
+    most = table.iloc[0]
+    summary = (
+        f"Most common Somnotate/Final correction pattern: {most['pattern']} "
+        f"({int(most['events'])} events, {most['% Somnotate-Final disagreements']:.1f}% of Somnotate-Final disagreements). "
+        "This section ignores unreviewed Final epochs so it reflects reviewer decisions, not missing review."
+    )
+
+    return html.Div(className="card", children=[
+        html.H4("Somnotate vs Final biological patterns"),
+        html.Div(
+            "This is the main biological/reviewer summary: in the flagged events, did the reviewer keep Somnotate's Wake/NREM/REM state, "
+            "or systematically correct it to another biological state?",
+            className="app-subtitle",
+            style={"marginBottom": "8px"},
+        ),
+        cards,
+        html.Div(summary, className="app-subtitle", style={"margin": "8px 0"}),
+        dash_table.DataTable(
+            data=table.to_dict("records"),
+            columns=[{"name": c, "id": c} for c in table.columns],
+            page_size=8,
+            sort_action="native",
+            style_table={"overflowX": "auto"},
+            style_cell={"fontSize": 12, "padding": "8px", "textAlign": "left", "whiteSpace": "normal", "height": "auto", "maxWidth": "440px"},
+            style_header={"fontWeight": "bold", "background": "#F3F4F6", "border": "1px solid #E5E7EB"},
+            style_data={"border": "1px solid #E5E7EB"},
+            style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#FAFAFA"}],
+        ),
+    ])
+
+
+def find_state_column(df, candidates):
+    if df is None:
+        return None
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def render_somnotate_rem_outcome(recording_dir):
+    """Compare all Somnotate REM epochs with reviewed Final labels."""
+    recording_dir = Path(recording_dir)
+    som = safe_read_csv(recording_dir / "somnotate" / "somnotate_results_timeseries.csv")
+    final = safe_read_csv(recording_dir / "final_scoring.csv")
+    layer1 = safe_read_csv(recording_dir / "layer1_wake_sleep.csv")
+
+    if som is None or len(som) == 0:
+        return html.Div(className="card", children=[
+            html.H4("Somnotate REM review outcome"),
+            html.Div("No Somnotate timeseries found yet. Run or import Somnotate results first.", className="app-subtitle"),
+        ])
+
+    som_state_col = find_state_column(som, ["somnotate_state", "state", "predicted_state", "label"])
+    if som_state_col is None or not {"t0_s", "t1_s"}.issubset(som.columns):
+        return html.Div(className="card", children=[
+            html.H4("Somnotate REM review outcome"),
+            html.Div("Somnotate results were found, but the app could not identify t0_s/t1_s and state columns.", className="app-subtitle"),
+        ])
+
+    som = som.copy()
+    som["som_state_clean"] = som[som_state_col].map(normalize_state_label)
+    rem_mask = som["som_state_clean"] == "REM"
+    n_rem = int(rem_mask.sum())
+
+    if n_rem == 0:
+        return html.Div(className="card", children=[
+            html.H4("Somnotate REM review outcome"),
+            html.Div("Somnotate did not label any REM epochs in this recording.", className="app-subtitle"),
+        ])
+
+    rem = som.loc[rem_mask, ["t0_s", "t1_s", "som_state_clean"]].copy()
+    if final is not None and len(final) and {"t0_s", "t1_s", "final_state"}.issubset(final.columns):
+        rem["final_state_at_midpoint"] = labels_at_epoch_midpoints(rem, final, "final_state")
+    else:
+        rem["final_state_at_midpoint"] = "Undefined"
+
+    if layer1 is not None and len(layer1) and {"t0_s", "t1_s", "layer1_label"}.issubset(layer1.columns):
+        rem["layer1_at_midpoint"] = labels_at_epoch_midpoints(rem, layer1, "layer1_label")
+        rem["layer1_at_midpoint"] = rem["layer1_at_midpoint"].map(lambda x: normalize_state_label(x, collapse_sleep=True))
+    else:
+        rem["layer1_at_midpoint"] = "Undefined"
+
+    rem["final_clean"] = rem["final_state_at_midpoint"].map(normalize_state_label)
+    kept = int((rem["final_clean"] == "REM").sum())
+    corrected_nrem = int((rem["final_clean"] == "NREM").sum())
+    corrected_wake = int((rem["final_clean"] == "Wake").sum())
+    unreviewed = int(rem["final_clean"].map(is_unreviewed_state).sum())
+    reviewed = max(n_rem - unreviewed, 0)
+    corrected = corrected_nrem + corrected_wake + int((~rem["final_clean"].isin(["REM", "NREM", "Wake", "Undefined"])).sum())
+
+    def pct(n, denom=n_rem):
+        return f"{100*n/max(denom,1):.1f}%"
+
+    cards = html.Div(className="dashboard-grid", children=[
+        compact_metric_card("Somnotate REM epochs", n_rem),
+        compact_metric_card("Kept as Final REM", f"{kept} ({pct(kept)})"),
+        compact_metric_card("Corrected to NREM/Wake", f"{corrected_nrem + corrected_wake} ({pct(corrected_nrem + corrected_wake)})"),
+        compact_metric_card("Still unreviewed", f"{unreviewed} ({pct(unreviewed)})"),
+    ])
+
+    outcome_counts = rem["final_clean"].value_counts().rename_axis("Final state").reset_index(name="Somnotate REM epochs")
+    outcome_counts["% Somnotate REM"] = (100.0 * outcome_counts["Somnotate REM epochs"] / max(n_rem, 1)).round(1)
+
+    # Build REM episodes from consecutive Somnotate REM epochs.
+    rem_sorted = rem.sort_values("t0_s").reset_index(drop=True)
+    median_step = np.nanmedian((rem_sorted["t1_s"].astype(float) - rem_sorted["t0_s"].astype(float)).to_numpy())
+    if not np.isfinite(median_step) or median_step <= 0:
+        median_step = 1.0
+    episode_ids = []
+    ep = 0
+    prev_end = None
+    for _, row in rem_sorted.iterrows():
+        t0 = float(row["t0_s"])
+        if prev_end is None or t0 - prev_end > max(2.0 * median_step, median_step + 1e-6):
+            ep += 1
+        episode_ids.append(ep)
+        prev_end = float(row["t1_s"])
+    rem_sorted["episode"] = episode_ids
+
+    episode_rows = []
+    for ep_id, sub in rem_sorted.groupby("episode"):
+        duration = float(sub["t1_s"].astype(float).max() - sub["t0_s"].astype(float).min())
+        pct_kept = 100.0 * (sub["final_clean"] == "REM").mean()
+        pct_reviewed = 100.0 * (~sub["final_clean"].map(is_unreviewed_state)).mean()
+        final_mode = sub["final_clean"].mode()
+        layer_mode = sub["layer1_at_midpoint"].mode()
+        episode_rows.append({
+            "REM episode": int(ep_id),
+            "start min": round(float(sub["t0_s"].astype(float).min()) / 60.0, 2),
+            "end min": round(float(sub["t1_s"].astype(float).max()) / 60.0, 2),
+            "duration s": round(duration, 1),
+            "% kept Final REM": round(pct_kept, 1),
+            "% reviewed": round(pct_reviewed, 1),
+            "main Final state": str(final_mode.iloc[0]) if len(final_mode) else "Undefined",
+            "main Layer 1 state": str(layer_mode.iloc[0]) if len(layer_mode) else "Undefined",
+        })
+    episodes = pd.DataFrame(episode_rows)
+    if len(episodes):
+        # Put most corrected/reviewed and longer REM episodes first.
+        episodes = episodes.sort_values(["% kept Final REM", "% reviewed", "duration s"], ascending=[True, False, False]).head(12)
+
+    note = (
+        "This section asks: when Somnotate called REM, did the reviewer keep REM in Final, "
+        "correct it to NREM/Wake, or leave it unreviewed? This is useful for spotting REM overcalls, "
+        "REM with movement/high EMG, or systematic reviewer corrections."
+    )
+
+    children = [
+        html.H4("Somnotate REM review outcome"),
+        html.Div(note, className="app-subtitle", style={"marginBottom": "8px"}),
+        cards,
+        html.Div(style={"height": "8px"}),
+        html.H5("All Somnotate REM epochs: Final outcome"),
+        dash_table.DataTable(
+            data=outcome_counts.to_dict("records"),
+            columns=[{"name": c, "id": c} for c in outcome_counts.columns],
+            page_size=6,
+            sort_action="native",
+            style_table={"overflowX": "auto"},
+            style_cell={"fontSize": 12, "padding": "8px", "textAlign": "left"},
+            style_header={"fontWeight": "bold", "background": "#F3F4F6", "border": "1px solid #E5E7EB"},
+            style_data={"border": "1px solid #E5E7EB"},
+        ),
+    ]
+    if len(episodes):
+        children += [
+            html.H5("Somnotate REM episodes most likely corrected or needing review"),
+            dash_table.DataTable(
+                data=episodes.to_dict("records"),
+                columns=[{"name": c, "id": c} for c in episodes.columns],
+                page_size=8,
+                sort_action="native",
+                style_table={"overflowX": "auto"},
+                style_cell={"fontSize": 12, "padding": "8px", "textAlign": "left", "whiteSpace": "normal", "height": "auto"},
+                style_header={"fontWeight": "bold", "background": "#F3F4F6", "border": "1px solid #E5E7EB"},
+                style_data={"border": "1px solid #E5E7EB"},
+                style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#FAFAFA"}],
+            ),
+        ]
+    return html.Div(className="card", children=children)
+
 def render_dissociation_dashboard(analysis_dir):
     """Clean, review-oriented dissociation dashboard."""
     analysis_dir = Path(analysis_dir)
@@ -3349,6 +3875,23 @@ def render_dissociation_dashboard(analysis_dir):
         compact_metric_card("Highest pairwise disagreement", key_pair_pct),
         compact_metric_card("Top reason", top_reason),
     ]))
+
+    children.append(html.Div(className="card", children=[
+        html.H4("How events are ranked"),
+        html.Div(
+            "Epochs above the threshold are merged into review events. "
+            "Events are ranked by strongest peak dissociation score, then average score, then duration. "
+            "Rank #1 is therefore the strongest suspicious event, not necessarily the longest one.",
+            className="app-subtitle",
+        ),
+    ]))
+
+    # Prioritize biologically/reviewer-oriented summaries first.
+    # Somnotate vs Final is usually more useful than Somnotate vs Layer 1 when
+    # Layer 1 is missing/Undefined for many events.
+    children.append(render_somnotate_final_patterns(events))
+    children.append(render_somnotate_rem_outcome(analysis_dir.parent))
+    children.append(render_flagged_state_patterns(events))
 
     # Pairwise percent disagreement, horizontal and readable.
     if pairwise is not None and len(pairwise):
