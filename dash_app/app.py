@@ -84,6 +84,9 @@ STATE_COLORS = {
 
 
 RAW_TRACE_COLOR = "black"
+# Opacity for scoring-colour backgrounds over EEG/EMG/ACh panels.
+# Increase for stronger colours; decrease if the black trace becomes too obscured.
+SCORING_BACKGROUND_ALPHA = 0.16
 EMG_RMS_COLOR = "rgba(90,90,90,0.75)"
 
 PROB_TRACE_COLORS = {
@@ -603,20 +606,44 @@ def robust_range(x: np.ndarray, low=1, high=99, pad=0.08):
     return [a - p, b + p]
 
 
+def adaptive_spectrogram_params(window_s: float) -> tuple[float, float, int]:
+    """Choose STFT parameters based on the visible QC window.
+
+    A 4 s STFT window is useful for broad sleep review, but it becomes very
+    blocky when the user zooms into a short 20–60 s interval. These settings
+    trade frequency resolution for time resolution only when the visible window
+    is short.
+    """
+    window_s = float(window_s or 0.0)
+
+    if window_s <= 60.0:
+        # Fine temporal view: ~0.25 s hop at 75% overlap. Frequency bins are
+        # coarser, but the spectrogram remains informative when zoomed in.
+        return 1.0, 0.75, 1200
+
+    if window_s <= 180.0:
+        # Intermediate view: good balance for transition inspection.
+        return 2.0, 0.75, 1200
+
+    # Broad sleep-review view: stable spectral estimate and manageable size.
+    return 4.0, 0.75, 900
+
+
 def compute_eeg_spectrogram_window(
     npy_path: Path,
     fs: float,
     start_s: float,
     end_s: float,
     max_freq_hz: float = 30.0,
-    nperseg_s: float = 4.0,
-    overlap_fraction: float = 0.75,
-    max_time_bins: int = 900,
+    nperseg_s: float | None = None,
+    overlap_fraction: float | None = None,
+    max_time_bins: int | None = None,
 ):
     """Compute an EEG spectrogram for the visible review window.
 
     Returns x in minutes, frequency in Hz, and log-power in dB. The function is
-    intentionally windowed so it stays responsive in the Dash QC viewer.
+    intentionally windowed so it stays responsive in the Dash QC viewer. For
+    short zoomed windows, STFT settings are automatically made more temporal.
     """
     if scipy_spectrogram is None:
         return None
@@ -634,6 +661,15 @@ def compute_eeg_spectrogram_window(
             return None
 
         y = y - np.nanmedian(y)
+
+        if nperseg_s is None or overlap_fraction is None or max_time_bins is None:
+            auto_nperseg_s, auto_overlap, auto_max_bins = adaptive_spectrogram_params(float(end_s) - float(start_s))
+            if nperseg_s is None:
+                nperseg_s = auto_nperseg_s
+            if overlap_fraction is None:
+                overlap_fraction = auto_overlap
+            if max_time_bins is None:
+                max_time_bins = auto_max_bins
 
         nperseg = int(max(64, round(float(nperseg_s) * float(fs))))
         nperseg = min(nperseg, len(y))
@@ -915,12 +951,18 @@ def make_review_figure(
     # -----------------------------
     # EEG spectrogram
     # -----------------------------
+    visible_window_s = max(0.0, (end_min - float(start_min)) * 60.0)
+    spec_nperseg_s, spec_overlap, spec_max_bins = adaptive_spectrogram_params(visible_window_s)
+
     spec = compute_eeg_spectrogram_window(
         rec["recording_dir"] / "eeg.npy",
         fs,
         start_min * 60,
         end_min * 60,
         max_freq_hz=30.0,
+        nperseg_s=spec_nperseg_s,
+        overlap_fraction=spec_overlap,
+        max_time_bins=spec_max_bins,
     )
 
     if spec is not None:
@@ -940,6 +982,12 @@ def make_review_figure(
             col=1,
         )
         fig.update_yaxes(title_text="Hz", range=[0.5, 20.0], row=spec_row, col=1)
+        try:
+            fig.layout.annotations[spec_row - 1].text = (
+                f"EEG spectrogram (0.5–20 Hz; STFT {spec_nperseg_s:g} s)"
+            )
+        except Exception:
+            pass
     else:
         fig.add_annotation(
             text="Spectrogram unavailable. Install scipy or check EEG signal length.",
@@ -1816,7 +1864,8 @@ def render_tab(tab, project_root, _refresh):
                 ]),
 
                 html.Div(id="empty-qc-message", children=[html.H4("No recording loaded yet"), html.P("Load a project and choose a recording first.")], className="empty-panel"),
-                dcc.Graph(id="qc-graph", style={"display":"none"}, config={"scrollZoom": False, "displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["select2d", "pan2d", "zoom2d", "resetScale2d"]}),
+                dcc.Graph(id="qc-graph", style={"display":"none"}, config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["select2d", "pan2d", "zoom2d", "resetScale2d"]}),
+                html.Div("Tip: use mouse wheel / trackpad scroll over the QC plot to zoom; press P to pan and S to select scoring windows.", className="app-subtitle", style={"marginTop": "4px"}),
                 html.Div(id="selected-interval-label", className="status-line"),
 
                 html.H4("Apply source to whole visible window"),
@@ -3125,7 +3174,7 @@ def shade_selected_interval_from_store(selected, fig):
 # -----------------------------------------------------------------------------
 
 
-def rgba_from_hex(hex_color, alpha=0.07):
+def rgba_from_hex(hex_color, alpha=SCORING_BACKGROUND_ALPHA):
     """Convert #RRGGBB to rgba string."""
     h = str(hex_color).lstrip("#")
     if len(h) != 6:
@@ -3136,7 +3185,7 @@ def rgba_from_hex(hex_color, alpha=0.07):
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def state_to_soft_fill(state, alpha=0.07):
+def state_to_soft_fill(state, alpha=SCORING_BACKGROUND_ALPHA):
     state = str(state)
     if state == "Sleep":
         state = "Layer 1 Sleep"
@@ -3225,7 +3274,7 @@ def add_scoring_background_to_raw_panels(fig, rec, start_min, end_min, raw_rows,
     bouts = state_bouts_from_epoch_table(df, col, start_min, end_min)
 
     for x0, x1, state in bouts:
-        fill = state_to_soft_fill(state, alpha=0.07)
+        fill = state_to_soft_fill(state, alpha=SCORING_BACKGROUND_ALPHA)
 
         for rr in raw_rows:
             fig.add_vrect(
