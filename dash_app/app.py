@@ -271,6 +271,11 @@ def video_panel_children(video_file: str | Path | None, offset_s: float | int | 
             style={"width": "100%", "maxHeight": "420px", "background": "#000", "borderRadius": "10px"},
         ),
         html.Div(
+            "Video is loading… If the player stays black, check the file path/format or convert AVI to MP4.",
+            className="status-line",
+            style={"marginTop": "6px"},
+        ),
+        html.Div(
             f"Video offset: {float(offset_s or 0):.3f} s. Video time = recording time - offset.",
             className="app-subtitle",
             style={"marginTop": "6px"},
@@ -1718,6 +1723,7 @@ dcc.Graph(id="qc-graph"),
     PInput(id="video-file-input"), PInput(id="video-offset-input"), html.Button(id="save-video-settings"),
     html.Button(id="jump-video-window"), html.Button(id="jump-video-selected"), html.Button(id="convert-video-mp4"),
     html.Div(id="video-status"), html.Div(id="video-player-container"),
+    html.Div(id="video-browser-status"), dcc.Interval(id="video-load-poll"),
     dcc.Store(id="video-seek-store"), html.Div(id="video-seek-feedback"),
 
     # Somnotate tab
@@ -1905,7 +1911,16 @@ def render_tab(tab, project_root, _refresh):
                         className="app-subtitle",
                         style={"marginTop": "6px"},
                     ),
-                    html.Div(id="video-player-container", style={"marginTop": "10px"}),
+                    dcc.Loading(
+                        type="circle",
+                        children=html.Div(id="video-player-container", style={"marginTop": "10px"}),
+                    ),
+                    html.Div(
+                        id="video-browser-status",
+                        className="status-line",
+                        style={"marginTop": "6px"},
+                    ),
+                    dcc.Interval(id="video-load-poll", interval=750, n_intervals=0),
                     dcc.Store(id="video-seek-store"),
                     html.Div(id="video-seek-feedback", className="status-line"),
                     html.Details(children=[
@@ -2760,6 +2775,48 @@ app.clientside_callback(
     """,
     Output("video-seek-feedback", "children"),
     Input("video-seek-store", "data"),
+)
+
+
+app.clientside_callback(
+    """
+    function(n_intervals, player_children) {
+        const video = document.getElementById("qc-video-player");
+        if (!video) {
+            return "No video loaded yet. Save a video path to display the player.";
+        }
+
+        if (video.error) {
+            const code = video.error.code || "unknown";
+            return "Video could not be loaded by the browser. Error code: " + code + ". Check the path and format; MP4 is recommended.";
+        }
+
+        const ready = Number(video.readyState || 0);
+        const network = Number(video.networkState || 0);
+        const durationOk = Number.isFinite(video.duration) && video.duration > 0;
+        const durationText = durationOk ? " Duration: " + video.duration.toFixed(1) + " s." : "";
+
+        if (ready >= 4) {
+            return "Video ready." + durationText;
+        }
+        if (ready >= 2) {
+            return "Video is buffering enough data to play…" + durationText;
+        }
+        if (ready >= 1) {
+            return "Video metadata loaded; loading frames…" + durationText;
+        }
+        if (network === 2) {
+            return "Video is loading… Large videos can take several seconds before the first frame appears.";
+        }
+        if (network === 3) {
+            return "The browser could not fetch the video. Check that the path exists and try MP4 if this is AVI.";
+        }
+        return "Video is loading… If the player stays black, check the file path/format or convert AVI to MP4.";
+    }
+    """,
+    Output("video-browser-status", "children"),
+    Input("video-load-poll", "n_intervals"),
+    Input("video-player-container", "children"),
 )
 
 
