@@ -263,12 +263,34 @@ def video_panel_children(video_file: str | Path | None, offset_s: float | int | 
         return html.Div(messages)
 
     return html.Div(children=messages + [
-        html.Video(
-            id="qc-video-player",
-            src=video_url_for_path(p),
-            controls=True,
-            preload="metadata",
-            style={"width": "100%", "maxHeight": "420px", "background": "#000", "borderRadius": "10px"},
+        html.Div(
+            id="qc-video-stage",
+            children=[
+                html.Video(
+                    id="qc-video-player",
+                    src=video_url_for_path(p),
+                    controls=True,
+                    preload="metadata",
+                    style={
+                        "height": "min(58vh, 560px)",
+                        "width": "auto",
+                        "maxWidth": "100%",
+                        "background": "transparent",
+                        "borderRadius": "10px",
+                        "display": "block",
+                        "margin": "0 auto",
+                    },
+                ),
+            ],
+            style={
+                "display": "flex",
+                "justifyContent": "center",
+                "alignItems": "center",
+                "background": "#fff",
+                "border": "1px solid #e5e7eb",
+                "borderRadius": "12px",
+                "padding": "8px",
+            },
         ),
         html.Div(
             f"Video offset: {float(offset_s or 0):.3f} s. Video time = recording time - offset.",
@@ -1587,6 +1609,120 @@ def serve_local_video():
     return send_file(path, mimetype=mimetype, conditional=True, as_attachment=False)
 
 
+
+
+def selected_interval_video_reviewer_modal_shell():
+    """Always-mounted selected-window reviewer modal.
+
+    Keeping the modal components in the layout even when hidden prevents Dash
+    callbacks from complaining about missing Inputs. The modal opens only after
+    the user selects an interval and presses the reviewer button.
+    """
+    return html.Div(
+        id="selected-interval-reviewer-modal",
+        style={"display": "none"},
+        children=[
+            html.Div(
+                style={
+                    "position": "fixed",
+                    "top": 0,
+                    "left": 0,
+                    "right": 0,
+                    "bottom": 0,
+                    "zIndex": 10000,
+                    "background": "rgba(15,23,42,0.50)",
+                    "padding": "20px",
+                },
+                children=[
+                    html.Div(
+                        style={
+                            "height": "100%",
+                            "background": "white",
+                            "borderRadius": "16px",
+                            "boxShadow": "0 22px 60px rgba(15,23,42,0.35)",
+                            "padding": "14px",
+                            "overflow": "auto",
+                        },
+                        children=[
+                            html.Div(
+                                style={"display": "flex", "justifyContent": "space-between", "gap": "12px", "alignItems": "center"},
+                                children=[
+                                    html.Div([
+                                        html.H3(id="interval-review-title", children="Selected-window EEG/EMG + video reviewer", style={"margin": "0"}),
+                                        html.Div(id="interval-review-subtitle", className="app-subtitle"),
+                                    ]),
+                                    html.Button("Close reviewer", id="close-selected-interval-reviewer", n_clicks=0),
+                                ],
+                            ),
+                            html.Div(
+                                style={"display": "grid", "gridTemplateColumns": "1.25fr 0.9fr", "gap": "14px", "alignItems": "start", "marginTop": "12px"},
+                                children=[
+                                    html.Div([
+                                        dcc.Graph(
+                                            id="interval-review-graph",
+                                            figure=go.Figure(),
+                                            config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False},
+                                            style={"height": "520px"},
+                                        ),
+                                        html.Div(id="interval-review-epoch-label", className="status-line"),
+                                    ]),
+                                    html.Div([
+                                        html.Video(
+                                            id="interval-review-video-player",
+                                            src="",
+                                            controls=True,
+                                            preload="metadata",
+                                            style={
+                                                "width": "100%",
+                                                "height": "48vh",
+                                                "maxHeight": "520px",
+                                                "objectFit": "contain",
+                                                "background": "#ffffff",
+                                                "border": "1px solid #d9e2ef",
+                                                "borderRadius": "12px",
+                                            },
+                                        ),
+                                        dcc.Interval(id="interval-review-poll", interval=350, n_intervals=0),
+                                        html.Div(
+                                            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginTop": "8px"},
+                                            children=[
+                                                html.Button("▶ Play selected clip", id="interval-review-play", n_clicks=0),
+                                                html.Button("Pause", id="interval-review-pause", n_clicks=0),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginTop": "8px"},
+                                            children=[
+                                                html.Button("◀ Previous epoch", id="interval-review-prev-epoch", n_clicks=0),
+                                                html.Button("Next epoch ▶", id="interval-review-next-epoch", n_clicks=0),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr 1fr", "gap": "8px", "alignItems": "end", "marginTop": "8px"},
+                                            children=[
+                                                html.Div([html.Label("Frame step (s)"), PInput(id="interval-review-frame-step-input", type="number", value=0.04, step=0.001, min=0.001, style={"width": "100%"})]),
+                                                html.Button("◀ 1 frame", id="interval-review-step-back-frame", n_clicks=0),
+                                                html.Button("1 frame ▶", id="interval-review-step-forward-frame", n_clicks=0),
+                                                html.Button("◀ 1 s", id="interval-review-step-back-second", n_clicks=0),
+                                                html.Button("1 s ▶", id="interval-review-step-forward-second", n_clicks=0),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            "The video uses the saved offset automatically. The blue shaded band in the EEG/EMG plot is the current 1 s / 2 s app epoch; the blue line is the current video frame time.",
+                                            className="app-subtitle",
+                                            style={"marginTop": "8px"},
+                                        ),
+                                        html.Div(id="interval-review-feedback", className="status-line", style={"marginTop": "8px"}),
+                                    ]),
+                                ],
+                            ),
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+
 app.layout = html.Div(
     id="app-shell",
     className="theme-light",
@@ -1597,6 +1733,10 @@ app.layout = html.Div(
         dcc.Store(id="window-store", data={"start_min": 0.0, "window_min": 15.0}),
         dcc.Store(id="selected-interval-store"),
         dcc.Store(id="manifest-refresh", data=0),
+        dcc.Store(id="video-floating-store", data=False),
+        dcc.Store(id="interval-review-store"),
+        dcc.Store(id="interval-review-seek-store"),
+        dcc.Store(id="interval-review-cursor-store"),
 
         html.Div(
             className="app-header",
@@ -1653,6 +1793,7 @@ app.layout = html.Div(
             ],
         ),
         html.Div(id="tab-content", style={"paddingTop": "12px"}),
+        selected_interval_video_reviewer_modal_shell(),
     ],
 )
 
@@ -1717,8 +1858,24 @@ dcc.Graph(id="qc-graph"),
     html.Div(id="score-status"),
     PInput(id="video-file-input"), PInput(id="video-offset-input"), html.Button(id="save-video-settings"),
     html.Button(id="jump-video-window"), html.Button(id="jump-video-selected"), html.Button(id="convert-video-mp4"),
-    html.Div(id="video-status"), html.Div(id="video-player-container"),
-    dcc.Store(id="video-seek-store"), html.Div(id="video-seek-feedback"),
+    html.Button(id="open-floating-video-reviewer"), html.Button(id="close-floating-video-reviewer"),
+    html.Button(id="video-step-back-frame"), html.Button(id="video-step-forward-frame"),
+    html.Button(id="video-step-back-second"), html.Button(id="video-step-forward-second"),
+    html.Button(id="video-prev-epoch"), html.Button(id="video-next-epoch"), html.Button(id="video-zoom-current-epoch"),
+    html.Button(id="video-sync-offset-from-selection"), dcc.Checklist(id="video-auto-sync-window"), PInput(id="video-frame-step-input"),
+    html.Div(id="video-qc-card"), html.Div(id="video-status"), html.Div(id="video-player-container"),
+    html.Div(id="video-load-status"), html.Div(id="video-frame-feedback"), html.Div(id="video-epoch-feedback"),
+    dcc.Interval(id="video-status-poll"),
+    dcc.Store(id="video-seek-store"), dcc.Store(id="video-sync-offset-store"), dcc.Store(id="video-cursor-store"), dcc.Store(id="video-floating-store"), html.Div(id="video-seek-feedback"),
+    html.Button(id="open-selected-interval-reviewer"), html.Button(id="close-selected-interval-reviewer"),
+    html.Button(id="interval-review-play"), html.Button(id="interval-review-pause"),
+    html.Button(id="interval-review-prev-epoch"), html.Button(id="interval-review-next-epoch"),
+    html.Button(id="interval-review-step-back-frame"), html.Button(id="interval-review-step-forward-frame"),
+    html.Button(id="interval-review-step-back-second"), html.Button(id="interval-review-step-forward-second"),
+    PInput(id="interval-review-frame-step-input"), html.Div(id="selected-interval-reviewer-modal"),
+    dcc.Graph(id="interval-review-graph"), dcc.Interval(id="interval-review-poll"),
+    dcc.Store(id="interval-review-store"), dcc.Store(id="interval-review-seek-store"), dcc.Store(id="interval-review-cursor-store"),
+    html.Div(id="interval-review-feedback"), html.Div(id="interval-review-epoch-label"),
 
     # Somnotate tab
     PInput(id="som-recording-ids"), PInput(id="som-target-fs"), PDropdown(id="som-epoch-sec"), PInput(id="som-root"),
@@ -1877,8 +2034,14 @@ def render_tab(tab, project_root, _refresh):
                     html.Button("Apply Manual to visible window", id="score-window-manual"),
                 ]),
 
-                html.Div(className="video-qc-card", children=[
-                    html.H4("Video QC"),
+                html.Div(id="video-qc-card", className="video-qc-card", children=[
+                    html.Div(style={"display": "flex", "justifyContent": "space-between", "gap": "8px", "alignItems": "center"}, children=[
+                        html.H4("Video QC", style={"margin": "0"}),
+                        html.Div(style={"display": "none"}, children=[
+                            html.Button("Open floating video reviewer", id="open-floating-video-reviewer", n_clicks=0),
+                            html.Button("Close", id="close-floating-video-reviewer", n_clicks=0),
+                        ]),
+                    ]),
                     html.Div(
                         "Optional: link an .mp4/.mov/.avi video to this recording. MP4 is the most reliable browser format. If an .avi file does not load in the browser, try another browser or convert the .avi video to .mp4 with the Terminal command below.",
                         className="app-subtitle",
@@ -1894,7 +2057,7 @@ def render_tab(tab, project_root, _refresh):
                     html.Div(
                         style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1.4fr 2fr", "gap": "8px", "alignItems": "center", "marginTop": "8px"},
                         children=[
-                            html.Button("Jump video to window start", id="jump-video-window", n_clicks=0),
+                            html.Button("Sync video to visible signal start", id="jump-video-window", n_clicks=0),
                             html.Button("Play selected video interval", id="jump-video-selected", n_clicks=0),
                             html.Button("Convert AVI to MP4 + save path", id="convert-video-mp4", n_clicks=0),
                             dcc.Loading(type="circle", children=html.Div(id="video-status", className="status-line")),
@@ -1906,7 +2069,56 @@ def render_tab(tab, project_root, _refresh):
                         style={"marginTop": "6px"},
                     ),
                     html.Div(id="video-player-container", style={"marginTop": "10px"}),
+                    html.Div(className="card", style={"marginTop": "10px", "padding": "10px"}, children=[
+                        html.H4("Selected-window EEG/EMG + video reviewer", style={"marginTop": "0"}),
+                        html.Div(
+                            "Select a short interval on the QC plot, then press the button below. A pop-up reviewer opens with only that EEG/EMG segment, the app epoch row, epoch boundaries, and the matching video clip.",
+                            className="app-subtitle",
+                        ),
+                        html.Button("Open selected-window EEG/EMG + video reviewer", id="open-selected-interval-reviewer", n_clicks=0, style={"marginTop": "8px"}),
+                        html.Div(id="selected-interval-reviewer-status", className="status-line", style={"marginTop": "6px"}),
+                    ]),
+                    dcc.Interval(id="video-status-poll", interval=500, n_intervals=0),
+                    html.Div(id="video-load-status", className="status-line", style={"marginTop": "6px"}),
+                    html.Div(className="card", style={"display": "none"}, children=[
+                        html.H4("Epoch + frame review", style={"marginTop": "0"}),
+                        html.Div(
+                            "Use the video as a reviewer panel while inspecting the signal. Click a signal time or use the epoch arrows to jump the video. The current Final/App epoch is shaded light blue on the QC plot, and the blue line marks the current video frame. Frame arrows are for fine movement inside the current epoch.",
+                            className="app-subtitle",
+                        ),
+                        dcc.Checklist(
+                            id="video-auto-sync-window",
+                            options=[{"label": "Optional: auto-sync video when the visible signal range changes", "value": "auto"}],
+                            value=[],
+                            inline=True,
+                            persistence=True,
+                            persistence_type="local",
+                            style={"marginTop": "8px"},
+                        ),
+                        html.Div(
+                            style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr 1fr", "gap": "8px", "alignItems": "end", "marginTop": "8px"},
+                            children=[
+                                html.Div([html.Label("Frame step (s)"), PInput(id="video-frame-step-input", type="number", value=0.04, step=0.001, min=0.001, style={"width": "100%"})]),
+                                html.Button("◀ 1 frame", id="video-step-back-frame", n_clicks=0),
+                                html.Button("1 frame ▶", id="video-step-forward-frame", n_clicks=0),
+                                html.Button("◀ 1 s", id="video-step-back-second", n_clicks=0),
+                                html.Button("1 s ▶", id="video-step-forward-second", n_clicks=0),
+                            ],
+                        ),
+                        html.Div(
+                            style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr", "gap": "8px", "alignItems": "center", "marginTop": "8px"},
+                            children=[
+                                html.Button("◀ Previous epoch", id="video-prev-epoch", n_clicks=0),
+                                html.Button("Next epoch ▶", id="video-next-epoch", n_clicks=0),
+                                html.Button("Zoom QC to current epoch", id="video-zoom-current-epoch", n_clicks=0),
+                            ],
+                        ),
+                        html.Div(id="video-frame-feedback", className="status-line", style={"marginTop": "6px"}),
+                        html.Div(id="video-epoch-feedback", className="status-line", style={"marginTop": "4px", "fontWeight": "600"}),
+                    ]),
                     dcc.Store(id="video-seek-store"),
+                    dcc.Store(id="video-sync-offset-store"),
+                    dcc.Store(id="video-cursor-store"),
                     html.Div(id="video-seek-feedback", className="status-line"),
                     html.Details(children=[
                         html.Summary("AVI not loading? Convert AVI to MP4"),
@@ -2619,6 +2831,61 @@ def score_or_export(*args):
 # Optional video QC callbacks
 # -----------------------------------------------------------------------------
 
+
+def current_epoch_for_recording_time(project_root: str | Path, recording_id: str, recording_time_s: float) -> dict[str, Any] | None:
+    """Return the Final/App epoch containing a recording time, if available."""
+    try:
+        rec = load_recording(project_root, recording_id)
+        final = rec.get("final")
+        if final is None or len(final) == 0:
+            return None
+        t = float(recording_time_s)
+        t0 = final["t0_s"].astype(float).to_numpy()
+        t1 = final["t1_s"].astype(float).to_numpy()
+        mask = (t0 <= t) & (t < t1)
+        if not np.any(mask):
+            idx = int(np.argmin(np.abs(((t0 + t1) / 2.0) - t)))
+        else:
+            idx = int(np.where(mask)[0][0])
+        row = final.iloc[idx]
+        return {
+            "epoch_index": idx,
+            "epoch_id": int(row.get("epoch_id", idx)),
+            "t0_s": float(row["t0_s"]),
+            "t1_s": float(row["t1_s"]),
+            "final_state": str(row.get("final_state", "Undefined")),
+        }
+    except Exception:
+        return None
+
+
+@app.callback(
+    Output("video-floating-store", "data"),
+    Input("open-floating-video-reviewer", "n_clicks"),
+    Input("close-floating-video-reviewer", "n_clicks"),
+    State("video-floating-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_floating_video_reviewer(n_open, n_close, current):
+    trig = callback_context.triggered_id
+    if trig == "open-floating-video-reviewer":
+        return True
+    if trig == "close-floating-video-reviewer":
+        return False
+    return bool(current)
+
+
+@app.callback(
+    Output("video-qc-card", "style"),
+    Input("video-floating-store", "data"),
+)
+def style_video_qc_card(is_floating):
+    # Keep the standard Video QC card in the normal page flow.
+    # The detailed EEG/EMG + video reviewer opens separately only when the user presses
+    # "Open selected-window EEG/EMG + video reviewer".
+    return {"marginTop": "16px"}
+
+
 @app.callback(
     Output("video-file-input", "value"),
     Output("video-offset-input", "value"),
@@ -2627,12 +2894,13 @@ def score_or_export(*args):
     Input("recording-id-store", "data"),
     Input("save-video-settings", "n_clicks"),
     Input("convert-video-mp4", "n_clicks"),
+    Input("video-sync-offset-store", "data"),
     State("project-root-store", "data"),
     State("video-file-input", "value"),
     State("video-offset-input", "value"),
     prevent_initial_call=True,
 )
-def update_video_panel(recording_id, save_clicks, convert_clicks, project_root, video_file_value, video_offset_value):
+def update_video_panel(recording_id, save_clicks, convert_clicks, sync_offset_data, project_root, video_file_value, video_offset_value):
     if not project_root or not recording_id:
         return "", 0.0, html.Div("Load a recording to enable video QC.", className="app-subtitle"), "Load a recording first."
 
@@ -2657,6 +2925,26 @@ def update_video_panel(recording_id, save_clicks, convert_clicks, project_root, 
             combined_msg = f"{msg}\n{save_msg}"
         return converted_path, offset_s, video_panel_children(converted_path, offset_s), combined_msg
 
+    if trig == "video-sync-offset-store":
+        video_file = str(video_file_value or "").strip()
+        old_offset_s = safe_float(video_offset_value, 0.0)
+        data = sync_offset_data or {}
+        if data.get("error"):
+            return video_file, old_offset_s, video_panel_children(video_file, old_offset_s), str(data.get("error"))
+        try:
+            new_offset_s = float(data.get("offset_s"))
+        except Exception:
+            return video_file, old_offset_s, video_panel_children(video_file, old_offset_s), "Could not read calculated video offset."
+        ok, msg = save_video_metadata(project_root, recording_id, video_file, new_offset_s)
+        sync_msg = (
+            f"Set video offset to {new_offset_s:.3f} s using selected signal time "
+            f"{float(data.get('recording_time_s', 0.0)):.3f} s and current video frame "
+            f"{float(data.get('video_time_s', 0.0)):.3f} s."
+        )
+        if not ok:
+            sync_msg += f"\nCould not save offset: {msg}"
+        return video_file, new_offset_s, video_panel_children(video_file, new_offset_s), sync_msg
+
     video_file, offset_s = load_video_metadata(project_root, recording_id)
     return video_file, offset_s, video_panel_children(video_file, offset_s), video_format_message(video_file)
 
@@ -2668,9 +2956,10 @@ def update_video_panel(recording_id, save_clicks, convert_clicks, project_root, 
     State("window-store", "data"),
     State("selected-interval-store", "data"),
     State("video-offset-input", "value"),
+    State("qc-graph", "figure"),
     prevent_initial_call=True,
 )
-def request_video_seek(n_window, n_selected, window_data, selected_data, offset_s):
+def request_video_seek(n_window, n_selected, window_data, selected_data, offset_s, fig):
     trig = callback_context.triggered_id
     offset_s = safe_float(offset_s, 0.0)
 
@@ -2681,11 +2970,29 @@ def request_video_seek(n_window, n_selected, window_data, selected_data, offset_
         recording_end_s = float(selected_data.get("end_min", selected_data.get("start_min", 0.0))) * 60.0
         auto_play = True
     else:
-        window_data = window_data or {}
-        start_min = float(window_data.get("start_min", 0.0))
-        window_min = float(window_data.get("window_min", 15.0))
-        recording_start_s = start_min * 60.0
-        recording_end_s = (start_min + window_min) * 60.0
+        # Prefer the actual visible Plotly x-range, because users often pan/zoom
+        # the graph without changing the app's window-store. Fall back to
+        # window-store if the figure range is not available.
+        start_min = None
+        end_min = None
+        try:
+            xaxis = (fig or {}).get("layout", {}).get("xaxis", {})
+            xr = xaxis.get("range")
+            if isinstance(xr, (list, tuple)) and len(xr) >= 2:
+                start_min = float(xr[0])
+                end_min = float(xr[1])
+        except Exception:
+            start_min = None
+            end_min = None
+
+        if start_min is None or not np.isfinite(start_min):
+            window_data = window_data or {}
+            start_min = float(window_data.get("start_min", 0.0))
+            window_min = float(window_data.get("window_min", 15.0))
+            end_min = start_min + window_min
+
+        recording_start_s = max(0.0, start_min * 60.0)
+        recording_end_s = max(recording_start_s, float(end_min) * 60.0)
         auto_play = False
 
     video_start_s = max(0.0, recording_start_s - offset_s)
@@ -2703,18 +3010,254 @@ def request_video_seek(n_window, n_selected, window_data, selected_data, offset_
     }
 
 
+@app.callback(
+    Output("video-seek-store", "data", allow_duplicate=True),
+    Input("qc-graph", "clickData"),
+    State("video-file-input", "value"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def sync_video_to_qc_click(click_data, video_file, offset_s):
+    """Click on the QC plot to send the video to that recording time.
+
+    This is the most Sirenia-like interaction: the reviewer chooses a precise
+    signal moment, then the video player jumps to the corresponding frame.
+    """
+    if not video_file or not click_data:
+        return no_update
+    try:
+        pts = click_data.get("points") or []
+        if not pts:
+            return no_update
+        x_min = float(pts[0].get("x"))
+    except Exception:
+        return no_update
+    if not np.isfinite(x_min):
+        return no_update
+
+    offset_s = safe_float(offset_s, 0.0)
+    recording_s = max(0.0, x_min * 60.0)
+    video_s = max(0.0, recording_s - offset_s)
+    return {
+        "time_s": video_s,
+        "end_time_s": video_s,
+        "duration_s": 0.0,
+        "recording_time_s": recording_s,
+        "recording_end_s": recording_s,
+        "offset_s": offset_s,
+        "source": "qc_plot_click",
+        "auto_play": False,
+    }
+
+
+@app.callback(
+    Output("video-seek-store", "data", allow_duplicate=True),
+    Input("qc-graph", "relayoutData"),
+    State("video-auto-sync-window", "value"),
+    State("video-file-input", "value"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def auto_sync_video_to_visible_xrange(relayout_data, auto_values, video_file, offset_s):
+    """When Plotly pan/zoom changes the visible x-range, sync video to range start.
+
+    The previous implementation listened to the app's window-store, which does
+    not always update after Plotly scroll-zoom or pan. This callback listens to
+    Plotly's actual relayoutData, so the video follows the signal view.
+    """
+    if not video_file or not relayout_data:
+        return no_update
+    if "auto" not in (auto_values or []):
+        return no_update
+
+    # Plotly can report ranges under xaxis.range[0]/[1] or xaxis.range.
+    start_min = None
+    end_min = None
+    try:
+        if "xaxis.range[0]" in relayout_data and "xaxis.range[1]" in relayout_data:
+            start_min = float(relayout_data["xaxis.range[0]"])
+            end_min = float(relayout_data["xaxis.range[1]"])
+        elif "xaxis.range" in relayout_data:
+            xr = relayout_data.get("xaxis.range")
+            if isinstance(xr, (list, tuple)) and len(xr) >= 2:
+                start_min = float(xr[0])
+                end_min = float(xr[1])
+    except Exception:
+        return no_update
+
+    if start_min is None or not np.isfinite(start_min):
+        return no_update
+    if end_min is None or not np.isfinite(end_min):
+        end_min = start_min
+
+    offset_s = safe_float(offset_s, 0.0)
+    recording_start_s = max(0.0, start_min * 60.0)
+    recording_end_s = max(recording_start_s, end_min * 60.0)
+    video_start_s = max(0.0, recording_start_s - offset_s)
+    video_end_s = max(video_start_s, recording_end_s - offset_s)
+
+    return {
+        "time_s": video_start_s,
+        "end_time_s": video_end_s,
+        "duration_s": max(0.0, video_end_s - video_start_s),
+        "recording_time_s": recording_start_s,
+        "recording_end_s": recording_end_s,
+        "offset_s": offset_s,
+        "source": "plot_visible_range_sync",
+        "auto_play": False,
+    }
+
+
+@app.callback(
+    Output("video-seek-store", "data", allow_duplicate=True),
+    Input("window-store", "data"),
+    State("video-auto-sync-window", "value"),
+    State("video-file-input", "value"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def auto_sync_video_to_qc_window(window_data, auto_values, video_file, offset_s):
+    """Automatically keep the video player aligned with the current QC signal window.
+
+    This is intentionally controlled by a checkbox because seeking a large video
+    on every pan/zoom can be annoying on slow machines. When enabled, changing
+    the visible QC window sends the video to the matching recording-time start.
+    """
+    if not video_file:
+        return no_update
+    if "auto" not in (auto_values or []):
+        return no_update
+    if not window_data:
+        return no_update
+
+    offset_s = safe_float(offset_s, 0.0)
+    try:
+        start_min = float(window_data.get("start_min", 0.0))
+        window_min = float(window_data.get("window_min", 15.0))
+    except Exception:
+        return no_update
+
+    recording_start_s = max(0.0, start_min * 60.0)
+    recording_end_s = max(recording_start_s, (start_min + window_min) * 60.0)
+    video_start_s = max(0.0, recording_start_s - offset_s)
+    video_end_s = max(video_start_s, recording_end_s - offset_s)
+
+    return {
+        "time_s": video_start_s,
+        "end_time_s": video_end_s,
+        "duration_s": max(0.0, video_end_s - video_start_s),
+        "recording_time_s": recording_start_s,
+        "recording_end_s": recording_end_s,
+        "offset_s": offset_s,
+        "source": "auto_window_sync",
+        "auto_play": False,
+    }
+
+
+
+@app.callback(
+    Output("video-seek-store", "data", allow_duplicate=True),
+    Input("video-prev-epoch", "n_clicks"),
+    Input("video-next-epoch", "n_clicks"),
+    State("video-cursor-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def step_video_epoch(n_prev, n_next, cursor_data, project_root, recording_id, offset_s):
+    """Move the video to the previous/next app epoch.
+
+    This gives a Sirenia-like epoch stepping mode. The epoch grid is the
+    app's Final/App grid, so it respects recordings imported as 1 s or 2 s.
+    """
+    if not project_root or not recording_id:
+        return {"error": "Load a recording first."}
+    trig = callback_context.triggered_id
+    direction = -1 if trig == "video-prev-epoch" else 1
+    offset_s = safe_float(offset_s, 0.0)
+
+    try:
+        rec = load_recording(project_root, recording_id)
+        final = rec.get("final")
+        if final is None or len(final) == 0:
+            return {"error": "No Final/App epoch grid found for this recording."}
+        t0 = final["t0_s"].astype(float).to_numpy()
+        t1 = final["t1_s"].astype(float).to_numpy()
+        mids = (t0 + t1) / 2.0
+        if cursor_data and cursor_data.get("recording_time_s") is not None:
+            current_s = float(cursor_data.get("recording_time_s"))
+        else:
+            current_s = float(t0[0])
+        current_idx = int(np.argmin(np.abs(mids - current_s)))
+        target_idx = max(0, min(len(final) - 1, current_idx + direction))
+        target_s = float(t0[target_idx])
+        video_s = max(0.0, target_s - offset_s)
+        return {
+            "time_s": video_s,
+            "end_time_s": max(video_s, float(t1[target_idx]) - offset_s),
+            "duration_s": max(0.0, float(t1[target_idx] - t0[target_idx])),
+            "recording_time_s": target_s,
+            "recording_end_s": float(t1[target_idx]),
+            "offset_s": offset_s,
+            "source": trig,
+            "auto_play": False,
+        }
+    except Exception as e:
+        return {"error": f"Could not step epoch: {type(e).__name__}: {e}"}
+
+
+@app.callback(
+    Output("window-store", "data", allow_duplicate=True),
+    Input("video-zoom-current-epoch", "n_clicks"),
+    State("video-cursor-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def zoom_qc_to_current_video_epoch(n, cursor_data, project_root, recording_id):
+    if not n or not cursor_data or not project_root or not recording_id:
+        return no_update
+    epoch = current_epoch_for_recording_time(project_root, recording_id, float(cursor_data.get("recording_time_s", 0.0)))
+    if not epoch:
+        return no_update
+    # Show the current epoch with context. For 1 s/2 s epochs, a 1 min view is useful.
+    center = (float(epoch["t0_s"]) + float(epoch["t1_s"])) / 2.0
+    start_min = max(0.0, (center - 30.0) / 60.0)
+    return {"start_min": start_min, "window_min": 1.0}
+
+
+@app.callback(
+    Output("video-epoch-feedback", "children"),
+    Input("video-cursor-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+)
+def update_video_epoch_feedback(cursor_data, project_root, recording_id):
+    if not cursor_data or not project_root or not recording_id:
+        return "Current epoch: not available yet. Click the signal or use video controls."
+    epoch = current_epoch_for_recording_time(project_root, recording_id, float(cursor_data.get("recording_time_s", 0.0)))
+    if not epoch:
+        return "Current epoch: not found."
+    dur = float(epoch["t1_s"]) - float(epoch["t0_s"])
+    return (
+        f"Current app epoch: {epoch['t0_s']:.3f}–{epoch['t1_s']:.3f} s "
+        f"({dur:.3f} s), Final={epoch['final_state']}"
+    )
+
+
 app.clientside_callback(
     """
     function(data) {
         if (!data) {
-            return "";
+            return ["", window.dash_clientside.no_update];
         }
         if (data.error) {
-            return data.error;
+            return [data.error, window.dash_clientside.no_update];
         }
         const video = document.getElementById("qc-video-player");
         if (!video) {
-            return "No video player loaded. Save a valid video path first.";
+            return ["No video player loaded. Save a valid video path first.", window.dash_clientside.no_update];
         }
 
         const start = Math.max(0, Number(data.time_s || 0));
@@ -2748,20 +3291,800 @@ app.clientside_callback(
                 if (p && p.catch) {
                     p.catch(function() {});
                 }
-                return "Playing selected video interval: " + start.toFixed(2) + "–" + end.toFixed(2) + " s.";
+                return ["Playing selected video interval: " + start.toFixed(2) + "–" + end.toFixed(2) + " s.", {
+                    recording_time_s: Number(data.recording_time_s || 0),
+                    video_time_s: start,
+                    source: data.source || "video_seek",
+                    created_at_ms: Date.now()
+                }];
             }
 
             video.pause();
-            return "Video jumped to " + start.toFixed(2) + " s.";
+            let prefix = "Video jumped";
+            if (data.source === "auto_window_sync" || data.source === "plot_visible_range_sync") prefix = "Auto-synced video";
+            if (data.source === "qc_plot_click") prefix = "Clicked signal → video jumped";
+            return [prefix + " to " + start.toFixed(2) + " s. Recording time: " + Number(data.recording_time_s || 0).toFixed(2) + " s.", {
+                recording_time_s: Number(data.recording_time_s || 0),
+                video_time_s: start,
+                source: data.source || "video_seek",
+                created_at_ms: Date.now()
+            }];
         } catch (e) {
-            return "Could not control video: " + e;
+            return ["Could not control video: " + e, window.dash_clientside.no_update];
         }
     }
     """,
     Output("video-seek-feedback", "children"),
+    Output("video-cursor-store", "data", allow_duplicate=True),
     Input("video-seek-store", "data"),
+    prevent_initial_call=True,
 )
 
+
+app.clientside_callback(
+    """
+    function(n, videoFile) {
+        const baseStyle = {marginTop: "6px", fontSize: "12px"};
+        if (!videoFile) {
+            return ["No video selected yet.", Object.assign({}, baseStyle, {color: "#666"})];
+        }
+        const video = document.getElementById("qc-video-player");
+        if (!video) {
+            return ["Video player is not mounted yet. Save a valid video path first.", Object.assign({}, baseStyle, {color: "#8a5a00"})];
+        }
+        const ready = Number(video.readyState || 0);
+        const network = Number(video.networkState || 0);
+        const current = Number(video.currentTime || 0);
+        const duration = Number(video.duration || 0);
+
+        if (ready < 1 || network === 2) {
+            return ["Video is loading metadata / buffering… keep the app tab open.", Object.assign({}, baseStyle, {color: "#8a5a00", fontWeight: "600"})];
+        }
+        if (video.seeking || ready < 3) {
+            return ["Video is seeking or buffering…", Object.assign({}, baseStyle, {color: "#8a5a00", fontWeight: "600"})];
+        }
+        if (isFinite(duration) && duration > 0) {
+            return ["Video ready. Current video time: " + current.toFixed(2) + " s / " + duration.toFixed(2) + " s.", Object.assign({}, baseStyle, {color: "#2b6b2b"})];
+        }
+        return ["Video ready. Current video time: " + current.toFixed(2) + " s.", Object.assign({}, baseStyle, {color: "#2b6b2b"})];
+    }
+    """,
+    Output("video-load-status", "children"),
+    Output("video-load-status", "style"),
+    Input("video-status-poll", "n_intervals"),
+    Input("video-file-input", "value"),
+)
+
+
+app.clientside_callback(
+    """
+    function(nBackFrame, nForwardFrame, nBackSecond, nForwardSecond, frameStep, offsetS) {
+        const ctx = dash_clientside.callback_context;
+        if (!ctx.triggered || ctx.triggered.length === 0) {
+            return ["", window.dash_clientside.no_update];
+        }
+        const trig = ctx.triggered[0].prop_id.split('.')[0];
+        const video = document.getElementById("qc-video-player");
+        if (!video) {
+            return ["No video player loaded. Save a valid video path first.", window.dash_clientside.no_update];
+        }
+        let step = Number(frameStep || 0.04);
+        if (!isFinite(step) || step <= 0) {
+            step = 0.04;
+        }
+        let delta = 0;
+        if (trig === "video-step-back-frame") delta = -step;
+        if (trig === "video-step-forward-frame") delta = step;
+        if (trig === "video-step-back-second") delta = -1.0;
+        if (trig === "video-step-forward-second") delta = 1.0;
+        if (delta === 0) return ["", window.dash_clientside.no_update];
+
+        try {
+            if (video._qcStopHandler) {
+                video.removeEventListener("timeupdate", video._qcStopHandler);
+                video._qcStopHandler = null;
+            }
+            video.pause();
+            const duration = Number(video.duration || 0);
+            let newTime = Math.max(0, Number(video.currentTime || 0) + delta);
+            if (isFinite(duration) && duration > 0) {
+                newTime = Math.min(duration, newTime);
+            }
+            video.currentTime = newTime;
+            const offset = Number(offsetS || 0);
+            const recordingTime = newTime + offset;
+            return ["Video time: " + newTime.toFixed(3) + " s | recording time: " + recordingTime.toFixed(3) + " s | offset: " + offset.toFixed(3) + " s.", {
+                recording_time_s: recordingTime,
+                video_time_s: newTime,
+                source: trig,
+                created_at_ms: Date.now()
+            }];
+        } catch (e) {
+            return ["Could not step video: " + e, window.dash_clientside.no_update];
+        }
+    }
+    """,
+    Output("video-frame-feedback", "children"),
+    Output("video-cursor-store", "data", allow_duplicate=True),
+    Input("video-step-back-frame", "n_clicks"),
+    Input("video-step-forward-frame", "n_clicks"),
+    Input("video-step-back-second", "n_clicks"),
+    Input("video-step-forward-second", "n_clicks"),
+    State("video-frame-step-input", "value"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(n, selectedData) {
+        if (!n) {
+            return window.dash_clientside.no_update;
+        }
+        const video = document.getElementById("qc-video-player");
+        if (!video) {
+            return {error: "No video player loaded. Save a valid video path first."};
+        }
+        if (!selectedData || selectedData.start_min === undefined) {
+            return {error: "Select the signal event first. Use S, drag a short interval over the signal event, then move the video to the matching frame."};
+        }
+        const recordingTime = Number(selectedData.start_min || 0) * 60.0;
+        const videoTime = Number(video.currentTime || 0);
+        if (!isFinite(recordingTime) || !isFinite(videoTime)) {
+            return {error: "Could not read selected signal time or current video time."};
+        }
+        return {
+            offset_s: recordingTime - videoTime,
+            recording_time_s: recordingTime,
+            video_time_s: videoTime,
+            created_at_ms: Date.now()
+        };
+    }
+    """,
+    Output("video-sync-offset-store", "data"),
+    Input("video-sync-offset-from-selection", "n_clicks"),
+    State("selected-interval-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+@app.callback(
+    Output("qc-graph", "figure", allow_duplicate=True),
+    Input("video-cursor-store", "data"),
+    State("qc-graph", "figure"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def draw_video_cursor_on_qc_plot(cursor_data, fig, project_root, recording_id):
+    """Draw the current video frame and epoch on the QC plot.
+
+    The vertical blue line is the exact recording time of the video frame.
+    The translucent blue rectangle is the current app epoch (1 s or 2 s,
+    depending on how the recording was imported). This makes frame review
+    explicitly epoch-based, closer to a Sirenia-style review workflow.
+    """
+    if not cursor_data or fig is None:
+        return no_update
+    try:
+        recording_time_s = float(cursor_data.get("recording_time_s"))
+    except Exception:
+        return no_update
+    if not np.isfinite(recording_time_s):
+        return no_update
+
+    x_min = recording_time_s / 60.0
+    epoch = None
+    if project_root and recording_id:
+        epoch = current_epoch_for_recording_time(project_root, recording_id, recording_time_s)
+
+    try:
+        existing_shapes = [
+            s for s in (fig.get("layout", {}).get("shapes", []) or [])
+            if s.get("name") not in {"video_frame_cursor", "video_current_epoch"}
+        ]
+    except Exception:
+        existing_shapes = []
+
+    new_shapes = []
+    if epoch is not None:
+        new_shapes.append({
+            "type": "rect",
+            "name": "video_current_epoch",
+            "xref": "x",
+            "yref": "paper",
+            "x0": float(epoch["t0_s"]) / 60.0,
+            "x1": float(epoch["t1_s"]) / 60.0,
+            "y0": 0,
+            "y1": 1,
+            "fillcolor": "rgba(0, 85, 255, 0.11)",
+            "line": {"color": "rgba(0, 85, 255, 0.45)", "width": 1},
+            "layer": "above",
+        })
+
+    new_shapes.append({
+        "type": "line",
+        "name": "video_frame_cursor",
+        "xref": "x",
+        "yref": "paper",
+        "x0": x_min,
+        "x1": x_min,
+        "y0": 0,
+        "y1": 1,
+        "line": {"color": "rgba(0, 85, 255, 0.95)", "width": 2, "dash": "solid"},
+        "layer": "above",
+    })
+
+    patch = Patch()
+    patch["layout"]["shapes"] = existing_shapes + new_shapes
+    return patch
+
+
+app.clientside_callback(
+    """
+    function(n, offsetS, videoFile) {
+        if (!videoFile) {
+            return window.dash_clientside.no_update;
+        }
+        const video = document.getElementById("qc-video-player");
+        if (!video) {
+            return window.dash_clientside.no_update;
+        }
+        const current = Number(video.currentTime || 0);
+        if (!isFinite(current)) {
+            return window.dash_clientside.no_update;
+        }
+        const offset = Number(offsetS || 0);
+        return {
+            recording_time_s: current + offset,
+            video_time_s: current,
+            source: video.paused ? "video_poll_paused" : "video_poll_playing",
+            created_at_ms: Date.now()
+        };
+    }
+    """,
+    Output("video-cursor-store", "data", allow_duplicate=True),
+    Input("video-status-poll", "n_intervals"),
+    State("video-offset-input", "value"),
+    State("video-file-input", "value"),
+    prevent_initial_call=True,
+)
+
+
+
+
+# -----------------------------------------------------------------------------
+# Selected-window EEG/EMG + video reviewer
+# -----------------------------------------------------------------------------
+def make_selected_interval_review_figure(
+    project_root: str,
+    recording_id: str,
+    start_s: float,
+    end_s: float,
+    cursor_s: float | None = None,
+):
+    """Focused review plot for a selected interval.
+
+    It shows the app Final epoch grid on top, then EEG and EMG for the selected
+    window. A light-blue rectangle highlights the epoch currently corresponding
+    to the video frame, and a darker blue line marks the exact video-frame time.
+    """
+    rec = load_recording(project_root, recording_id)
+    fs = float(rec["fs"])
+    rd = rec["recording_dir"]
+
+    start_s = max(0.0, float(start_s))
+    end_s = min(float(rec["duration_s"]), float(end_s))
+    if end_s <= start_s:
+        end_s = min(float(rec["duration_s"]), start_s + 10.0)
+
+    start_min = start_s / 60.0
+    end_min = end_s / 60.0
+
+    # Higher point budget here because this is a focused short-window reviewer.
+    t_eeg, eeg = downsample_npy_window(rd / "eeg.npy", fs, start_s, end_s, max_points=120000)
+    t_emg, emg = downsample_npy_window(rd / "emg.npy", fs, start_s, end_s, max_points=120000)
+
+    final = rec["final"].copy()
+    mask = (final["t0_s"].astype(float) < end_s) & (final["t1_s"].astype(float) > start_s)
+    epoch_df = final.loc[mask].copy()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.16, 0.42, 0.42],
+        vertical_spacing=0.045,
+        subplot_titles=["Final/app epochs", "EEG", "EMG"],
+    )
+
+    if len(epoch_df):
+        mids_min = ((epoch_df["t0_s"].astype(float) + epoch_df["t1_s"].astype(float)) / 2.0) / 60.0
+        labels = epoch_df.get("final_state", pd.Series("Undefined", index=epoch_df.index)).fillna("Undefined").astype(str).to_numpy()
+        z = np.asarray([state_display_codes(labels, "Final")], dtype=float)
+        custom = np.asarray([labels], dtype=object)
+        fig.add_trace(
+            go.Heatmap(
+                x=mids_min,
+                y=["Final"],
+                z=z,
+                customdata=custom,
+                zmin=-2.5,
+                zmax=3.5,
+                colorscale=discrete_colorscale(),
+                showscale=False,
+                hovertemplate="Time=%{x:.3f} min<br>Final=%{customdata}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
+        # Draw epoch boundaries so 1 s / 2 s bins are visible even if labels are similar.
+        for _, erow in epoch_df.iterrows():
+            for x_s in [float(erow["t0_s"]), float(erow["t1_s"])]:
+                if start_s <= x_s <= end_s:
+                    fig.add_shape(
+                        type="line",
+                        xref="x",
+                        yref="paper",
+                        x0=x_s / 60.0,
+                        x1=x_s / 60.0,
+                        y0=0.0,
+                        y1=1.0,
+                        line={"color": "rgba(60,60,60,0.18)", "width": 1},
+                        layer="above",
+                    )
+
+    fig.add_trace(
+        go.Scattergl(x=t_eeg, y=eeg, mode="lines", name="EEG", line=dict(color=RAW_TRACE_COLOR, width=1)),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scattergl(x=t_emg, y=emg, mode="lines", name="EMG", line=dict(color=RAW_TRACE_COLOR, width=1)),
+        row=3,
+        col=1,
+    )
+
+    yrg = robust_range(eeg)
+    if yrg:
+        fig.update_yaxes(range=yrg, row=2, col=1)
+    yrg = robust_range(emg)
+    if yrg:
+        fig.update_yaxes(range=yrg, row=3, col=1)
+
+    # Current video epoch / frame overlay.
+    if cursor_s is not None and np.isfinite(float(cursor_s)):
+        x_cursor = float(cursor_s) / 60.0
+        epoch = current_epoch_for_recording_time(project_root, recording_id, float(cursor_s))
+        if epoch is not None:
+            fig.add_vrect(
+                x0=float(epoch["t0_s"]) / 60.0,
+                x1=float(epoch["t1_s"]) / 60.0,
+                fillcolor="rgba(0,85,255,0.16)",
+                line_width=0,
+                layer="above",
+            )
+        fig.add_vline(x=x_cursor, line_width=2, line_color="rgba(0,85,255,0.95)")
+
+    fig.update_xaxes(range=[start_min, end_min])
+    fig.update_xaxes(title_text="Time (min)", row=3, col=1)
+    fig.update_layout(
+        height=620,
+        margin=dict(l=60, r=20, t=70, b=45),
+        hovermode="x unified",
+        showlegend=False,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        uirevision=f"interval-review-{recording_id}-{start_s:.3f}-{end_s:.3f}",
+    )
+    fig.update_yaxes(fixedrange=False)
+    return fig
+
+
+def interval_review_epoch_summary(project_root: str, recording_id: str, recording_time_s: float | None) -> str:
+    if recording_time_s is None:
+        return "No video-frame time yet. Press play or step inside the selected-window reviewer."
+    epoch = current_epoch_for_recording_time(project_root, recording_id, float(recording_time_s))
+    if epoch is None:
+        return f"Recording time {float(recording_time_s):.3f} s is outside the final/app epoch table."
+    dur = float(epoch["t1_s"]) - float(epoch["t0_s"])
+    return (
+        f"Current epoch #{epoch['epoch_id']}: {epoch['t0_s']:.3f}–{epoch['t1_s']:.3f} s "
+        f"({dur:.3f} s), Final={epoch['final_state']}"
+    )
+
+
+@app.callback(
+    Output("interval-review-store", "data"),
+    Input("open-selected-interval-reviewer", "n_clicks"),
+    Input("close-selected-interval-reviewer", "n_clicks"),
+    State("selected-interval-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def open_or_close_selected_interval_reviewer(n_open, n_close, selected, project_root, recording_id):
+    trig = callback_context.triggered_id
+    if trig == "close-selected-interval-reviewer":
+        return {"open": False}
+
+    if not project_root or not recording_id:
+        return {"open": False, "error": "Load a recording first."}
+    if not selected:
+        return {"open": False, "error": "Select a window on the QC plot first. Press S, drag over the signal interval, then open the reviewer."}
+
+    try:
+        start_s = float(selected.get("start_min")) * 60.0
+        end_s = float(selected.get("end_min")) * 60.0
+    except Exception:
+        return {"open": False, "error": "Could not read selected interval. Select a window again."}
+
+    if end_s <= start_s:
+        return {"open": False, "error": "Selected interval is invalid. Select a wider window."}
+
+    # Keep the focused reviewer manageable. It can still show up to 10 minutes,
+    # but it is most useful for short review clips.
+    max_review_s = 10.0 * 60.0
+    if end_s - start_s > max_review_s:
+        end_s = start_s + max_review_s
+
+    return {
+        "open": True,
+        "project_root": str(project_root),
+        "recording_id": str(recording_id),
+        "start_s": start_s,
+        "end_s": end_s,
+        "created_at_ms": int(pd.Timestamp.now().timestamp() * 1000),
+    }
+
+
+@app.callback(
+    Output("selected-interval-reviewer-modal", "style"),
+    Output("interval-review-graph", "figure"),
+    Output("interval-review-video-player", "src"),
+    Output("interval-review-title", "children"),
+    Output("interval-review-subtitle", "children"),
+    Output("interval-review-epoch-label", "children"),
+    Output("interval-review-feedback", "children"),
+    Output("selected-interval-reviewer-status", "children"),
+    Output("interval-review-seek-store", "data", allow_duplicate=True),
+    Input("interval-review-store", "data"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def render_selected_interval_reviewer(data, offset_s):
+    hidden_style = {"display": "none"}
+    visible_style = {"display": "block"}
+    data = data or {}
+
+    if data.get("error"):
+        return hidden_style, no_update, no_update, no_update, no_update, no_update, no_update, str(data.get("error")), no_update
+    if not data.get("open"):
+        return hidden_style, no_update, no_update, no_update, no_update, no_update, "Reviewer closed.", "", no_update
+
+    project_root = data.get("project_root")
+    recording_id = data.get("recording_id")
+    start_s = float(data.get("start_s", 0.0))
+    end_s = float(data.get("end_s", start_s))
+    offset = safe_float(offset_s, 0.0)
+
+    video_file, saved_offset = load_video_metadata(project_root, recording_id)
+    # Prefer the visible input offset, but fall back to saved metadata.
+    if offset_s in (None, ""):
+        offset = float(saved_offset or 0.0)
+    video_time_start = max(0.0, start_s - offset)
+    video_time_end = max(video_time_start, end_s - offset)
+
+    fig = make_selected_interval_review_figure(project_root, recording_id, start_s, end_s, cursor_s=start_s)
+
+    title = "Selected-window EEG/EMG + video reviewer"
+    subtitle = (
+        f"Recording {recording_id}: {start_s/60.0:.3f}–{end_s/60.0:.3f} min. "
+        "This detailed reviewer appears only for the selected window. Top row = Final/app epochs; blue highlight = current epoch; blue line = current video frame."
+    )
+    epoch_label = interval_review_epoch_summary(project_root, recording_id, start_s)
+
+    if not video_file:
+        src = ""
+        feedback = "No video linked to this recording yet. Save a video path in Video QC first."
+        seek = no_update
+    else:
+        src = video_url_for_path(video_file)
+        feedback = f"Ready. Selected clip video time: {video_time_start:.2f}–{video_time_end:.2f} s. If the video is black or does not seek, this time may be outside the video duration; check that the correct video file and offset are saved."
+        seek = {
+            "time_s": video_time_start,
+            "end_time_s": video_time_end,
+            "recording_time_s": start_s,
+            "auto_play": False,
+            "source": "open_selected_interval_reviewer",
+            "created_at_ms": int(pd.Timestamp.now().timestamp() * 1000),
+        }
+
+    status = f"Opened selected-window reviewer: {start_s/60.0:.3f}–{end_s/60.0:.3f} min."
+    return visible_style, fig, src, title, subtitle, epoch_label, feedback, status, seek
+
+
+@app.callback(
+    Output("interval-review-seek-store", "data", allow_duplicate=True),
+    Input("interval-review-play", "n_clicks"),
+    State("interval-review-store", "data"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def play_selected_interval_in_reviewer(n, data, offset_s):
+    if not n or not data or not data.get("open"):
+        return no_update
+    offset = safe_float(offset_s, 0.0)
+    start_s = float(data.get("start_s", 0.0))
+    end_s = float(data.get("end_s", start_s))
+    return {
+        "time_s": max(0.0, start_s - offset),
+        "end_time_s": max(0.0, end_s - offset),
+        "recording_time_s": start_s,
+        "auto_play": True,
+        "source": "interval_review_play",
+        "created_at_ms": int(pd.Timestamp.now().timestamp() * 1000),
+    }
+
+
+@app.callback(
+    Output("interval-review-seek-store", "data", allow_duplicate=True),
+    Input("interval-review-prev-epoch", "n_clicks"),
+    Input("interval-review-next-epoch", "n_clicks"),
+    State("interval-review-cursor-store", "data"),
+    State("interval-review-store", "data"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def interval_review_epoch_step(n_prev, n_next, cursor, data, offset_s):
+    trig = callback_context.triggered_id
+    if not data or not data.get("open"):
+        return no_update
+    project_root = data.get("project_root")
+    recording_id = data.get("recording_id")
+    start_s = float(data.get("start_s", 0.0))
+    end_s = float(data.get("end_s", start_s))
+    offset = safe_float(offset_s, 0.0)
+    current_s = float((cursor or {}).get("recording_time_s", start_s))
+    try:
+        rec = load_recording(project_root, recording_id)
+        final = rec["final"].copy()
+        # Restrict epoch stepping to epochs in the selected interval.
+        mask = (final["t0_s"].astype(float) < end_s) & (final["t1_s"].astype(float) > start_s)
+        epochs = final.loc[mask].reset_index(drop=True)
+        if len(epochs) == 0:
+            return no_update
+        mids = ((epochs["t0_s"].astype(float) + epochs["t1_s"].astype(float)) / 2.0).to_numpy(float)
+        idx = int(np.argmin(np.abs(mids - current_s)))
+        if trig == "interval-review-prev-epoch":
+            idx = max(0, idx - 1)
+        elif trig == "interval-review-next-epoch":
+            idx = min(len(epochs) - 1, idx + 1)
+        else:
+            return no_update
+        target_s = float(epochs.iloc[idx]["t0_s"])
+        return {
+            "time_s": max(0.0, target_s - offset),
+            "end_time_s": max(0.0, end_s - offset),
+            "recording_time_s": target_s,
+            "auto_play": False,
+            "source": trig,
+            "created_at_ms": int(pd.Timestamp.now().timestamp() * 1000),
+        }
+    except Exception as e:
+        return {"error": f"Could not step epoch: {type(e).__name__}: {e}"}
+
+
+app.clientside_callback(
+    """
+    function(data) {
+        if (!data) {
+            return ["", window.dash_clientside.no_update];
+        }
+        if (data.error) {
+            return [data.error, window.dash_clientside.no_update];
+        }
+        const requestedStart = Math.max(0, Number(data.time_s || 0));
+        const requestedEnd = Math.max(requestedStart, Number(data.end_time_s || requestedStart));
+        const autoPlay = Boolean(data.auto_play);
+
+        function controlVideo() {
+            const video = document.getElementById("interval-review-video-player");
+            if (!video) { return false; }
+            try {
+                if (video._intervalStopHandler) {
+                    video.removeEventListener("timeupdate", video._intervalStopHandler);
+                    video._intervalStopHandler = null;
+                }
+                video.currentTime = requestedStart;
+                const duration = Math.max(0, requestedEnd - requestedStart);
+                if (duration > 0) {
+                    const stopHandler = function() {
+                        if (video.currentTime >= requestedEnd - 0.03) {
+                            video.pause();
+                            try { video.currentTime = requestedEnd; } catch(e) {}
+                            video.removeEventListener("timeupdate", stopHandler);
+                            video._intervalStopHandler = null;
+                        }
+                    };
+                    video._intervalStopHandler = stopHandler;
+                    video.addEventListener("timeupdate", stopHandler);
+                }
+                if (autoPlay && requestedEnd > requestedStart) {
+                    const p = video.play();
+                    if (p && p.catch) { p.catch(function() {}); }
+                } else {
+                    video.pause();
+                }
+                return true;
+            } catch(e) {
+                return false;
+            }
+        }
+
+        // The modal/video may be mounted in the same Dash update as this store.
+        // Try immediately, then again shortly after render.
+        let ok = controlVideo();
+        if (!ok) {
+            setTimeout(controlVideo, 200);
+            setTimeout(controlVideo, 600);
+        }
+
+        return [
+            (autoPlay ? "Playing" : "Ready at") + " selected-window video time " + requestedStart.toFixed(2) + " s.",
+            {
+                recording_time_s: Number(data.recording_time_s || 0),
+                video_time_s: requestedStart,
+                source: data.source || "interval_review_seek",
+                created_at_ms: Date.now()
+            }
+        ];
+    }
+    """,
+    Output("interval-review-feedback", "children", allow_duplicate=True),
+    Output("interval-review-cursor-store", "data", allow_duplicate=True),
+    Input("interval-review-seek-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(nPause) {
+        const video = document.getElementById("interval-review-video-player");
+        if (!video) {
+            return "No selected-window video player loaded.";
+        }
+        try {
+            video.pause();
+            return "Paused selected-window video.";
+        } catch(e) {
+            return "Could not pause video: " + e;
+        }
+    }
+    """,
+    Output("interval-review-feedback", "children", allow_duplicate=True),
+    Input("interval-review-pause", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(nBackFrame, nForwardFrame, nBackSecond, nForwardSecond, frameStep, offsetS, data) {
+        const ctx = dash_clientside.callback_context;
+        if (!ctx.triggered || ctx.triggered.length === 0) {
+            return ["", window.dash_clientside.no_update];
+        }
+        const trig = ctx.triggered[0].prop_id.split('.')[0];
+        const video = document.getElementById("interval-review-video-player");
+        if (!video) {
+            return ["No selected-window video player loaded.", window.dash_clientside.no_update];
+        }
+        let step = Number(frameStep || 0.04);
+        if (!isFinite(step) || step <= 0) { step = 0.04; }
+        let delta = 0;
+        if (trig === "interval-review-step-back-frame") delta = -step;
+        if (trig === "interval-review-step-forward-frame") delta = step;
+        if (trig === "interval-review-step-back-second") delta = -1.0;
+        if (trig === "interval-review-step-forward-second") delta = 1.0;
+        if (delta === 0) return ["", window.dash_clientside.no_update];
+        try {
+            video.pause();
+            const offset = Number(offsetS || 0);
+            const selectedStart = Number((data || {}).start_s || 0) - offset;
+            const selectedEnd = Number((data || {}).end_s || Infinity) - offset;
+            let newTime = Number(video.currentTime || 0) + delta;
+            newTime = Math.max(Math.max(0, selectedStart), newTime);
+            if (isFinite(selectedEnd)) newTime = Math.min(selectedEnd, newTime);
+            const duration = Number(video.duration || 0);
+            if (isFinite(duration) && duration > 0) newTime = Math.min(duration, newTime);
+            video.currentTime = newTime;
+            const recordingTime = newTime + offset;
+            return ["Video time " + newTime.toFixed(3) + " s | recording time " + recordingTime.toFixed(3) + " s.", {
+                recording_time_s: recordingTime,
+                video_time_s: newTime,
+                source: trig,
+                created_at_ms: Date.now()
+            }];
+        } catch(e) {
+            return ["Could not step selected-window video: " + e, window.dash_clientside.no_update];
+        }
+    }
+    """,
+    Output("interval-review-feedback", "children", allow_duplicate=True),
+    Output("interval-review-cursor-store", "data", allow_duplicate=True),
+    Input("interval-review-step-back-frame", "n_clicks"),
+    Input("interval-review-step-forward-frame", "n_clicks"),
+    Input("interval-review-step-back-second", "n_clicks"),
+    Input("interval-review-step-forward-second", "n_clicks"),
+    State("interval-review-frame-step-input", "value"),
+    State("video-offset-input", "value"),
+    State("interval-review-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(n, offsetS, data) {
+        if (!data || !data.open) {
+            return window.dash_clientside.no_update;
+        }
+        const video = document.getElementById("interval-review-video-player");
+        if (!video) {
+            return window.dash_clientside.no_update;
+        }
+        const current = Number(video.currentTime || 0);
+        const offset = Number(offsetS || 0);
+        const selectedStart = Number(data.start_s || 0);
+        const selectedEnd = Number(data.end_s || Infinity);
+        const recordingTime = current + offset;
+        if (!isFinite(recordingTime) || recordingTime < selectedStart - 0.1 || recordingTime > selectedEnd + 0.1) {
+            return window.dash_clientside.no_update;
+        }
+        return {
+            recording_time_s: recordingTime,
+            video_time_s: current,
+            source: video.paused ? "interval_review_poll_paused" : "interval_review_poll_playing",
+            created_at_ms: Date.now()
+        };
+    }
+    """,
+    Output("interval-review-cursor-store", "data", allow_duplicate=True),
+    Input("interval-review-poll", "n_intervals"),
+    State("video-offset-input", "value"),
+    State("interval-review-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+@app.callback(
+    Output("interval-review-graph", "figure", allow_duplicate=True),
+    Output("interval-review-epoch-label", "children", allow_duplicate=True),
+    Input("interval-review-cursor-store", "data"),
+    State("interval-review-store", "data"),
+    prevent_initial_call=True,
+)
+def update_selected_interval_review_cursor(cursor, data):
+    if not cursor or not data or not data.get("open"):
+        return no_update, no_update
+    project_root = data.get("project_root")
+    recording_id = data.get("recording_id")
+    start_s = float(data.get("start_s", 0.0))
+    end_s = float(data.get("end_s", start_s))
+    try:
+        recording_time_s = float(cursor.get("recording_time_s"))
+    except Exception:
+        return no_update, no_update
+    if not np.isfinite(recording_time_s):
+        return no_update, no_update
+    # Redraw the focused figure. The selected interval is small, so this remains responsive
+    # while avoiding fragile shape patch bookkeeping.
+    fig = make_selected_interval_review_figure(project_root, recording_id, start_s, end_s, cursor_s=recording_time_s)
+    return fig, interval_review_epoch_summary(project_root, recording_id, recording_time_s)
 
 # -----------------------------------------------------------------------------
 # Somnotate callbacks
