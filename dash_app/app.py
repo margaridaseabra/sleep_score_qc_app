@@ -8,6 +8,8 @@ import re
 import shutil
 import subprocess
 import sys
+import platform
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any
@@ -44,9 +46,43 @@ except Exception:
 
 APP_DIR = Path(__file__).resolve().parents[1]
 PIPELINES_DIR = APP_DIR / "pipelines"
+LOGS_DIR = APP_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-DEFAULT_PROJECT_ROOT = "/Users/margaridaseabra/Desktop/Margarida-batch2-june26"
+def _safe_log_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "command"))
+    return value.strip("._") or "command"
+
+
+def _write_command_log(cmd: list[str], cwd: Path, returncode: int, stdout: str, stderr: str, started: datetime, finished: datetime) -> Path:
+    command_name = _safe_log_name(Path(cmd[1]).stem if len(cmd) > 1 else Path(cmd[0]).stem)
+    stamp = started.strftime("%Y%m%d_%H%M%S_%f")
+    path = LOGS_DIR / f"{stamp}_{command_name}.log"
+    content = [
+        f"Started: {started.isoformat()}",
+        f"Finished: {finished.isoformat()}",
+        f"Elapsed seconds: {(finished-started).total_seconds():.3f}",
+        f"Return code: {returncode}",
+        f"Platform: {platform.platform()}",
+        f"Python: {sys.executable}",
+        f"Python version: {sys.version}",
+        f"Working directory: {cwd}",
+        "Command:",
+        subprocess.list2cmdline([str(x) for x in cmd]),
+        "",
+        "--- STDOUT ---",
+        stdout or "<empty>",
+        "",
+        "--- STDERR ---",
+        stderr or "<empty>",
+        "",
+    ]
+    path.write_text("\n".join(content), encoding="utf-8", errors="replace")
+    return path
+
+
+DEFAULT_PROJECT_ROOT = os.environ.get("SLEEP_QC_PROJECT_ROOT", str(APP_DIR / "project_data"))
 
 
 def PInput(*args, **kwargs):
@@ -179,21 +215,40 @@ def discrete_colorscale():
 
 
 def run_command(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
+    run_cwd = Path(cwd or APP_DIR).resolve()
+    started = datetime.now()
+    stdout = ""
+    stderr = ""
+    returncode = 999
     try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
         p = subprocess.run(
-            cmd,
-            cwd=str(cwd or APP_DIR),
+            [str(x) for x in cmd],
+            cwd=str(run_cwd),
             text=True,
             capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            shell=False,
         )
-        out = ""
-        if p.stdout:
-            out += p.stdout
-        if p.stderr:
-            out += "\n[stderr]\n" + p.stderr
-        return p.returncode, out.strip()
-    except Exception as e:
-        return 999, repr(e)
+        returncode = int(p.returncode)
+        stdout = p.stdout or ""
+        stderr = p.stderr or ""
+    except Exception as exc:
+        stderr = repr(exc)
+    finished = datetime.now()
+    log_path = _write_command_log(cmd, run_cwd, returncode, stdout, stderr, started, finished)
+    parts = [
+        f"Return code: {returncode}",
+        f"Diagnostic log: {log_path}",
+    ]
+    if stdout.strip():
+        parts += ["", "[stdout]", stdout.strip()]
+    if stderr.strip():
+        parts += ["", "[stderr]", stderr.strip()]
+    return returncode, "\n".join(parts)
 
 
 def as_path(x: str | Path | None) -> Path:
@@ -306,28 +361,40 @@ def save_video_metadata(project_root: str | Path, recording_id: str, video_file:
         return False, f"Could not save video settings: {type(e).__name__}: {e}"
 
 
-def next_available_mp4_path(avi_path: Path) -> Path:
-    """Return a non-overwriting MP4 path next to the AVI file."""
-    base = avi_path.with_suffix(".mp4")
-    if not base.exists():
-        return base
+def browser_mp4_path_for_avi(avi_path: Path) -> Path:
+    """Return the deterministic local MP4 path stored beside an AVI file."""
+    return avi_path.with_name(f"{avi_path.stem}_browser.mp4")
 
-    candidate = avi_path.with_name(f"{avi_path.stem}_converted.mp4")
-    if not candidate.exists():
-        return candidate
 
-    for i in range(2, 1000):
-        candidate = avi_path.with_name(f"{avi_path.stem}_converted_{i}.mp4")
-        if not candidate.exists():
-            return candidate
-
-    raise RuntimeError("Could not choose a free MP4 output filename.")
+def save_video_source_metadata(
+    project_root: str | Path,
+    recording_id: str,
+    source_video_file: str | Path,
+    browser_video_file: str | Path,
+) -> tuple[bool, str]:
+    """Record both local source and browser-compatible video paths."""
+    try:
+        rd = recording_dir_from_manifest(project_root, recording_id)
+        meta_path = rd / "metadata.json"
+        meta = read_json(meta_path)
+        meta["video_source_file"] = str(Path(source_video_file).expanduser().resolve())
+        meta["video_file"] = str(Path(browser_video_file).expanduser().resolve())
+        meta["video_conversion"] = {
+            "format": "mp4_h264",
+            "storage": "local_beside_source",
+        }
+        write_json(meta_path, meta)
+        return True, "Saved the original AVI and local browser MP4 paths in metadata.json."
+    except Exception as e:
+        return False, f"Could not save video conversion metadata: {type(e).__name__}: {e}"
 
 
 def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str | None]:
-    """Convert an AVI file to browser-friendly H.264 MP4 using ffmpeg.
+    """Convert AVI to a browser-compatible MP4 beside the original file.
 
-    Returns (ok, message, output_path).
+    The original AVI remains untouched. The converted file is stored locally as
+    ``<original_stem>_browser.mp4``. Existing up-to-date conversions are reused.
+    Returns ``(ok, message, output_path)``.
     """
     raw = str(video_file or "").strip()
     if not raw:
@@ -338,20 +405,35 @@ def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str |
         return False, f"AVI file not found: {avi_path}", None
 
     if avi_path.suffix.lower() != ".avi":
-        return False, "Automatic conversion is only needed for .avi files. MP4/MOV can be saved directly.", None
+        return False, "Local conversion is only required for .avi files.", None
+
+    out_path = browser_mp4_path_for_avi(avi_path)
+
+    # Reuse the local conversion when it is at least as new as the source AVI.
+    if out_path.exists() and out_path.stat().st_size > 0:
+        try:
+            if out_path.stat().st_mtime >= avi_path.stat().st_mtime:
+                return (
+                    True,
+                    f"Reusing existing local browser video:\n{out_path}",
+                    str(out_path),
+                )
+        except OSError:
+            pass
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return (
             False,
-            "ffmpeg was not found. Install it with: brew install ffmpeg",
+            "FFmpeg was not found in the active environment. Run: "
+            "conda env update -f environment.yml --prune, then reactivate "
+            "sleep_stage_qc_v2.",
             None,
         )
 
-    out_path = next_available_mp4_path(avi_path)
-
     cmd = [
         ffmpeg,
+        "-y",
         "-i", str(avi_path),
         "-map", "0:v:0",
         "-an",
@@ -367,15 +449,24 @@ def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str |
     try:
         p = subprocess.run(cmd, text=True, capture_output=True)
     except Exception as e:
-        return False, f"Could not run ffmpeg: {type(e).__name__}: {e}", None
+        return False, f"Could not run FFmpeg: {type(e).__name__}: {e}", None
 
     if p.returncode != 0:
         err = (p.stderr or p.stdout or "").strip()
         if len(err) > 3500:
             err = err[-3500:]
-        return False, f"ffmpeg conversion failed. Terminal output:\n{err}", None
+        return False, f"FFmpeg conversion failed. Terminal output:\n{err}", None
 
-    return True, f"Converted AVI to MP4 and saved new video path:\n{out_path}", str(out_path)
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return False, f"FFmpeg finished but no usable MP4 was created: {out_path}", None
+
+    return (
+        True,
+        "Converted AVI locally. The original AVI was not changed.\n"
+        f"Browser MP4: {out_path}",
+        str(out_path),
+    )
+
 
 
 def safe_float(x, default=0.0) -> float:
@@ -1896,12 +1987,12 @@ def render_tab(tab, project_root, _refresh):
                         children=[
                             html.Button("Jump video to window start", id="jump-video-window", n_clicks=0),
                             html.Button("Play selected video interval", id="jump-video-selected", n_clicks=0),
-                            html.Button("Convert AVI to MP4 + save path", id="convert-video-mp4", n_clicks=0),
+                            html.Button("Convert AVI locally to browser MP4", id="convert-video-mp4", n_clicks=0),
                             dcc.Loading(type="circle", children=html.Div(id="video-status", className="status-line")),
                         ],
                     ),
                     html.Div(
-                        "During conversion, keep the app tab open. Large AVI files can take several minutes; the button shows a spinner while ffmpeg is running.",
+                        "Conversion runs locally on this computer. The original AVI stays unchanged, and the browser-compatible MP4 is saved beside it as <name>_browser.mp4. Existing conversions are reused.",
                         className="app-subtitle",
                         style={"marginTop": "6px"},
                     ),
@@ -1909,9 +2000,9 @@ def render_tab(tab, project_root, _refresh):
                     dcc.Store(id="video-seek-store"),
                     html.Div(id="video-seek-feedback", className="status-line"),
                     html.Details(children=[
-                        html.Summary("AVI not loading? Convert AVI to MP4"),
+                        html.Summary("How local AVI conversion works"),
                         html.Div(
-                            "If your .avi file is not loading in this browser, click “Convert AVI to MP4 + save path” above. You can also do the same conversion manually in Terminal with this command. Replace videoname.avi and videoname.mp4 with your real file names or full paths.",
+                            "If your .avi file is not loading in this browser, click “Convert AVI locally to browser MP4” above. You can also do the same conversion manually in Terminal with this command. Replace videoname.avi and videoname.mp4 with your real file names or full paths.",
                             className="app-subtitle",
                             style={"marginTop": "6px", "marginBottom": "6px"},
                         ),
@@ -2216,8 +2307,52 @@ def run_import_pipeline(n1,n2,n3,project_root,mat_file,rec_id,fs,eeg_key,emg_key
         cmd = [sys.executable, str(PIPELINES_DIR/"03_layer1_emg_wake_sleep.py"), "--project-root", str(project_root), "--recording-id", str(rec_id), "--epoch-sec", str(epoch_sec)]
     else:
         return no_update, refresh
+    project_path = Path(str(project_root)).expanduser().resolve()
+    recording_dir = project_path / "recordings" / str(rec_id)
+
+    # Fail early with a useful message rather than launching a pipeline that cannot succeed.
+    if trigger == "btn-compute-features":
+        missing = [name for name in ("metadata.json", "eeg.npy", "emg.npy") if not (recording_dir / name).exists()]
+        if missing:
+            return (
+                "Cannot compute features because the imported recording is incomplete.\n"
+                f"Recording folder: {recording_dir}\n"
+                f"Missing: {', '.join(missing)}",
+                refresh,
+            )
+    if trigger == "btn-run-layer1" and not (recording_dir / "epoch_features.csv").exists():
+        return (
+            "Cannot run Layer 1 because epoch_features.csv does not exist.\n"
+            "Run Compute epoch features first.\n"
+            f"Expected file: {recording_dir / 'epoch_features.csv'}",
+            refresh,
+        )
+
     code, out = run_command(cmd)
-    return f"$ {' '.join(cmd)}\n\n{out}", (refresh or 0) + 1
+    expected = None
+    if trigger == "btn-import-mat":
+        expected = recording_dir / "metadata.json"
+    elif trigger == "btn-compute-features":
+        expected = recording_dir / "epoch_features.csv"
+    elif trigger == "btn-run-layer1":
+        expected = recording_dir / "layer1_wake_sleep.csv"
+
+    command_text = subprocess.list2cmdline([str(x) for x in cmd])
+    if code != 0:
+        return (
+            f"FAILED (return code {code})\n\n$ {command_text}\n\n{out}",
+            refresh,
+        )
+    if expected is not None and not expected.exists():
+        return (
+            "FAILED: the command returned successfully, but the expected output was not created.\n"
+            f"Expected: {expected}\n\n$ {command_text}\n\n{out}",
+            refresh,
+        )
+    return (
+        f"SUCCESS\nCreated/verified: {expected}\n\n$ {command_text}\n\n{out}",
+        (refresh or 0) + 1,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -2652,10 +2787,16 @@ def update_video_panel(recording_id, save_clicks, convert_clicks, project_root, 
             return original_video_file, offset_s, video_panel_children(original_video_file, offset_s), msg
 
         ok_save, save_msg = save_video_metadata(project_root, recording_id, converted_path, offset_s)
-        combined_msg = msg if ok_save else f"{msg}\nCould not save converted path: {save_msg}"
-        if ok_save:
-            combined_msg = f"{msg}\n{save_msg}"
-        return converted_path, offset_s, video_panel_children(converted_path, offset_s), combined_msg
+        source_ok, source_msg = save_video_source_metadata(
+            project_root,
+            recording_id,
+            original_video_file,
+            converted_path,
+        )
+        messages = [msg]
+        messages.append(save_msg if ok_save else f"Could not save converted path: {save_msg}")
+        messages.append(source_msg if source_ok else f"Could not save source path: {source_msg}")
+        return converted_path, offset_s, video_panel_children(converted_path, offset_s), "\n".join(messages)
 
     video_file, offset_s = load_video_metadata(project_root, recording_id)
     return video_file, offset_s, video_panel_children(video_file, offset_s), video_format_message(video_file)
@@ -4124,4 +4265,6 @@ def set_global_qc_mouse_mode_select_window(n_pan, n_select, fig):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8050)
+    host = os.environ.get("SLEEP_QC_HOST", "127.0.0.1")
+    port = int(os.environ.get("SLEEP_QC_PORT", "8050"))
+    app.run(debug=False, use_reloader=False, host=host, port=port)

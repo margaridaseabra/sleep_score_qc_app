@@ -117,3 +117,13 @@ dash_migration_v2_patch/
 .local_backups_not_committed/
 dash_app/app_backup*.py
 *.zip
+logs/
+project_data/
+*.log
+# Local video/data files
+*.avi
+*.mp4
+*.m4v
+*.mov
+*.mkv
+*.wmv

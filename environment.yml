@@ -9,6 +9,8 @@ dependencies:
   - scikit-learn
   - scipy
   - plotly
+  - dash
+  - ffmpeg
   - streamlit
   - pip
   - dash

@@ -2,51 +2,40 @@
 
 A cross-platform Dash application for semi-automated EEG/EMG sleep scoring, quality control, and manual review.
 
-The application provides an end-to-end workflow for importing recordings, computing automatic scoring, reviewing EEG/EMG/ACh signals, comparing multiple scoring layers, manually correcting sleep states, and exporting the final reviewed scoring.
+The app supports importing recordings, computing initial Wake/Sleep scoring, running or importing Somnotate scoring, reviewing EEG/EMG/ACh signals, identifying disagreements between scoring layers, manually correcting sleep states, linking local video, and exporting reviewed scoring.
 
-> **Current version:** Dash application  
-> **Legacy version:** The previous Streamlit implementation is kept only for reference and is no longer recommended.
+> **Recommended application:** Dash  
+> **Legacy application:** The older Streamlit version is retained only for reference.
 
 ---
 
-# Features
+## Features
 
-- Import recordings from:
-  - MATLAB (`.mat`)
-  - EDF (`.edf`)
-- Export reviewed recordings to:
-  - CSV
-  - MATLAB (`.mat`)
-  - EDF (`.edf`)
+- MATLAB (`.mat`) and EDF (`.edf`) import
 - Automatic Layer 1 Wake/Sleep scoring
-- Somnotate integration
-- Manual scoring review
-- Dissociation analysis
-- Interactive EEG/EMG/ACh viewer
-- Interactive spectrogram
-- Optional synchronized video review
-- Support for:
-  - 1-second epochs
-  - 2-second epochs
-  - Legacy 5-second Somnotate models
-- Cross-platform support
-  - macOS
-  - Windows
+- Somnotate Wake/NREM/REM integration
+- Interactive EEG, EMG, ACh and spectrogram review
+- Manual interval scoring and keyboard shortcuts
+- Dissociation analysis between scoring layers
+- Optional local video synchronization
+- Local AVI-to-MP4 conversion for browser playback
+- CSV, MATLAB and EDF export
+- 1-second and 2-second final scoring epochs
+- 1-second, 2-second and legacy 5-second Somnotate model support
+- macOS and Windows support
 
 ---
 
-# Installation
+## Installation
 
-## 1. Clone the repository
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/margaridaseabra/sleep_score_qc_app.git
 cd sleep_score_qc_app
 ```
 
----
-
-## 2. Create the Conda environment
+### 2. Create the Conda environment
 
 ```bash
 conda env create -f environment.yml
@@ -60,326 +49,301 @@ conda env update -f environment.yml --prune
 conda activate sleep_stage_qc_v2
 ```
 
+The environment installs Dash and FFmpeg. FFmpeg is used only for local AVI conversion; it is not bundled in the repository.
+
 ---
 
-# Running the application
+## Run on macOS
 
-## macOS
+Open Terminal in the repository folder:
 
 ```bash
+conda activate sleep_stage_qc_v2
 bash run_app.sh
 ```
 
-or
+Alternatively:
 
 ```bash
 python dash_app/app.py
 ```
 
----
+## Run on Windows
 
-## Windows
-
-Open **Anaconda Prompt** and run
+Open **Anaconda Prompt** in the repository folder:
 
 ```bat
+conda activate sleep_stage_qc_v2
 run_app_windows.bat
 ```
 
-or
+Alternatively:
 
 ```bat
 python dash_app\app.py
 ```
 
-The application will normally open at
+The app normally opens at:
 
-```
+```text
 http://127.0.0.1:8050
 ```
 
----
+### Windows diagnostics
 
-# Windows diagnostics
-
-Before running the application on Windows, it is recommended to verify the installation:
-
-```bash
+```bat
 python check_windows_setup.py
 ```
 
-The diagnostics script checks:
-
-- Python installation
-- Conda environment
-- Dash
-- NumPy
-- pandas
-- SciPy
-- scikit-learn
-- pyEDFlib
-- required pipeline scripts
-- repository write permissions
-
-If FFmpeg is not found, only AVI video conversion will be unavailable. The rest of the application will continue to function normally.
+The diagnostic script checks Python, the active Conda environment, required packages, pipeline scripts, write permissions and FFmpeg availability.
 
 ---
 
-# Typical workflow
+## Typical workflow
 
-1. Import recording
-2. Compute epoch features
-3. Run Layer 1 Wake/Sleep scoring
-4. Run Somnotate (optional)
-5. Review scoring in the QC viewer
-6. Export the final reviewed scoring
-
----
-
-# Importing recordings
-
-Supported formats
-
-| Format | Supported |
-|---------|-----------|
-| MATLAB (.mat) | ✓ |
-| EDF (.edf) | ✓ |
-
-Supported channels include
-
-- EEG
-- EMG
-- ACh / Fiber photometry (optional)
-
-During import, the application creates the processed recording folder used throughout the remainder of the workflow.
+1. Import a MATLAB or EDF recording.
+2. Compute epoch features.
+3. Run Layer 1 Wake/Sleep scoring.
+4. Run or import Somnotate scoring, if required.
+5. Review and correct scoring in **QC / Review**.
+6. Run dissociation analysis, if required.
+7. Export the final reviewed scoring.
 
 ---
 
-# Layer 1 Wake/Sleep scoring
+## Project structure
 
-Layer 1 computes:
-
-- EMG RMS
-- EEG spectral features
-- Wake/Sleep classification
-
-The generated files include
-
-```
-epoch_features.csv
-layer1_wake_sleep.csv
-```
-
----
-
-# Somnotate
-
-The application supports:
-
-- Running existing Somnotate models
-- Training new Somnotate models
-- 1-second epochs
-- 2-second epochs
-- Legacy 5-second models
-
-**Important**
-
-The epoch length used during scoring must match the epoch length used when the model was trained.
-
-Legacy models without stored epoch metadata will generate a warning before scoring.
-
-Somnotate itself is **not bundled** with this repository and must be installed separately:
-
-https://github.com/paulbrodersen/somnotate
-
----
-
-# QC / Review
-
-The QC viewer allows simultaneous visualization of:
-
-- EEG
-- EMG
-- ACh / Fiber photometry
-- EEG spectrogram
-- State probabilities
-- Manual scoring
-- Layer 1 scoring
-- Somnotate scoring
-- Final reviewed scoring
-
-Features include
-
-- Interactive Plotly viewer
-- Scroll-wheel zoom
-- Adaptive spectrogram resolution
-- Dissociation review queue
-- Manual interval scoring
-- Keyboard shortcuts
-- Video synchronization
-
-The coloured overlays correspond to the current **Final** scoring.
-
----
-
-# Video synchronization
-
-The QC viewer supports linking a local video file to each recording.
-
-Recommended formats:
-
-- MP4 (H.264)
-- MOV
-
-AVI files may not play directly in some browsers.
-
-If required, convert AVI to MP4 using:
-
-```bash
-ffmpeg -i "video.avi" \
--map 0:v:0 \
--an \
--c:v libx264 \
--pix_fmt yuv420p \
--preset fast \
--crf 23 \
--movflags +faststart \
-"video.mp4"
-```
-
-Video synchronization is performed using
-
-```
-video_time = recording_time − video_offset
-```
-
-The viewer includes controls for
-
-- Jumping to the selected QC window
-- Playing only the selected interval
-- Automatic stopping at the end of the selected interval
-
----
-
-# Dissociation analysis
-
-The Dissociation module highlights periods where scoring methods disagree.
-
-Examples include
-
-- Layer 1 vs Somnotate
-- Final vs Somnotate
-- Low-confidence Somnotate predictions
-
-Biological summaries include information such as
-
-- Common reviewer corrections
-- Distribution of corrected sleep states
-- Frequently reviewed transitions
-- Percentage of Somnotate REM corrected by the reviewer
-
----
-
-# Export
-
-The reviewed Final scoring can be exported as
-
-- CSV
-- MATLAB (.mat)
-- EDF (.edf)
-
----
-
-# Project structure
-
-```
+```text
 project_root/
 └── recordings/
     └── recording_id/
         ├── metadata.json
         ├── eeg.npy
         ├── emg.npy
-        ├── ach.npy                    # optional
+        ├── ach.npy                         # optional
         ├── epoch_features.csv
         ├── layer1_wake_sleep.csv
+        ├── manual_scoring_aligned.csv      # optional
         ├── final_scoring.csv
-        ├── manual_scoring_aligned.csv # optional
         └── somnotate/
             └── somnotate_results_timeseries.csv
 ```
 
-Raw recordings should generally remain outside the repository and be stored on a shared drive, OneDrive, or local project folder.
+Raw recordings and videos should remain outside the Git repository, for example on a local disk, external drive, OneDrive or shared data drive.
 
 ---
 
-# Keyboard shortcuts
+## Import and Layer 1
 
-| Key | Action |
-|------|--------|
-| P | Pan |
-| S | Select interval |
-| Z | Zoom |
-| 1 | Apply Wake |
-| 2 | Apply NREM |
-| 3 | Apply REM |
-| A | Apply Somnotate |
-| L | Apply Layer 1 |
-| M | Apply Manual scoring |
+Supported recording formats:
 
----
+| Format | Support |
+|---|---|
+| MATLAB (`.mat`) | Yes |
+| EDF (`.edf`) | Yes |
 
-# Troubleshooting
+Supported signals include EEG, EMG and optional ACh/fiber photometry.
 
-## No recordings appear
+After import, run **Compute epoch features** and then **Run Layer 1**. The main generated files are:
 
-Verify that the selected project contains
-
+```text
+epoch_features.csv
+layer1_wake_sleep.csv
 ```
-recordings/
-```
-
-with one or more imported recording folders.
-
----
-
-## Feature extraction fails
-
-Update the Conda environment
-
-```bash
-conda env update -f environment.yml --prune
-```
-
----
-
-## Video does not play
-
-Some browsers cannot decode AVI files.
-
-Convert the video to MP4 using the FFmpeg command shown above.
-
----
-
-## Windows installation
-
-Run
-
-```bash
-python check_windows_setup.py
-```
-
-to verify the installation.
 
 ---
 
 ## Somnotate
 
-Always use a Somnotate model trained with the same epoch length as the recordings being scored.
+The app supports existing or newly trained Somnotate models using:
+
+- 1-second epochs
+- 2-second epochs
+- legacy 5-second models
+
+The Somnotate scoring epoch length must match the epoch length used during model training.
+
+Somnotate is installed separately from its upstream repository:
+
+```text
+https://github.com/paulbrodersen/somnotate
+```
 
 ---
 
-# Legacy Streamlit version
+## QC / Review
 
-The previous Streamlit application is retained only for reference.
+The QC viewer can display:
 
-All new development is performed in the Dash application.
+- Final, Somnotate, Layer 1 and Manual scoring rows
+- Raw EEG
+- EEG spectrogram
+- Raw EMG
+- Optional ACh/fiber photometry
+- State probabilities
+- Dissociation review events
+- Optional synchronized video
+
+The coloured overlays over the traces represent the current **Final** scoring.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `P` | Pan |
+| `S` | Select an interval |
+| `Z` | Zoom |
+| `1` | Apply Wake |
+| `2` | Apply NREM |
+| `3` | Apply REM |
+| `A` | Apply Somnotate |
+| `L` | Apply Layer 1 |
+| `M` | Apply Manual scoring |
+
+After an interval is scored, the selection is cleared to reduce accidental rescoring of an older selection.
+
+---
+
+## Local video synchronization
+
+The app stores only the path to a video on the user's computer. Videos are not uploaded to GitHub or copied into the application.
+
+Recommended browser format:
+
+```text
+MP4 with H.264 video
+```
+
+### AVI conversion
+
+Most browsers cannot play AVI directly. When an AVI is selected, use **Convert AVI locally to browser MP4**.
+
+The app then:
+
+1. Keeps the original AVI unchanged.
+2. Runs FFmpeg locally on the user's computer.
+3. Saves the converted file beside the AVI as:
+
+```text
+original_name_browser.mp4
+```
+
+4. Reuses that MP4 on future runs when it is already up to date.
+5. Stores the original AVI path and browser MP4 path in the recording's `metadata.json`.
+
+Example local files:
+
+```text
+D:\sleep_data\mouse12\mouse12.avi
+D:\sleep_data\mouse12\mouse12_browser.mp4
+```
+
+or on macOS:
+
+```text
+/Volumes/T7/sleep_data/mouse12/mouse12.avi
+/Volumes/T7/sleep_data/mouse12/mouse12_browser.mp4
+```
+
+Video synchronization follows:
+
+```text
+video_time_s = recording_time_s - video_offset_s
+```
+
+The converted video remains part of the user's local dataset and is ignored by Git.
+
+---
+
+## Dissociation analysis
+
+The Dissociation tab highlights periods where scoring layers disagree, including:
+
+- Layer 1 versus Somnotate
+- Final versus Somnotate
+- Low-confidence periods
+- Frequently corrected scoring patterns
+
+After running the analysis, use the dissociation queue in **QC / Review** to inspect the flagged intervals.
+
+---
+
+## Final scoring and export
+
+Final scoring starts as `Undefined` and changes only when the reviewer applies labels or fills empty epochs from another scoring source.
+
+Final scoring is continuously saved to:
+
+```text
+project_root/recordings/<recording_id>/final_scoring.csv
+```
+
+Export formats:
+
+- CSV
+- MATLAB (`.mat`)
+- EDF (`.edf`)
+
+---
+
+## Troubleshooting
+
+### No recordings appear
+
+Confirm that the selected project root contains:
+
+```text
+recordings/
+```
+
+and at least one imported recording folder.
+
+### Feature extraction fails
+
+Update and reactivate the environment:
+
+```bash
+conda env update -f environment.yml --prune
+conda activate sleep_stage_qc_v2
+```
+
+Check the pipeline log in the repository's `logs/` folder.
+
+### Layer 1 does not run
+
+Confirm that `epoch_features.csv` exists in the recording folder. Layer 1 depends on that file.
+
+### AVI conversion is unavailable
+
+Confirm FFmpeg is available in the active environment:
+
+```bash
+ffmpeg -version
+```
+
+If it is missing:
+
+```bash
+conda env update -f environment.yml --prune
+conda activate sleep_stage_qc_v2
+```
+
+### Somnotate feature mismatch
+
+Use a Somnotate model trained with the same epoch duration as the scoring run.
+
+### Windows setup problems
+
+Run:
+
+```bat
+python check_windows_setup.py
+```
+
+and share the generated output and relevant file from `logs/` when reporting a problem.
+
+---
+
+## Legacy Streamlit application
+
+The previous Streamlit application is retained only for reference. New scoring and development should use the Dash application.
