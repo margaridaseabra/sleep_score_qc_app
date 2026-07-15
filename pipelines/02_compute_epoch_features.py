@@ -35,7 +35,7 @@ def bandpower(x, fs, fmin, fmax):
     if not np.any(mask):
         return np.nan
 
-    return float(np.trapz(pxx[mask], f[mask]))
+    return float(np.trapezoid(pxx[mask], f[mask]))
 
 
 def main():

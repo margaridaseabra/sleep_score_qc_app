@@ -14,9 +14,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
-call conda activate sleep_app
+call conda activate sleep_stage_qc_v2
 if errorlevel 1 (
-  echo ERROR: could not activate the sleep_app environment.
+  echo ERROR: could not activate the sleep_stage_qc_v2 environment.
   echo Create/update it with: conda env update -f environment.yml --prune
   pause
   exit /b 1
