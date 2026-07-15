@@ -35,8 +35,12 @@ def bandpower(x, fs, fmin, fmax):
     if not np.any(mask):
         return np.nan
 
-    integrate = getattr(np, "trapezoid", np.trapz)
-    return float(integrate(pxx[mask], f[mask]))
+    if hasattr(np, "trapezoid"):
+        area = np.trapezoid(pxx[mask], f[mask])
+    else:
+        area = np.trapz(pxx[mask], f[mask])
+
+    return float(area)
 
 
 def main():
