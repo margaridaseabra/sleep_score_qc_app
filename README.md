@@ -1,301 +1,385 @@
-# Semi-automated sleep scoring QC app
+# Sleep Stage QC
 
-This repository contains a Dash-based app for semi-automated EEG/EMG sleep scoring quality control.
+A cross-platform Dash application for semi-automated EEG/EMG sleep scoring, quality control, and manual review.
 
-The app is designed to help users import recordings, run initial Wake/Sleep scoring, inspect EEG/EMG/ACh traces, compare automatic scoring layers, review dissociation events, manually correct scoring, and export final reviewed sleep scoring.
+The application provides an end-to-end workflow for importing recordings, computing automatic scoring, reviewing EEG/EMG/ACh signals, comparing multiple scoring layers, manually correcting sleep states, and exporting the final reviewed scoring.
 
-> **Current recommended version:** Dash app  
-> **Legacy version:** the older Streamlit app is kept only for reference and should not be used for new scoring.
-
----
-
-## What the app does
-
-The app supports the following workflow:
-
-1. Import `.mat` recordings containing EEG, EMG, optional ACh/fiber photometry, and optional manual scoring.
-2. Run Layer 1 Wake/Sleep scoring.
-3. Run or import Somnotate Wake/NREM/REM scoring.
-4. Inspect EEG, EMG, ACh, scoring rows, probabilities, and dissociation events.
-5. Select windows manually and apply reviewed labels.
-6. Save/export final scoring.
-
-The main scoring layers are:
-
-| Layer | Meaning |
-|---|---|
-| Layer 1 | Automatic Wake/Sleep scoring |
-| Somnotate | Automatic Wake/NREM/REM scoring |
-| Manual | Imported manual scoring, if available |
-| Final | Reviewed scoring created by the user |
-
-Important: **Final scoring starts empty/Undefined by default.** It is only filled when the user explicitly applies labels or accepts a source such as Somnotate, Layer 1, or Manual.
+> **Current version:** Dash application  
+> **Legacy version:** The previous Streamlit implementation is kept only for reference and is no longer recommended.
 
 ---
 
-## Quick start
+# Features
 
-### 1. Clone the repository
+- Import recordings from:
+  - MATLAB (`.mat`)
+  - EDF (`.edf`)
+- Export reviewed recordings to:
+  - CSV
+  - MATLAB (`.mat`)
+  - EDF (`.edf`)
+- Automatic Layer 1 Wake/Sleep scoring
+- Somnotate integration
+- Manual scoring review
+- Dissociation analysis
+- Interactive EEG/EMG/ACh viewer
+- Interactive spectrogram
+- Optional synchronized video review
+- Support for:
+  - 1-second epochs
+  - 2-second epochs
+  - Legacy 5-second Somnotate models
+- Cross-platform support
+  - macOS
+  - Windows
+
+---
+
+# Installation
+
+## 1. Clone the repository
 
 ```bash
 git clone https://github.com/margaridaseabra/sleep_score_qc_app.git
 cd sleep_score_qc_app
 ```
 
-### 2. Create the Python environment
+---
 
-Using Conda:
+## 2. Create the Conda environment
 
 ```bash
 conda env create -f environment.yml
 conda activate sleep_stage_qc_v2
 ```
 
-If your local environment already exists under another name, for example `sleep_app`, activate that instead:
+If the environment already exists:
 
 ```bash
-conda activate sleep_app
+conda env update -f environment.yml --prune
+conda activate sleep_stage_qc_v2
 ```
 
-### 3. Launch the Dash app
+---
+
+# Running the application
+
+## macOS
 
 ```bash
 bash run_app.sh
 ```
 
-Then open the local URL shown in the terminal, usually:
+or
 
-```text
+```bash
+python dash_app/app.py
+```
+
+---
+
+## Windows
+
+Open **Anaconda Prompt** and run
+
+```bat
+run_app_windows.bat
+```
+
+or
+
+```bat
+python dash_app\app.py
+```
+
+The application will normally open at
+
+```
 http://127.0.0.1:8050
 ```
 
 ---
 
-## Expected project folder structure
+# Windows diagnostics
 
-The app expects a project folder containing one or more prepared recordings:
+Before running the application on Windows, it is recommended to verify the installation:
 
-```text
+```bash
+python check_windows_setup.py
+```
+
+The diagnostics script checks:
+
+- Python installation
+- Conda environment
+- Dash
+- NumPy
+- pandas
+- SciPy
+- scikit-learn
+- pyEDFlib
+- required pipeline scripts
+- repository write permissions
+
+If FFmpeg is not found, only AVI video conversion will be unavailable. The rest of the application will continue to function normally.
+
+---
+
+# Typical workflow
+
+1. Import recording
+2. Compute epoch features
+3. Run Layer 1 Wake/Sleep scoring
+4. Run Somnotate (optional)
+5. Review scoring in the QC viewer
+6. Export the final reviewed scoring
+
+---
+
+# Importing recordings
+
+Supported formats
+
+| Format | Supported |
+|---------|-----------|
+| MATLAB (.mat) | ✓ |
+| EDF (.edf) | ✓ |
+
+Supported channels include
+
+- EEG
+- EMG
+- ACh / Fiber photometry (optional)
+
+During import, the application creates the processed recording folder used throughout the remainder of the workflow.
+
+---
+
+# Layer 1 Wake/Sleep scoring
+
+Layer 1 computes:
+
+- EMG RMS
+- EEG spectral features
+- Wake/Sleep classification
+
+The generated files include
+
+```
+epoch_features.csv
+layer1_wake_sleep.csv
+```
+
+---
+
+# Somnotate
+
+The application supports:
+
+- Running existing Somnotate models
+- Training new Somnotate models
+- 1-second epochs
+- 2-second epochs
+- Legacy 5-second models
+
+**Important**
+
+The epoch length used during scoring must match the epoch length used when the model was trained.
+
+Legacy models without stored epoch metadata will generate a warning before scoring.
+
+Somnotate itself is **not bundled** with this repository and must be installed separately:
+
+https://github.com/paulbrodersen/somnotate
+
+---
+
+# QC / Review
+
+The QC viewer allows simultaneous visualization of:
+
+- EEG
+- EMG
+- ACh / Fiber photometry
+- EEG spectrogram
+- State probabilities
+- Manual scoring
+- Layer 1 scoring
+- Somnotate scoring
+- Final reviewed scoring
+
+Features include
+
+- Interactive Plotly viewer
+- Scroll-wheel zoom
+- Adaptive spectrogram resolution
+- Dissociation review queue
+- Manual interval scoring
+- Keyboard shortcuts
+- Video synchronization
+
+The coloured overlays correspond to the current **Final** scoring.
+
+---
+
+# Video synchronization
+
+The QC viewer supports linking a local video file to each recording.
+
+Recommended formats:
+
+- MP4 (H.264)
+- MOV
+
+AVI files may not play directly in some browsers.
+
+If required, convert AVI to MP4 using:
+
+```bash
+ffmpeg -i "video.avi" \
+-map 0:v:0 \
+-an \
+-c:v libx264 \
+-pix_fmt yuv420p \
+-preset fast \
+-crf 23 \
+-movflags +faststart \
+"video.mp4"
+```
+
+Video synchronization is performed using
+
+```
+video_time = recording_time − video_offset
+```
+
+The viewer includes controls for
+
+- Jumping to the selected QC window
+- Playing only the selected interval
+- Automatic stopping at the end of the selected interval
+
+---
+
+# Dissociation analysis
+
+The Dissociation module highlights periods where scoring methods disagree.
+
+Examples include
+
+- Layer 1 vs Somnotate
+- Final vs Somnotate
+- Low-confidence Somnotate predictions
+
+Biological summaries include information such as
+
+- Common reviewer corrections
+- Distribution of corrected sleep states
+- Frequently reviewed transitions
+- Percentage of Somnotate REM corrected by the reviewer
+
+---
+
+# Export
+
+The reviewed Final scoring can be exported as
+
+- CSV
+- MATLAB (.mat)
+- EDF (.edf)
+
+---
+
+# Project structure
+
+```
 project_root/
 └── recordings/
     └── recording_id/
         ├── metadata.json
         ├── eeg.npy
         ├── emg.npy
-        ├── ach.npy                         # optional
+        ├── ach.npy                    # optional
         ├── epoch_features.csv
         ├── layer1_wake_sleep.csv
-        ├── manual_scoring_aligned.csv       # optional
         ├── final_scoring.csv
-        ├── metadata.json                  # may include video_file and video_offset_s
+        ├── manual_scoring_aligned.csv # optional
         └── somnotate/
             └── somnotate_results_timeseries.csv
 ```
 
-Raw `.mat`, `.npy`, `.h5`, `.hdf5`, and large recording files should generally **not** be committed to GitHub. Keep data on a shared drive, OneDrive, or a local project folder.
+Raw recordings should generally remain outside the repository and be stored on a shared drive, OneDrive, or local project folder.
 
 ---
 
-## Typical workflow inside the app
-
-### 1. Import `.mat` + Layer 1
-
-Use this tab to import a recording and generate the prepared files used by the app.
-
-Typical variables:
-
-| Field | Example |
-|---|---|
-| EEG variable | `eeg` |
-| EMG variable | `emg` |
-| ACh / photometry variable | `ne` |
-| EEG sampling frequency variable | `eeg_frequency` |
-| ACh sampling frequency variable | `ne_frequency` |
-
-After import, run Layer 1 Wake/Sleep scoring.
-
-### 2. QC / Review
-
-Use this tab to inspect the recording and edit the final scoring.
-
-The viewer can show:
-
-- scoring rows
-- raw EEG
-- EEG spectrogram
-- raw EMG
-- optional ACh/fiber photometry
-- state probabilities
-- dissociation review queue
-
-The faint colours over the raw traces correspond to the current **Final** scoring.
-
-
-### Optional video QC
-
-The QC / Review tab includes an optional **Video QC** panel. It can link a local `.mp4`, `.mov`, or `.avi` video to each recording. The video path and synchronization offset are saved in the recording `metadata.json` file.
-
-Recommended video format:
-
-```text
-.mp4 encoded with H.264
-```
-
-AVI files can be selected and saved, but many browsers cannot play `.avi` directly. If the video player is blank, convert the file to MP4 and save the MP4 path instead:
-
-```bash
-ffmpeg -i input_video.avi -c:v libx264 -crf 23 -preset fast -c:a aac output_video.mp4
-```
-
-Video synchronization uses:
-
-```text
-video_time_s = recording_time_s - video_offset_s
-```
-
-Examples:
-
-| Situation | `video_offset_s` |
-|---|---:|
-| Video and EEG start together | `0` |
-| Video starts 10 s after EEG | `10` |
-| Video starts 5 s before EEG | `-5` |
-
-The video panel has buttons to jump the video to the current QC window start or to play only the selected scoring interval. When playing a selected interval, the video automatically pauses at the end of that selected period.
-
-### 3. Somnotate
-
-Use this tab to run or import Somnotate scoring.
-
-Somnotate is not bundled inside this repository. It must be installed separately from:
-
-```text
-https://github.com/paulbrodersen/somnotate
-```
-
-The app can use an existing trained model or help prepare recordings for a Somnotate workflow.
-
-### 4. Dissociation
-
-Use this tab to detect and review disagreement between scoring layers, for example:
-
-- Layer 1 vs Somnotate
-- Final vs Somnotate
-- low-confidence periods
-- suspicious dissociation events
-
-After running dissociation analysis, return to the QC / Review tab and use the dissociation review queue to jump through interesting parts of the recording.
-
----
-
-## QC keyboard shortcuts
+# Keyboard shortcuts
 
 | Key | Action |
-|---|---|
-| `P` | Pan / move through the recording |
-| `S` | Select window for scoring |
-| `1` | Apply Wake |
-| `2` | Apply NREM |
-| `3` | Apply REM |
-| `A` | Apply automatic / Somnotate scoring |
-| `L` | Apply Layer 1 scoring |
-| `M` | Apply Manual scoring |
-| `Z` | Zoom mode |
+|------|--------|
+| P | Pan |
+| S | Select interval |
+| Z | Zoom |
+| 1 | Apply Wake |
+| 2 | Apply NREM |
+| 3 | Apply REM |
+| A | Apply Somnotate |
+| L | Apply Layer 1 |
+| M | Apply Manual scoring |
 
 ---
 
-## Saving and interrupting scoring
+# Troubleshooting
 
-Scoring is saved to:
+## No recordings appear
 
-```text
-project_root/recordings/<recording_id>/final_scoring.csv
+Verify that the selected project contains
+
 ```
-
-Each time the user applies a label, the app writes the updated final scoring to this file.
-
-If you need to stop in the middle of scoring:
-
-1. Finish the current scoring action.
-2. Wait for the app feedback/status to update.
-3. Optionally note the approximate time where you stopped.
-4. Stop the app with `Ctrl+C` in the terminal.
-5. Restart later with `bash run_app.sh`.
-6. Load the same project and recording.
-
-You should not lose labels already written to `final_scoring.csv`.
-
-For extra safety, you can manually back up final scoring files:
-
-```bash
-PROJECT="/path/to/project_root"
-STAMP=$(date +%Y%m%d_%H%M)
-
-find "$PROJECT/recordings" -name "final_scoring.csv" -exec sh -c '
-  for f do
-    cp "$f" "${f%.csv}_backup_'$STAMP'.csv"
-    echo "Backed up $f"
-  done
-' sh {} +
-```
-
----
-
-## Legacy Streamlit version
-
-The previous Streamlit version is kept only for reference. New users should use the Dash app.
-
-If the repository still contains `sleep_stage_qc_v2_app.py`, treat it as legacy code.
-
----
-
----
-
-## Safe keyboard scoring and final utilities
-
-The QC / Review tab is designed so keyboard scoring uses the current confirmed selected interval. After a selected interval is scored, the selection is cleared, so a new interval must be selected before the next keyboard scoring action. This reduces the risk of accidentally scoring an older selection.
-
-The bottom of the QC / Review page includes **Final scoring utilities**:
-
-- **Fill empty Final with Somnotate**: fills only epochs where Final is still empty/Undefined; existing reviewed labels are preserved.
-- **Fill empty Final with Somnotate + export**: fills empty epochs from Somnotate, then exports the final scoring.
-- **Export final scoring**: exports the current Final scoring without changing labels.
-
-The QC page layout is ordered for review: dissociation review queue first, recording-position controls directly above the plot, then scoring/video/export tools below.
-
-## Troubleshooting
-
-### The app opens but no recordings appear
-
-Check that the project root points to a folder containing:
-
-```text
 recordings/
-recordings_manifest.csv
 ```
 
-or at least one prepared recording folder inside `recordings/`.
+with one or more imported recording folders.
 
-### The final score looks already filled
+---
 
-Existing recordings may have an old `final_scoring.csv` created before the empty-final workflow. Reset it from the QC viewer, or manually back it up and set `final_state` to `Undefined`.
+## Feature extraction fails
 
-### The Plotly selection does not work
-
-Press `S` to activate select mode, then drag horizontally over the QC plot.
-
-Press `P` to return to pan mode.
-
-### The app still looks like the old Streamlit version
-
-Make sure you launched the Dash app with:
+Update the Conda environment
 
 ```bash
-bash run_app.sh
+conda env update -f environment.yml --prune
 ```
 
-and that the terminal says the app is running on:
+---
 
-```text
-http://127.0.0.1:8050
+## Video does not play
+
+Some browsers cannot decode AVI files.
+
+Convert the video to MP4 using the FFmpeg command shown above.
+
+---
+
+## Windows installation
+
+Run
+
+```bash
+python check_windows_setup.py
 ```
+
+to verify the installation.
+
+---
+
+## Somnotate
+
+Always use a Somnotate model trained with the same epoch length as the recordings being scored.
+
+---
+
+# Legacy Streamlit version
+
+The previous Streamlit application is retained only for reference.
+
+All new development is performed in the Dash application.
