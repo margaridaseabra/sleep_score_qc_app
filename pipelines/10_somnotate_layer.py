@@ -63,21 +63,87 @@ def run_step(cmd: list[str], title: str, cwd: Path | None = None) -> subprocess.
 
 
 def resolve_python(python_executable: str = "", conda_env: str = "") -> str:
+    """Resolve the Somnotate interpreter on Windows, macOS, or Linux."""
     if python_executable:
-        p = Path(python_executable).expanduser()
-        if p.exists():
-            return str(p)
-    if conda_env:
-        candidates = [
-            Path.home() / "anaconda3" / "envs" / conda_env / "bin" / "python",
-            Path.home() / "miniconda3" / "envs" / conda_env / "bin" / "python",
-            Path.home() / "mambaforge" / "envs" / conda_env / "bin" / "python",
-            Path.home() / "micromamba" / "envs" / conda_env / "bin" / "python",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return str(candidate)
-    return sys.executable
+        candidate = Path(python_executable).expanduser()
+        if candidate.is_file():
+            print(f"Using explicit Somnotate Python: {candidate}")
+            return str(candidate)
+        raise FileNotFoundError(
+            f"Somnotate Python executable was not found: {candidate}"
+        )
+
+    if not conda_env:
+        print(f"No Somnotate environment selected; using: {sys.executable}")
+        return sys.executable
+
+    candidates = []
+
+    # Ask Conda for registered environment locations.
+    conda_exe = shutil.which("conda")
+    if conda_exe:
+        try:
+            result = subprocess.run(
+                [conda_exe, "env", "list", "--json"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            for prefix_text in json.loads(result.stdout).get("envs", []):
+                prefix = Path(prefix_text)
+                if prefix.name.lower() == conda_env.lower():
+                    candidates.append(
+                        prefix / ("python.exe" if sys.platform.startswith("win")
+                                  else "bin/python")
+                    )
+        except Exception as exc:
+            print(f"Warning: could not query Conda environments: {exc}")
+
+    home = Path.home()
+
+    if sys.platform.startswith("win"):
+        candidates.extend([
+            home / "AppData/Local/miniconda3/envs" / conda_env / "python.exe",
+            home / "AppData/Local/anaconda3/envs" / conda_env / "python.exe",
+            home / "miniconda3/envs" / conda_env / "python.exe",
+            home / "anaconda3/envs" / conda_env / "python.exe",
+            home / "mambaforge/envs" / conda_env / "python.exe",
+        ])
+    else:
+        candidates.extend([
+            home / "anaconda3/envs" / conda_env / "bin/python",
+            home / "miniconda3/envs" / conda_env / "bin/python",
+            home / "mambaforge/envs" / conda_env / "bin/python",
+            home / "micromamba/envs" / conda_env / "bin/python",
+        ])
+
+    checked = []
+    seen = set()
+
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(candidate)
+
+        if candidate.is_file():
+            print(f"Using Somnotate environment '{conda_env}':")
+            print(candidate)
+            return str(candidate)
+
+    checked_text = "
+".join(f"  - {p}" for p in checked)
+    raise FileNotFoundError(
+        f"Could not locate Python for Conda environment '{conda_env}'.
+"
+        f"Checked:
+{checked_text}
+
+"
+        "Run `conda env list`, or provide the complete interpreter path "
+        "using the Somnotate Python executable field."
+    )
 
 
 def split_ids(x: str | None) -> list[str]:
