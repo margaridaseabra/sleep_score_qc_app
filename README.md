@@ -2,7 +2,7 @@
 
 A cross-platform Dash application for semi-automated EEG/EMG sleep scoring, quality control, and manual review.
 
-The app supports importing recordings, computing initial Wake/Sleep scoring, running or importing Somnotate scoring, reviewing EEG/EMG/ACh signals, identifying disagreements between scoring layers, manually correcting sleep states, linking local video, and exporting reviewed scoring.
+The app supports importing recordings, computing initial Wake/Sleep scoring, running or importing Somnotate scoring, reviewing EEG/EMG/photometry signals, identifying disagreements between scoring layers, manually correcting sleep states, linking local video, and exporting reviewed scoring.
 
 > **Recommended application:** Dash  
 > **Legacy application:** The older Streamlit version is retained only for reference.
@@ -14,7 +14,7 @@ The app supports importing recordings, computing initial Wake/Sleep scoring, run
 - MATLAB (`.mat`) and EDF (`.edf`) import
 - Automatic Layer 1 Wake/Sleep scoring
 - Somnotate Wake/NREM/REM integration
-- Interactive EEG, EMG, ACh and spectrogram review
+- Interactive EEG, EMG, photometry and spectrogram review
 - Manual interval scoring and keyboard shortcuts
 - Dissociation analysis between scoring layers
 - Optional local video synchronization

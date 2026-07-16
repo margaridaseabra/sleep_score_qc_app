@@ -958,7 +958,7 @@ def make_review_figure(
     # 2 raw EEG
     # 3 EEG spectrogram
     # 4 raw EMG
-    # 5 ACh / photometry if available
+    # 5 Photometry if available
     # last probabilities / features
     spec_row = 3
     has_spec = scipy_spectrogram is not None
@@ -1115,7 +1115,7 @@ def make_review_figure(
         fig.update_yaxes(range=yrg, row=emg_row, col=1)
 
     # -----------------------------
-    # ACh / photometry — black, before probabilities
+    # Photometry — black, before probabilities
     # -----------------------------
     if has_phot:
         p, pfs, label = phot
@@ -1770,7 +1770,7 @@ app.validation_layout = html.Div([
     html.Div(id="tab-content"),
 
     # Import tab
-    PInput(id="mat-file"), PInput(id="import-recording-id"), PInput(id="import-fs"),
+    PInput(id="mat-file"), PInput(id="import-recording-id"),
     PInput(id="import-mouse-id"), PInput(id="import-group"), PInput(id="import-condition"),
     PInput(id="import-week"), PInput(id="import-epoch-sec"),
     html.Button(id="detect-mat"), html.Div(id="mat-keys-status"),
@@ -1875,7 +1875,6 @@ def render_tab(tab, project_root, _refresh):
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"10px"}, children=[
                 html.Div([html.Label("Recording file (.mat, .edf, .bdf)"), PInput(id="mat-file", type="text", placeholder="/full/path/to/file.mat or /full/path/to/file.edf", style={"width":"100%"})]),
                 html.Div([html.Label("Recording ID"), PInput(id="import-recording-id", type="text", value="test_recording", style={"width":"100%"})]),
-                html.Div([html.Label("Sampling rate Hz (MAT fallback; EDF reads this automatically)"), PInput(id="import-fs", type="number", value=1017.2526, style={"width":"100%"})]),
                 html.Div([html.Label("Mouse ID"), PInput(id="import-mouse-id", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Group"), PInput(id="import-group", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Condition"), PInput(id="import-condition", type="text", style={"width":"100%"})]),
@@ -1887,9 +1886,9 @@ def render_tab(tab, project_root, _refresh):
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"10px", "marginTop":"8px"}, children=[
                 html.Div([html.Label("EEG variable or EDF channel"), PInput(id="eeg-key", type="text", value="eeg", style={"width":"100%"})]),
                 html.Div([html.Label("EMG variable or EDF channel"), PInput(id="emg-key", type="text", value="emg", style={"width":"100%"})]),
-                html.Div([html.Label("ACh / photometry variable or EDF channel, optional"), PInput(id="ach-key", type="text", value="ne", style={"width":"100%"})]),
+                html.Div([html.Label("Photometry variable or EDF channel, optional"), PInput(id="ach-key", type="text", value="ne", style={"width":"100%"})]),
                 html.Div([html.Label("EEG sampling frequency variable, optional"), PInput(id="eeg-fs-key", type="text", value="eeg_frequency", style={"width":"100%"})]),
-                html.Div([html.Label("ACh sampling frequency variable, optional"), PInput(id="ach-fs-key", type="text", value="ne_frequency", style={"width":"100%"})]),
+                html.Div([html.Label("Photometry sampling frequency variable, optional"), PInput(id="ach-fs-key", type="text", value="ne_frequency", style={"width":"100%"})]),
                 html.Div([html.Label("Optional scoring variable"), PInput(id="scoring-key", type="text", style={"width":"100%"})]),
             ]),
             html.Label("Manual scoring code map"),
@@ -2248,10 +2247,10 @@ def show_manifest_table(refresh, project_root):
 @app.callback(
     Output("import-log", "children"), Output("manifest-refresh", "data"),
     Input("btn-import-mat", "n_clicks"), Input("btn-compute-features", "n_clicks"), Input("btn-run-layer1", "n_clicks"),
-    State("project-root-store", "data"), State("mat-file", "value"), State("import-recording-id", "value"), State("import-fs", "value"), State("eeg-key", "value"), State("emg-key", "value"), State("ach-key", "value"), State("eeg-fs-key", "value"), State("ach-fs-key", "value"), State("scoring-key", "value"), State("import-epoch-sec", "value"), State("import-mouse-id", "value"), State("import-group", "value"), State("import-condition", "value"), State("import-week", "value"), State("code-map", "value"), State("manifest-refresh", "data"),
+    State("project-root-store", "data"), State("mat-file", "value"), State("import-recording-id", "value"), State("eeg-key", "value"), State("emg-key", "value"), State("ach-key", "value"), State("eeg-fs-key", "value"), State("ach-fs-key", "value"), State("scoring-key", "value"), State("import-epoch-sec", "value"), State("import-mouse-id", "value"), State("import-group", "value"), State("import-condition", "value"), State("import-week", "value"), State("code-map", "value"), State("manifest-refresh", "data"),
     prevent_initial_call=True,
 )
-def run_import_pipeline(n1,n2,n3,project_root,mat_file,rec_id,fs,eeg_key,emg_key,ach_key,eeg_fs_key,ach_fs_key,scoring_key,epoch_sec,mouse_id,group,condition,week,code_map,refresh):
+def run_import_pipeline(n1,n2,n3,project_root,mat_file,rec_id,eeg_key,emg_key,ach_key,eeg_fs_key,ach_fs_key,scoring_key,epoch_sec,mouse_id,group,condition,week,code_map,refresh):
     if not project_root or not rec_id:
         return "Load project and enter recording ID first.", refresh
     trigger = callback_context.triggered_id
@@ -2291,7 +2290,7 @@ def run_import_pipeline(n1,n2,n3,project_root,mat_file,rec_id,fs,eeg_key,emg_key
             if ach_key:
                 cmd += ["--ach-channel", str(ach_key)]
         elif suffix == ".mat":
-            cmd = [sys.executable, str(PIPELINES_DIR/"01_import_mat_recording.py"), "--mat-file", str(data_path), "--project-root", str(project_root), "--recording-id", str(rec_id), "--eeg-key", str(eeg_key), "--emg-key", str(emg_key), "--fs", str(fs), "--epoch-sec", str(epoch_sec), "--code-map", str(code_map or "{}"), "--mouse-id", str(mouse_id or ""), "--group", str(group or ""), "--condition", str(condition or ""), "--week", str(week or "")]
+            cmd = [sys.executable, str(PIPELINES_DIR/"01_import_mat_recording.py"), "--mat-file", str(data_path), "--project-root", str(project_root), "--recording-id", str(rec_id), "--eeg-key", str(eeg_key), "--emg-key", str(emg_key), "--epoch-sec", str(epoch_sec), "--code-map", str(code_map or "{}"), "--mouse-id", str(mouse_id or ""), "--group", str(group or ""), "--condition", str(condition or ""), "--week", str(week or "")]
             if ach_key:
                 cmd += ["--ach-key", str(ach_key)]
             if eeg_fs_key:
