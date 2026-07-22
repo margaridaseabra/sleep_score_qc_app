@@ -132,15 +132,10 @@ def resolve_python(python_executable: str = "", conda_env: str = "") -> str:
             print(candidate)
             return str(candidate)
 
-    checked_text = "
-".join(f"  - {p}" for p in checked)
+    checked_text = "\n".join(f"  - {p}" for p in checked)
     raise FileNotFoundError(
-        f"Could not locate Python for Conda environment '{conda_env}'.
-"
-        f"Checked:
-{checked_text}
-
-"
+        f"Could not locate Python for Conda environment '{conda_env}'.\n"
+        f"Checked:\n{checked_text}\n\n"
         "Run `conda env list`, or provide the complete interpreter path "
         "using the Somnotate Python executable field."
     )
