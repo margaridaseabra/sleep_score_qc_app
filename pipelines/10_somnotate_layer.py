@@ -212,6 +212,12 @@ def export_manual_for_somnotate(manual_csv: Path, out_path: Path) -> str:
 
     for _, r in manual.iterrows():
         state = normalize_state(r["manual_state"])
+
+        # Somnotate's example pipeline uses "Awake", while the app uses
+        # "Wake" internally. Convert only when exporting annotations.
+        if state == "Wake":
+            state = "Awake"
+
         end_s = float(r["t1_s"])
         if current_state is None:
             current_state = state
