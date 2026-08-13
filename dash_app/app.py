@@ -48,6 +48,21 @@ APP_DIR = Path(__file__).resolve().parents[1]
 PIPELINES_DIR = APP_DIR / "pipelines"
 LOGS_DIR = APP_DIR / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+VERSION_FILE = APP_DIR / "VERSION"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "dev"
+TESTED_SOMNOTATE_VERSION = "0.5.0"
+TESTED_SOMNOTATE_COMMIT = "a20f33de62511d8c172e333896608b7fc166d0f0"
+
+
+def _default_somnotate_root() -> str:
+    configured = str(os.environ.get("SOMNOTATE_ROOT", "")).strip()
+    if configured:
+        return configured
+    candidate = Path.home() / "somnotate"
+    return str(candidate) if candidate.exists() else ""
+
+
+DEFAULT_SOMNOTATE_ROOT = _default_somnotate_root()
 
 
 def _safe_log_name(value: str) -> str:
@@ -447,7 +462,7 @@ def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str |
     ]
 
     try:
-        p = subprocess.run(cmd, text=True, capture_output=True)
+        p = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="replace")
     except Exception as e:
         return False, f"Could not run FFmpeg: {type(e).__name__}: {e}", None
 
@@ -573,12 +588,37 @@ def load_manifest(project_root: str | Path | None) -> pd.DataFrame | None:
 
 
 def recording_dir_from_manifest(project_root: str | Path, recording_id: str) -> Path:
+    """Resolve a recording folder without tying a project to one computer/OS.
+
+    The canonical location is ``<project_root>/recordings/<recording_id>``.
+    Older manifests may contain an absolute ``recording_dir`` written on a
+    different machine (for example ``/Volumes/...`` on macOS).  Prefer the
+    canonical folder when it exists, then use a valid manifest path as a
+    backwards-compatible fallback.
+    """
+    project_root = Path(project_root).expanduser().resolve()
+    canonical = project_root / "recordings" / str(recording_id)
+
+    # This makes a copied/moved project portable between macOS, Windows,
+    # external-drive letters, OneDrive locations, etc.
+    if canonical.exists():
+        return canonical
+
     manifest = load_manifest(project_root)
-    if manifest is not None and len(manifest):
+    if manifest is not None and len(manifest) and "recording_id" in manifest.columns:
         m = manifest[manifest["recording_id"].astype(str) == str(recording_id)]
         if len(m) and "recording_dir" in m.columns:
-            return Path(m.iloc[0]["recording_dir"]).expanduser().resolve()
-    return Path(project_root).expanduser().resolve() / "recordings" / str(recording_id)
+            raw = m.iloc[0]["recording_dir"]
+            if pd.notna(raw) and str(raw).strip():
+                candidate = Path(str(raw)).expanduser()
+                if not candidate.is_absolute():
+                    candidate = project_root / candidate
+                if candidate.exists():
+                    return candidate.resolve()
+
+    # Return the expected canonical path so any later FileNotFoundError points
+    # to the current project root rather than to a stale path from another OS.
+    return canonical
 
 
 def available_recordings(project_root: str | Path | None) -> list[dict[str, str]]:
@@ -586,6 +626,17 @@ def available_recordings(project_root: str | Path | None) -> list[dict[str, str]
     if manifest is None or len(manifest) == 0 or "recording_id" not in manifest.columns:
         return []
     return [{"label": str(x), "value": str(x)} for x in manifest["recording_id"].astype(str).tolist()]
+
+
+def _model_metadata(model_path: Path) -> dict[str, Any]:
+    candidates = [model_path.with_suffix(".metadata.json"), model_path.with_name(model_path.name + ".metadata.json")]
+    for meta_path in candidates:
+        if meta_path.exists():
+            try:
+                return read_json(meta_path)
+            except Exception:
+                return {}
+    return {}
 
 
 def available_models(project_root: str | Path | None = None) -> list[dict[str, str]]:
@@ -611,9 +662,17 @@ def available_models(project_root: str | Path | None = None) -> list[dict[str, s
             if rp in seen:
                 continue
             seen.add(rp)
-            # Include the parent folder so project-trained and app-shared models
-            # with the same filename remain distinguishable in the dropdown.
-            label = f"{p.name}  —  {p.parent.name}"
+            # Include model compatibility metadata when available.
+            meta = _model_metadata(p)
+            epoch = meta.get("somnotate_epoch_sec", meta.get("epoch_sec"))
+            legacy = bool(meta.get("legacy_model") or meta.get("legacy_unverified"))
+            bits = [p.name]
+            if epoch is not None:
+                bits.append(f"{float(epoch):g}s")
+            if legacy:
+                bits.append("LEGACY")
+            bits.append(p.parent.name)
+            label = "  —  ".join(bits)
             models.append({"label": label, "value": str(p)})
     return models
 
@@ -621,7 +680,7 @@ def available_models(project_root: str | Path | None = None) -> list[dict[str, s
 def state_display_codes(labels: list[str] | np.ndarray, row_name: str = "") -> np.ndarray:
     out = []
     for x in labels:
-        sx = str(x)
+        sx = normalize_state_label(x)
         if row_name == "Layer 1" and sx == "Sleep":
             out.append(3)
         else:
@@ -809,6 +868,38 @@ def compute_eeg_spectrogram_window(
 # -----------------------------------------------------------------------------
 # Recording loading
 # -----------------------------------------------------------------------------
+FINAL_TEXT_COLUMNS = {
+    "recording_id": "",
+    "final_state": "Undefined",
+    "final_source": "",
+    "review_status": "",
+    "review_notes": "",
+}
+
+
+def normalize_final_scoring_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep Final scoring writable and normalize legacy/non-canonical labels."""
+    out = df.copy()
+    for col, default in FINAL_TEXT_COLUMNS.items():
+        if col not in out.columns:
+            out[col] = default
+        out[col] = out[col].astype(object)
+
+    # Older/imported Somnotate values can be stored as e.g. ``awake`` and
+    # ``non-REM``. Canonicalize these so display and exported numeric codes
+    # remain correct even for a Final file written before this fix.
+    if "final_state" in out.columns:
+        canonical = out["final_state"].map(normalize_state_label)
+        canonical = canonical.replace({"Sleep": "NREM"})
+        out["final_state"] = canonical.astype(object)
+        out["final_code"] = [FINAL_EXPORT_CODE.get(str(x), -1) for x in canonical]
+    return out
+
+
+def read_final_scoring(path: str | Path) -> pd.DataFrame:
+    return normalize_final_scoring_dtypes(pd.read_csv(path))
+
+
 def ensure_final_scoring(recording_dir: Path, recording_id: str) -> Path:
     """
     Create final_scoring.csv if missing.
@@ -859,10 +950,25 @@ def load_recording(project_root: str | Path, recording_id: str) -> dict[str, Any
     manual = pd.read_csv(manual_file) if manual_file.exists() else None
     som_file = recording_dir / "somnotate" / "somnotate_results_timeseries.csv"
     som = pd.read_csv(som_file) if som_file.exists() else None
+    if som is not None:
+        # Accept both current canonical app labels and raw labels emitted by
+        # Somnotate versions such as "awake" and "non-REM". This keeps old
+        # imported result files usable after moving/upgrading the app.
+        if "somnotate_state" in som.columns:
+            som["somnotate_state"] = som["somnotate_state"].map(normalize_state_label)
+        rename_prob = {}
+        for col in som.columns:
+            if str(col).startswith("somnotate_P_"):
+                suffix = str(col)[len("somnotate_P_"):]
+                canon = normalize_state_label(suffix)
+                if canon in {"Wake", "NREM", "REM"}:
+                    rename_prob[col] = f"somnotate_P_{canon}"
+        if rename_prob:
+            som = som.rename(columns=rename_prob)
     features_file = recording_dir / "epoch_features.csv"
     features = pd.read_csv(features_file) if features_file.exists() else None
     final_file = ensure_final_scoring(recording_dir, recording_id)
-    final = pd.read_csv(final_file)
+    final = read_final_scoring(final_file)
     return {
         "project_root": project_root,
         "recording_id": str(recording_id),
@@ -1295,7 +1401,7 @@ def record_undo_snapshot(recording_dir: Path, final: pd.DataFrame, mask: pd.Seri
 def apply_manual_label(project_root: str, recording_id: str, start_min: float, end_min: float, label: str):
     rec = load_recording(project_root, recording_id)
     final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
-    final = pd.read_csv(final_file)
+    final = read_final_scoring(final_file)
     start_s, end_s = float(start_min) * 60.0, float(end_min) * 60.0
     mask = (final["t0_s"].astype(float) < end_s) & (final["t1_s"].astype(float) > start_s)
     if int(mask.sum()) == 0:
@@ -1313,7 +1419,7 @@ def apply_manual_label(project_root: str, recording_id: str, start_min: float, e
 def apply_source_label(project_root: str, recording_id: str, start_min: float, end_min: float, source_name: str):
     rec = load_recording(project_root, recording_id)
     final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
-    final = pd.read_csv(final_file)
+    final = read_final_scoring(final_file)
     start_s, end_s = float(start_min) * 60.0, float(end_min) * 60.0
     mask = (final["t0_s"].astype(float) < end_s) & (final["t1_s"].astype(float) > start_s)
     if int(mask.sum()) == 0:
@@ -1358,8 +1464,8 @@ def undo_last_action(project_root: str, recording_id: str):
     idx = active.index[-1]
     snap = Path(active.loc[idx, "snapshot_file"])
     if not snap.exists(): return False, "Undo snapshot file is missing."
-    previous = pd.read_csv(snap)
-    final = pd.read_csv(final_file)
+    previous = normalize_final_scoring_dtypes(pd.read_csv(snap))
+    final = read_final_scoring(final_file)
     if "epoch_id" not in previous.columns or "epoch_id" not in final.columns:
         return False, "Cannot undo: epoch_id missing."
     prev_idx = previous.set_index("epoch_id", drop=False)
@@ -1380,7 +1486,7 @@ def reset_final_to_empty(project_root: str, recording_id: str):
     """Reset the full Final scoring row to Undefined/empty."""
     rec = load_recording(project_root, recording_id)
     final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
-    final = pd.read_csv(final_file)
+    final = read_final_scoring(final_file)
     mask = pd.Series(True, index=final.index)
     record_undo_snapshot(rec["recording_dir"], final, mask, "reset final empty")
     final["final_state"] = "Undefined"
@@ -1403,7 +1509,7 @@ def fill_empty_final_with_somnotate(project_root: str, recording_id: str, export
         return False, "Somnotate scoring not found for this recording."
 
     final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
-    final = pd.read_csv(final_file)
+    final = read_final_scoring(final_file)
     epoch_df = final[["t0_s", "t1_s"]].copy()
     source_labels = labels_at_epoch_midpoints(epoch_df, rec["som"], "somnotate_state")
     source_labels = np.asarray(source_labels, dtype=object)
@@ -1568,7 +1674,7 @@ def export_recording_edf(rec: dict[str, Any], final: pd.DataFrame, edf_out: Path
 def export_final(project_root: str, recording_id: str):
     rec = load_recording(project_root, recording_id)
     final_file = ensure_final_scoring(rec["recording_dir"], rec["recording_id"])
-    final = pd.read_csv(final_file)
+    final = read_final_scoring(final_file)
     out_dir = rec["recording_dir"] / "exports"
     out_dir.mkdir(exist_ok=True)
 
@@ -1646,7 +1752,7 @@ def legend_bar():
     ], style={"fontSize":"13px", "margin":"4px 0 8px 0"})
 
 
-app = Dash(__name__, suppress_callback_exceptions=True, title="Semi-automated sleep scoring QC app")
+app = Dash(__name__, suppress_callback_exceptions=True, title=f"Sleep Stage QC {APP_VERSION}")
 
 
 @app.server.route("/_local_video")
@@ -1695,7 +1801,7 @@ app.layout = html.Div(
                 html.Div([
                     html.H1("Semi-automated sleep scoring QC app", className="app-title"),
                     html.Div(
-                        "Interactive review, model comparison, dissociation QC and export for EEG/EMG sleep scoring.",
+                        f"Version {APP_VERSION} · Interactive review, model comparison, dissociation QC and export for EEG/EMG sleep scoring.",
                         className="app-subtitle",
                     ),
                 ]),
@@ -1794,9 +1900,6 @@ app.validation_layout = html.Div([
                     html.Div(id="qc-mode-status", className="status-line"),
                 ]),
 dcc.Graph(id="qc-graph"),
-    html.Button(id="qc-mode-pan"),
-    html.Button(id="qc-mode-select-window"),
-    html.Div(id="qc-mode-status"),
     dcc.RangeSlider(id="qc-window-range-slider"),
     html.Div(id="qc-window-range-label"),
     html.Div(id="selected-interval-label"),
@@ -1961,11 +2064,12 @@ def render_tab(tab, project_root, _refresh):
                 html.Div(id="selected-interval-label", className="status-line"),
 
                 html.H4("Apply source to whole visible window"),
-                html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(3, 1fr)", "gap":"6px", "marginBottom":"12px"}, children=[
+                html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(3, 1fr)", "gap":"6px", "marginBottom":"6px"}, children=[
                     html.Button("Apply Somnotate to visible window", id="score-window-somnotate"),
                     html.Button("Apply Layer 1 to visible window", id="score-window-layer1"),
                     html.Button("Apply Manual to visible window", id="score-window-manual"),
                 ]),
+                html.Div(id="score-status", className="status-line", style={"whiteSpace":"pre-wrap", "marginBottom":"12px"}),
 
                 html.Div(className="video-qc-card", children=[
                     html.H4("Video QC"),
@@ -2006,17 +2110,7 @@ def render_tab(tab, project_root, _refresh):
                             style={"marginTop": "6px", "marginBottom": "6px"},
                         ),
                         html.Pre(
-                            "\n".join([
-                                'ffmpeg -i "videoname.avi" \\',
-                                '  -map 0:v:0 \\',
-                                '  -an \\',
-                                '  -c:v libx264 \\',
-                                '  -pix_fmt yuv420p \\',
-                                '  -preset fast \\',
-                                '  -crf 23 \\',
-                                '  -movflags +faststart \\',
-                                '  "videoname.mp4"',
-                            ]),
+                            'ffmpeg -i "videoname.avi" -map 0:v:0 -an -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 -movflags +faststart "videoname.mp4"',
                             className="log-box",
                         ),
                     ]),
@@ -2045,7 +2139,6 @@ def render_tab(tab, project_root, _refresh):
                         html.Button("Export final scoring CSV + MAT + EDF", id="btn-export-bottom", n_clicks=0),
                     ]),
                 ]),
-                html.Div(id="score-status", className="status-line", style={"whiteSpace":"pre-wrap"}),
             ]),
         ])
 
@@ -2053,7 +2146,10 @@ def render_tab(tab, project_root, _refresh):
         models = available_models(project_root)
         return html.Div(className="card", children=[
             html.H3("Somnotate"),
-            html.Div("These buttons call the external Somnotate pipeline. A spinner and command log will appear while each workflow runs.", className="app-subtitle"),
+            html.Div(
+                f"These buttons call the external Somnotate pipeline in a separate environment. Tested upstream: Somnotate {TESTED_SOMNOTATE_VERSION} at commit {TESTED_SOMNOTATE_COMMIT[:7]}. The app modifies only a temporary pipeline copy.",
+                className="app-subtitle",
+            ),
             html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"10px"}, children=[
                 html.Div([html.Label("Recording IDs, comma-separated"), PInput(id="som-recording-ids", type="text", value=",".join([o["value"] for o in rec_options[:1]]), style={"width":"100%"})]),
                 html.Div([html.Label("Target fs"), PInput(id="som-target-fs", type="number", value=512.0, style={"width":"100%"})]),
@@ -2068,7 +2164,7 @@ def render_tab(tab, project_root, _refresh):
                     clearable=False,
                     style={"width":"100%"},
                 )]),
-                html.Div([html.Label("Somnotate repository path"), PInput(id="som-root", type="text", style={"width":"100%"})]),
+                html.Div([html.Label("Somnotate repository path"), PInput(id="som-root", type="text", value=DEFAULT_SOMNOTATE_ROOT, placeholder=str(Path.home() / "somnotate"), style={"width":"100%"})]),
                 html.Div([html.Label("Somnotate conda env"), PInput(id="som-conda-env", type="text", value="somnotate_env", style={"width":"100%"})]),
                 html.Div([html.Label("Optional Somnotate Python executable"), PInput(id="som-python", type="text", style={"width":"100%"})]),
                 html.Div([html.Label("Existing model"), PDropdown(id="som-model-file", options=models, value=models[0]["value"] if models else None)]),
@@ -2154,7 +2250,8 @@ def render_tab(tab, project_root, _refresh):
 
     return html.Div(className="card", children=[
         html.H3("About"),
-        html.P("This app supports semi-automated sleep scoring QC with manual review, Layer 1 Wake/Sleep, Somnotate comparison, dissociation event ranking, and export."),
+        html.P(f"Sleep Stage QC {APP_VERSION}. This app supports semi-automated sleep scoring QC with manual review, Layer 1 Wake/Sleep, Somnotate comparison, dissociation event ranking, and export."),
+        html.P(f"Somnotate integration is tested against Somnotate {TESTED_SOMNOTATE_VERSION}, commit {TESTED_SOMNOTATE_COMMIT[:7]}. The app modifies only a temporary copy of the upstream example pipeline."),
         html.Ul([
             html.Li("Final scoring starts empty by default and is filled only when accepted/edited."),
             html.Li("Use selection mode to score a specific interval, or use window buttons to accept a source for the whole visible window."),
@@ -2259,8 +2356,9 @@ def run_import_pipeline(n1,n2,n3,project_root,mat_file,rec_id,eeg_key,emg_key,ac
             return (
                 "Please paste the full path to a .mat, .edf, or .bdf file before pressing Import recording.\n\n"
                 "Examples:\n"
-                "/Users/margaridaseabra/Desktop/Margarida-batch2-june26/recordings/300526-m63-bas-1/my_recording.mat\n"
-                "/Users/margaridaseabra/Desktop/Margarida-batch2-june26/recordings/300526-m63-bas-1/my_recording.edf",
+                "Windows: E:\\sleep_data\\mouse01\\recording.mat\n"
+                "macOS: /Volumes/T7/sleep_data/mouse01/recording.mat\n"
+                "The same field also accepts .edf and .bdf files.",
                 refresh,
             )
 
@@ -2720,20 +2818,29 @@ def score_or_export(*args):
         end = float(selected["end_min"])
         scope_text = "selected interval"
 
-    if trig == "score-wake":
-        ok, msg = apply_manual_label(project_root, recording_id, start, end, "Wake")
-    elif trig == "score-nrem":
-        ok, msg = apply_manual_label(project_root, recording_id, start, end, "NREM")
-    elif trig == "score-rem":
-        ok, msg = apply_manual_label(project_root, recording_id, start, end, "REM")
-    elif trig in {"score-somnotate", "score-window-somnotate"}:
-        ok, msg = apply_source_label(project_root, recording_id, start, end, "Somnotate")
-    elif trig in {"score-layer1", "score-window-layer1"}:
-        ok, msg = apply_source_label(project_root, recording_id, start, end, "Layer 1")
-    elif trig in {"score-manual", "score-window-manual"}:
-        ok, msg = apply_source_label(project_root, recording_id, start, end, "Manual")
-    else:
-        return "Unknown action.", no_update, no_update, no_update, no_update
+    try:
+        if trig == "score-wake":
+            ok, msg = apply_manual_label(project_root, recording_id, start, end, "Wake")
+        elif trig == "score-nrem":
+            ok, msg = apply_manual_label(project_root, recording_id, start, end, "NREM")
+        elif trig == "score-rem":
+            ok, msg = apply_manual_label(project_root, recording_id, start, end, "REM")
+        elif trig in {"score-somnotate", "score-window-somnotate"}:
+            ok, msg = apply_source_label(project_root, recording_id, start, end, "Somnotate")
+        elif trig in {"score-layer1", "score-window-layer1"}:
+            ok, msg = apply_source_label(project_root, recording_id, start, end, "Layer 1")
+        elif trig in {"score-manual", "score-window-manual"}:
+            ok, msg = apply_source_label(project_root, recording_id, start, end, "Manual")
+        else:
+            return "Unknown action.", no_update, no_update, no_update, no_update
+    except Exception as e:
+        return (
+            f"Scoring action failed: {type(e).__name__}: {e}",
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+        )
 
     if ok:
         msg = f"{msg} Applied to {scope_text}: {start:.2f}–{end:.2f} min."
@@ -2960,11 +3067,20 @@ def update_somnotate_epoch_warning(model_file, som_epoch_sec):
         return base + f"You selected {selected_epoch:g} s epochs. Select a model, or train a new matching model."
 
     model_epoch, meta_path = read_somnotate_model_epoch_metadata(model_file)
+    meta = _model_metadata(Path(str(model_file)).expanduser()) if model_file else {}
+    legacy_note = ""
+    if meta.get("legacy_model") or meta.get("legacy_unverified"):
+        serialized_sklearn = meta.get("serialized_scikit_learn_version", meta.get("scikit_learn_version"))
+        legacy_note = " This is a LEGACY model."
+        if serialized_sklearn:
+            legacy_note += f" It was serialized with scikit-learn {serialized_sklearn}; use a version-matched/retrained release model for final scientific analysis."
+
     if model_epoch is None:
         return (
             base
             + f"You selected {selected_epoch:g} s epochs. This model has no readable epoch metadata, "
             + "so only use it if you know it was trained with the same epoch length."
+            + legacy_note
         )
 
     if abs(model_epoch - selected_epoch) > 1e-6:
@@ -2979,8 +3095,40 @@ def update_somnotate_epoch_warning(model_file, som_epoch_sec):
 
     return (
         f"Somnotate epoch OK: selected epoch = {selected_epoch:g} s and model metadata = {model_epoch:g} s. "
-        "New models trained from this tab will also save epoch metadata."
+        "New models trained from this tab will also save epoch and runtime metadata."
+        + legacy_note
     )
+
+
+def _split_recording_ids(value) -> list[str]:
+    return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
+
+def validate_somnotate_ui_inputs(*, som_root, model_file=None, recording_ids=None, training=False) -> str | None:
+    root_text = str(som_root or "").strip()
+    if not root_text:
+        return (
+            "Somnotate repository path is empty. Clone the tested Somnotate checkout and set this field, "
+            f"for example {Path.home() / 'somnotate'}."
+        )
+    root = Path(root_text).expanduser()
+    if not root.exists():
+        return f"Somnotate repository path does not exist: {root}"
+    expected = root / "example_pipeline" / "01_preprocess_signals.py"
+    if not expected.exists():
+        return f"Somnotate example pipeline was not found under: {root}"
+
+    ids = _split_recording_ids(recording_ids)
+    if not ids:
+        return "Enter at least one recording ID." if not training else "Enter at least one training recording ID."
+
+    if not training:
+        model_text = str(model_file or "").strip()
+        if not model_text:
+            return "Select a Somnotate model before running the existing-model workflow."
+        if not Path(model_text).expanduser().exists():
+            return f"Somnotate model file does not exist: {model_text}"
+    return None
 
 
 @app.callback(Output("som-log", "children"), Input("btn-som-existing", "n_clicks"), Input("btn-som-train", "n_clicks"), Input("btn-som-import-results", "n_clicks"), State("project-root-store", "data"), State("som-recording-ids", "value"), State("som-target-fs", "value"), State("som-epoch-sec", "value"), State("som-root", "value"), State("som-conda-env", "value"), State("som-python", "value"), State("som-model-file", "value"), State("som-existing-steps", "value"), State("som-train-ids", "value"), State("som-test-ids", "value"), State("som-model-name", "value"), State("som-train-steps", "value"), prevent_initial_call=True)
@@ -2990,10 +3138,16 @@ def run_somnotate(n_exist, n_train, n_import, project_root, rec_ids, target_fs, 
     base = [sys.executable, str(PIPELINES_DIR/"10_somnotate_layer.py")]
     epoch_arg = str(som_epoch_sec or "1.0")
     if trig == "btn-som-existing":
+        problem = validate_somnotate_ui_inputs(som_root=som_root, model_file=model_file, recording_ids=rec_ids, training=False)
+        if problem:
+            return "Somnotate setup problem: " + problem
         cmd = base + ["use-existing-model", "--project-root", str(project_root), "--recording-ids", str(rec_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-file", str(model_file or ""), "--target-fs", str(target_fs or 512), "--epoch-sec", epoch_arg]
         if som_py: cmd += ["--somnotate-python", str(som_py)]
         for s in steps or []: cmd += [f"--{s}"]
     elif trig == "btn-som-train":
+        problem = validate_somnotate_ui_inputs(som_root=som_root, recording_ids=train_ids, training=True)
+        if problem:
+            return "Somnotate setup problem: " + problem
         cmd = base + ["train-model", "--project-root", str(project_root), "--train-recording-ids", str(train_ids or ""), "--test-recording-ids", str(test_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-name", str(model_name or "model"), "--target-fs", str(target_fs or 512), "--epoch-sec", epoch_arg]
         if som_py: cmd += ["--somnotate-python", str(som_py)]
         for s in train_steps or []: cmd += [f"--{s}"]
@@ -3490,7 +3644,7 @@ def find_first_numeric_col(df, candidates):
 
 
 def normalize_state_label(x, collapse_sleep=False):
-    """Return a clean display label for sleep-state values."""
+    """Return a canonical app label for sleep-state values from any source."""
     if x is None:
         return "Undefined"
     try:
@@ -3498,22 +3652,29 @@ def normalize_state_label(x, collapse_sleep=False):
             return "Undefined"
     except Exception:
         pass
+
     s = str(x).strip()
-    if not s or s.lower() in {"nan", "none", "null", "undefined", "uncertain", "unknown"}:
+    if not s:
         return "Undefined"
-    low = s.lower().replace("_", " ").replace("-", " ")
-    if "wake" in low:
+
+    low = re.sub(r"[\s_-]+", " ", s.lower()).strip()
+    compact = re.sub(r"[^a-z0-9]+", "", low)
+
+    if compact in {"nan", "none", "null", "undefined", "uncertain", "unknown", "nd", "tr"}:
+        out = "Undefined"
+    elif compact in {"awake", "wake", "wk", "w"} or "wake" in low:
         out = "Wake"
-    elif "rem" in low and "nrem" not in low:
-        out = "REM"
-    elif "nrem" in low or low in {"nr", "non rem"}:
+    elif compact in {"nrem", "nonrem", "nr", "sws", "slowwavesleep"} or "non rem" in low:
         out = "NREM"
+    elif compact in {"rem", "ps"}:
+        out = "REM"
+    elif "artifact" in low or compact == "artf":
+        out = "Artifact"
     elif "sleep" in low:
         out = "Sleep"
-    elif "artifact" in low:
-        out = "Artifact"
     else:
         out = s
+
     if collapse_sleep and out in {"NREM", "REM", "Sleep"}:
         return "Sleep"
     return out

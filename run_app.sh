@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -e
-
-# Current recommended app: Dash version
-python dash_app/app.py
+set -euo pipefail
+cd "$(dirname "$0")"
+python -m dash_app.app

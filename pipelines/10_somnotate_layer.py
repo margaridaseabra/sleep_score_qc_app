@@ -15,6 +15,12 @@ import numpy as np
 import pandas as pd
 from scipy.signal import resample_poly
 
+APP_ROOT = Path(__file__).resolve().parents[1]
+VERSION_FILE = APP_ROOT / "VERSION"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "dev"
+TESTED_SOMNOTATE_VERSION = "0.5.0"
+TESTED_SOMNOTATE_COMMIT = "a20f33de62511d8c172e333896608b7fc166d0f0"
+
 # =============================================================================
 # GENERAL HELPERS
 # =============================================================================
@@ -31,6 +37,8 @@ def run_step(cmd: list[str], title: str, cwd: Path | None = None) -> subprocess.
         [str(x) for x in cmd],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=str(cwd) if cwd else None,
     )
     if result.stdout:
@@ -63,12 +71,15 @@ def run_step(cmd: list[str], title: str, cwd: Path | None = None) -> subprocess.
 
 
 def resolve_python(python_executable: str = "", conda_env: str = "") -> str:
-    """Resolve the Somnotate interpreter on Windows, macOS, or Linux."""
+    """Resolve the Somnotate Python interpreter across Windows, macOS, and Linux."""
+
     if python_executable:
         candidate = Path(python_executable).expanduser()
+
         if candidate.is_file():
             print(f"Using explicit Somnotate Python: {candidate}")
             return str(candidate)
+
         raise FileNotFoundError(
             f"Somnotate Python executable was not found: {candidate}"
         )
@@ -77,53 +88,67 @@ def resolve_python(python_executable: str = "", conda_env: str = "") -> str:
         print(f"No Somnotate environment selected; using: {sys.executable}")
         return sys.executable
 
-    candidates = []
+    candidates: list[Path] = []
 
     # Ask Conda for registered environment locations.
-    conda_exe = shutil.which("conda")
-    if conda_exe:
+    conda_executable = shutil.which("conda")
+
+    if conda_executable:
         try:
             result = subprocess.run(
-                [conda_exe, "env", "list", "--json"],
+                [conda_executable, "env", "list", "--json"],
                 capture_output=True,
                 text=True,
                 check=True,
             )
-            for prefix_text in json.loads(result.stdout).get("envs", []):
+
+            conda_data = json.loads(result.stdout)
+
+            for prefix_text in conda_data.get("envs", []):
                 prefix = Path(prefix_text)
-                if prefix.name.lower() == conda_env.lower():
-                    candidates.append(
-                        prefix / ("python.exe" if sys.platform.startswith("win")
-                                  else "bin/python")
-                    )
+
+                if prefix.name.lower() != conda_env.lower():
+                    continue
+
+                if sys.platform.startswith("win"):
+                    candidates.append(prefix / "python.exe")
+                else:
+                    candidates.append(prefix / "bin" / "python")
+
         except Exception as exc:
             print(f"Warning: could not query Conda environments: {exc}")
 
     home = Path.home()
 
     if sys.platform.startswith("win"):
-        candidates.extend([
-            home / "AppData/Local/miniconda3/envs" / conda_env / "python.exe",
-            home / "AppData/Local/anaconda3/envs" / conda_env / "python.exe",
-            home / "miniconda3/envs" / conda_env / "python.exe",
-            home / "anaconda3/envs" / conda_env / "python.exe",
-            home / "mambaforge/envs" / conda_env / "python.exe",
-        ])
+        candidates.extend(
+            [
+                home / "AppData" / "Local" / "miniconda3" / "envs" / conda_env / "python.exe",
+                home / "AppData" / "Local" / "anaconda3" / "envs" / conda_env / "python.exe",
+                home / "miniconda3" / "envs" / conda_env / "python.exe",
+                home / "anaconda3" / "envs" / conda_env / "python.exe",
+                home / "mambaforge" / "envs" / conda_env / "python.exe",
+            ]
+        )
     else:
-        candidates.extend([
-            home / "anaconda3/envs" / conda_env / "bin/python",
-            home / "miniconda3/envs" / conda_env / "bin/python",
-            home / "mambaforge/envs" / conda_env / "bin/python",
-            home / "micromamba/envs" / conda_env / "bin/python",
-        ])
+        candidates.extend(
+            [
+                home / "anaconda3" / "envs" / conda_env / "bin" / "python",
+                home / "miniconda3" / "envs" / conda_env / "bin" / "python",
+                home / "mambaforge" / "envs" / conda_env / "bin" / "python",
+                home / "micromamba" / "envs" / conda_env / "bin" / "python",
+            ]
+        )
 
-    checked = []
-    seen = set()
+    checked: list[Path] = []
+    seen: set[str] = set()
 
     for candidate in candidates:
         key = str(candidate).lower()
+
         if key in seen:
             continue
+
         seen.add(key)
         checked.append(candidate)
 
@@ -132,17 +157,13 @@ def resolve_python(python_executable: str = "", conda_env: str = "") -> str:
             print(candidate)
             return str(candidate)
 
-    checked_text = "
-".join(f"  - {p}" for p in checked)
-    raise FileNotFoundError(
-        f"Could not locate Python for Conda environment '{conda_env}'.
-"
-        f"Checked:
-{checked_text}
+    checked_text = "\n".join(f"  - {candidate}" for candidate in checked)
 
-"
-        "Run `conda env list`, or provide the complete interpreter path "
-        "using the Somnotate Python executable field."
+    raise FileNotFoundError(
+        f"Could not locate Python for Conda environment '{conda_env}'.\n"
+        f"Checked:\n{checked_text}\n\n"
+        "Run `conda env list` to verify that the environment exists, "
+        "or provide the complete Python path in the Somnotate Python field."
     )
 
 
@@ -159,32 +180,37 @@ def read_metadata(rec_dir: Path) -> dict[str, Any]:
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def normalize_state(x: Any) -> str:
-    x = str(x).strip()
-    mapping = {
-        "Awake": "Wake",
-        "Wake": "Wake",
-        "WK": "Wake",
-        "W": "Wake",
-        "NREM": "NREM",
-        "SWS": "NREM",
-        "REM": "REM",
-        "PS": "REM",
-        "Sleep": "NREM",
-        "Undefined": "Undefined",
-        "ND": "Undefined",
-        "TR": "Undefined",
-        "Artifact": "Undefined",
-        "Artf": "Undefined",
-        "nan": "Undefined",
-        "NaN": "Undefined",
-        "None": "Undefined",
-        "": "Undefined",
-    }
-    return mapping.get(x, x)
+    """Normalize Somnotate/upstream state names to the app's canonical labels."""
+    if x is None:
+        return "Undefined"
+    try:
+        if pd.isna(x):
+            return "Undefined"
+    except Exception:
+        pass
+
+    s = str(x).strip()
+    if not s:
+        return "Undefined"
+
+    low = re.sub(r"[\s_-]+", " ", s.lower()).strip()
+    compact = re.sub(r"[^a-z0-9]+", "", low)
+
+    if compact in {"awake", "wake", "wk", "w"} or "wake" in low:
+        return "Wake"
+    if compact in {"nrem", "nonrem", "nr", "sws", "slowwavesleep"} or "non rem" in low:
+        return "NREM"
+    if compact in {"rem", "ps"}:
+        return "REM"
+    if compact in {"sleep"}:
+        return "NREM"
+    if compact in {"undefined", "uncertain", "unknown", "nd", "tr", "artifact", "artf", "nan", "none", "null"}:
+        return "Undefined"
+    return s
 
 
 def epoch_tag(epoch_sec: float) -> str:
@@ -397,6 +423,29 @@ def prepare_one_recording(project_root: Path, recording_id: str, target_fs: floa
     return manifest_path
 
 
+def _rebase_somnotate_manifest_row(project_root: Path, recording_id: str, row: dict[str, Any], epoch_sec: float) -> dict[str, Any]:
+    """Repair generated Somnotate paths after a project is moved between machines."""
+    tag = epoch_tag(epoch_sec)
+    som_dir = project_root / "recordings" / recording_id / "somnotate"
+    row = dict(row)
+    canonical = {
+        "file_path_raw_signals": som_dir / f"somnotate_input_{tag}.edf",
+        "file_path_preprocessed_signals": som_dir / f"somnotate_preprocessed_{tag}.npy",
+        "file_path_automated_state_annotation": som_dir / f"somnotate_automated_{tag}.tsv",
+        "file_path_state_probabilities": som_dir / f"somnotate_state_probabilities_{tag}.npz",
+        "file_path_review_intervals": som_dir / f"somnotate_review_intervals_{tag}.tsv",
+    }
+    for key, path in canonical.items():
+        row[key] = str(path)
+    manual = som_dir / "somnotate_manual.tsv"
+    row["file_path_manual_state_annotation"] = str(manual) if manual.exists() else ""
+    row["sampling_frequency_in_hz"] = float(row.get("sampling_frequency_in_hz", 512.0))
+    row["somnotate_epoch_sec"] = float(epoch_sec)
+    row["frontal_eeg_signal_label"] = "EEG"
+    row["emg_signal_label"] = "EMG"
+    return row
+
+
 def combine_manifests(project_root: Path, recording_ids: list[str], out_path: Path, epoch_sec: float) -> Path:
     tag = epoch_tag(epoch_sec)
     rows = []
@@ -408,7 +457,10 @@ def combine_manifests(project_root: Path, recording_ids: list[str], out_path: Pa
                 f"Run Prepare first with Somnotate epoch sec = {float(epoch_sec):g}."
             )
         df = pd.read_csv(manifest_path)
-        rows.append(df.iloc[0].to_dict())
+        row = _rebase_somnotate_manifest_row(project_root, rec_id, df.iloc[0].to_dict(), epoch_sec)
+        # Persist repaired paths so a copied Mac/Windows project remains portable.
+        pd.DataFrame([row]).to_csv(manifest_path, index=False)
+        rows.append(row)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out_path, index=False)
     return out_path
@@ -488,6 +540,73 @@ def patch_configuration_time_resolution(config_path: Path, epoch_sec: float) -> 
     config_path.write_text(txt)
 
 
+def patch_configuration_signals(config_path: Path) -> None:
+    """Force the temporary Somnotate pipeline to use this app's EEG+EMG layout.
+
+    The upstream Somnotate example configuration can change over time. Current
+    versions may expect frontal EEG + occipital EEG + EMG, while this app writes
+    a two-channel EDF (EEG, EMG) and the bundled legacy model was trained on the
+    corresponding two-signal feature matrix.
+
+    Only the temporary pipeline copy is modified; the user's Somnotate checkout
+    remains untouched.
+    """
+    txt = config_path.read_text()
+
+    replacements = {
+        "state_annotation_signals": (
+            "state_annotation_signals = [\n"
+            "    'frontal_eeg_signal_label',\n"
+            "    'emg_signal_label',\n"
+            "]"
+        ),
+        "state_annotation_signal_labels": (
+            "state_annotation_signal_labels = [\n"
+            "    'EEG',\n"
+            "    'EMG',\n"
+            "]"
+        ),
+        "state_annotation_signal_frequency_bands": (
+            "state_annotation_signal_frequency_bands = [\n"
+            "    (0.5, 30.),  # EEG\n"
+            "    (10., 45.),  # EMG\n"
+            "]"
+        ),
+    }
+
+    for name, replacement in replacements.items():
+        pattern = rf"(?ms)^\s*{re.escape(name)}\s*=\s*\[.*?^\s*\]"
+        txt, count = re.subn(pattern, replacement, txt, count=1)
+        if count != 1:
+            raise RuntimeError(
+                f"Could not patch {name} in Somnotate configuration: {config_path}"
+            )
+
+    config_path.write_text(txt)
+
+
+def patch_preprocess_integer_nperseg(preprocess_script: Path) -> None:
+    """Make Somnotate/lspopt spectrogram window length an integer.
+
+    The upstream example pipeline computes ``nperseg`` as
+    ``sampling_frequency_in_hz * time_resolution_in_sec``. Values read from
+    the CSV manifest are commonly floats (for example 512.0), so the product
+    is also a float (for example 2560.0). Current NumPy/lspopt requires an
+    integer window length and otherwise raises ``TypeError: 'float' object
+    cannot be interpreted as an integer``.
+
+    Patch only the temporary Somnotate pipeline copy.
+    """
+    txt = preprocess_script.read_text()
+    old = "nperseg  = sampling_frequency_in_hz * time_resolution_in_sec,"
+    new = "nperseg  = int(round(sampling_frequency_in_hz * time_resolution_in_sec)),"
+    if old not in txt:
+        raise RuntimeError(
+            f"Could not patch integer nperseg in Somnotate preprocessing script: {preprocess_script}"
+        )
+    preprocess_script.write_text(txt.replace(old, new, 1))
+
+
 def patch_review_interval_time_resolution(score_script: Path) -> None:
     """Fix original example script's low-confidence intervals in the temp copy.
 
@@ -510,7 +629,10 @@ def create_epoch_pipeline_copy(somnotate_root: Path, project_root: Path, epoch_s
     tmp_dir = project_root / "somnotate_runs" / f"_tmp_example_pipeline_{tag}_{stamp}"
     tmp_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source_pipeline, tmp_dir, ignore=_copytree_ignore)
-    patch_configuration_time_resolution(tmp_dir / "configuration.py", epoch_sec)
+    config_path = tmp_dir / "configuration.py"
+    patch_configuration_time_resolution(config_path, epoch_sec)
+    patch_configuration_signals(config_path)
+    patch_preprocess_integer_nperseg(tmp_dir / "01_preprocess_signals.py")
     if (tmp_dir / "04_run_state_annotation.py").exists():
         patch_review_interval_time_resolution(tmp_dir / "04_run_state_annotation.py")
 
@@ -520,6 +642,8 @@ def create_epoch_pipeline_copy(somnotate_root: Path, project_root: Path, epoch_s
     print("Original Somnotate pipeline is unchanged:")
     print(source_pipeline)
     print("App-controlled time_resolution:", f"{float(epoch_sec):g} s")
+    print("App-controlled Somnotate signals: frontal EEG + EMG")
+    print("App compatibility patch: integer spectrogram nperseg")
     return tmp_dir
 
 
@@ -588,6 +712,141 @@ def write_model_metadata(model_file: Path, data: dict[str, Any]) -> Path:
     p = model_metadata_paths(model_file)[0]
     write_json(p, data)
     return p
+
+
+def query_runtime_versions(python_executable: str) -> dict[str, str]:
+    """Read versions from the separate Somnotate interpreter without importing them here."""
+    code = "\n".join([
+        "import json, sys",
+        "from importlib import metadata",
+        "packages = ['somnotate', 'pomegranate', 'numpy', 'scipy', 'scikit-learn', 'pandas', 'pyedflib', 'lspopt']",
+        "out = {'python': sys.version.split()[0]}",
+        "for name in packages:",
+        "    try:",
+        "        out[name] = metadata.version(name)",
+        "    except Exception as exc:",
+        "        out[name] = 'MISSING: ' + repr(exc)",
+        "print(json.dumps(out, sort_keys=True))",
+    ])
+    result = subprocess.run(
+        [str(python_executable), "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Could not inspect the Somnotate environment.\n"
+            + (result.stdout or "")
+            + "\n"
+            + (result.stderr or "")
+        )
+    info = json.loads(result.stdout.strip().splitlines()[-1])
+    missing = [k for k, v in info.items() if isinstance(v, str) and v.startswith("MISSING:")]
+    if missing:
+        raise RuntimeError(
+            "Somnotate environment is incomplete. Missing/broken packages: "
+            + ", ".join(missing)
+            + ". Recreate it from environment_somnotate.yml."
+        )
+    return {str(k): str(v) for k, v in info.items()}
+
+
+def somnotate_git_commit(somnotate_root: Path) -> str | None:
+    git = shutil.which("git")
+    root = Path(somnotate_root).expanduser().resolve()
+    if not git or not (root / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            [git, "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return None
+
+
+def preflight_somnotate_runtime(somnotate_root: Path, python_executable: str, model_file: Path | None = None) -> dict[str, str]:
+    """Fail early on setup problems before regenerating EDFs or running long steps."""
+    find_somnotate_pipeline_dir(somnotate_root)
+    if model_file is not None and not Path(model_file).exists():
+        raise FileNotFoundError(f"Somnotate model file does not exist: {model_file}")
+
+    runtime = query_runtime_versions(python_executable)
+    print()
+    print("Somnotate runtime preflight OK")
+    print("  Python:", runtime.get("python"))
+    print("  Somnotate:", runtime.get("somnotate"))
+    print("  scikit-learn:", runtime.get("scikit-learn"))
+    print("  pomegranate:", runtime.get("pomegranate"))
+
+    if runtime.get("somnotate") != TESTED_SOMNOTATE_VERSION:
+        print(
+            "WARNING: This app version was tested with Somnotate "
+            f"{TESTED_SOMNOTATE_VERSION}; current environment has {runtime.get('somnotate')}."
+        )
+
+    head = somnotate_git_commit(somnotate_root)
+    if head:
+        print("  Somnotate git commit:", head)
+        if head != TESTED_SOMNOTATE_COMMIT:
+            print("WARNING: tested Somnotate commit is:", TESTED_SOMNOTATE_COMMIT)
+    return runtime
+
+
+def check_model_runtime_compatibility(
+    model_file: Path,
+    runtime: dict[str, str],
+    allow_mismatch: bool = False,
+) -> None:
+    """Protect app-trained pickled models from unsupported runtime version drift."""
+    meta = read_model_metadata(model_file) or {}
+    expected = dict(meta.get("runtime_versions") or {})
+    if not expected:
+        serialized = meta.get("serialized_scikit_learn_version")
+        if serialized:
+            expected["scikit-learn"] = str(serialized)
+
+    mismatches = []
+    for key in ["python", "somnotate", "scikit-learn", "pomegranate"]:
+        want = expected.get(key)
+        have = runtime.get(key)
+        if want and have:
+            if key == "python":
+                want_mm = ".".join(str(want).split(".")[:2])
+                have_mm = ".".join(str(have).split(".")[:2])
+                equal = want_mm == have_mm
+            else:
+                equal = str(have) == str(want)
+            if not equal:
+                mismatches.append((key, want, have))
+
+    if not mismatches:
+        return
+
+    detail = "; ".join(f"{k}: model={want}, runtime={have}" for k, want, have in mismatches)
+    legacy = bool(meta.get("legacy_model") or meta.get("legacy_unverified"))
+    if legacy:
+        print()
+        print("WARNING: legacy Somnotate model runtime mismatch:", detail)
+        print("This legacy model may be used for compatibility testing, but a version-matched/retrained model is recommended for final scientific analysis.")
+        return
+
+    msg = (
+        "Somnotate model/runtime version mismatch. " + detail + "\n"
+        "scikit-learn does not support loading pickled estimators across versions. "
+        "Use the environment recorded in the model metadata or retrain the model in the release environment."
+    )
+    if allow_mismatch:
+        print("WARNING:", msg)
+    else:
+        raise RuntimeError(msg)
 
 
 def check_model_epoch_compatibility(model_file: Path, epoch_sec: float, allow_mismatch: bool = False) -> None:
@@ -777,7 +1036,9 @@ def workflow_use_existing_model(args: argparse.Namespace) -> None:
     if not recording_ids:
         raise ValueError("No recording IDs provided.")
 
+    runtime = preflight_somnotate_runtime(somnotate_root, py, model_file=model_file)
     check_model_epoch_compatibility(model_file, epoch_sec, allow_mismatch=args.allow_epoch_mismatch)
+    check_model_runtime_compatibility(model_file, runtime, allow_mismatch=args.allow_version_mismatch)
 
     if args.prepare:
         for rec_id in recording_ids:
@@ -812,6 +1073,8 @@ def workflow_train_model(args: argparse.Namespace) -> None:
 
     if not train_ids:
         raise ValueError("No training recording IDs provided.")
+
+    runtime = preflight_somnotate_runtime(somnotate_root, py)
 
     print()
     print("Training Somnotate model with app-controlled epoch length:", f"{epoch_sec:g} s")
@@ -855,12 +1118,17 @@ def workflow_train_model(args: argparse.Namespace) -> None:
         {
             "created_by_app": True,
             "created_at": datetime.now().isoformat(timespec="seconds"),
+            "app_version": APP_VERSION,
             "model_file": str(model_file),
             "somnotate_epoch_sec": float(epoch_sec),
             "target_fs": float(args.target_fs),
+            "signals": ["EEG", "EMG"],
+            "somnotate_configuration": "frontal EEG + EMG",
             "train_recording_ids": train_ids,
             "test_recording_ids": test_ids,
             "somnotate_root": str(somnotate_root),
+            "somnotate_git_commit": somnotate_git_commit(somnotate_root),
+            "runtime_versions": runtime,
         },
     )
 
@@ -954,6 +1222,7 @@ def main() -> None:
     p.add_argument("--target-fs", type=float, default=512.0)
     add_epoch_arg(p)
     p.add_argument("--allow-epoch-mismatch", action="store_true", help="Advanced/debug only: do not block model epoch mismatch.")
+    p.add_argument("--allow-version-mismatch", action="store_true", help="Advanced/debug only: do not block version mismatch for app-trained models.")
     p.add_argument("--prepare", action="store_true")
     p.add_argument("--preprocess", action="store_true")
     p.add_argument("--score", action="store_true")

@@ -1,0 +1,45 @@
+name: Cross-platform smoke tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install smoke-test dependencies
+        run: >-
+          python -m pip install
+          "numpy>=2,<3"
+          "pandas>=2.2,<4"
+          "scipy>=1.13,<2"
+          "scikit-learn>=1.6,<2"
+          "plotly>=6,<7"
+          "dash>=4,<5"
+          "h5py>=3.10,<4"
+          "pyedflib>=0.1.40,<0.2"
+          pytest
+
+      - name: Compile supported Python entry points
+        run: python -m compileall -q dash_app pipelines check_setup.py check_windows_setup.py
+
+      - name: Run cross-platform compatibility tests
+        run: python -m pytest -q tests/test_cross_platform.py
+
+      - name: Check pinned Somnotate source contract
+        shell: bash
+        run: |
+          git clone https://github.com/paulbrodersen/somnotate.git _somnotate_ci
+          git -C _somnotate_ci checkout a20f33de62511d8c172e333896608b7fc166d0f0
+          python tools/check_somnotate_source_contract.py _somnotate_ci

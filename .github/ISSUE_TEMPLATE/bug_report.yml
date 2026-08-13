@@ -1,0 +1,76 @@
+name: Bug report
+description: Report an app, Windows/macOS, Somnotate, import, QC, video, or export problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please remove animal/participant identifiers and other sensitive data from screenshots or logs before uploading them.
+
+  - type: input
+    id: version
+    attributes:
+      label: Sleep Stage QC version
+      description: Shown in the app header/About tab or in the VERSION file.
+      placeholder: 0.9.0-rc1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS Intel
+        - macOS Apple Silicon
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: action
+    attributes:
+      label: What were you doing?
+      description: Give the shortest sequence of clicks/steps that reproduces the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Setup diagnostics
+      description: Paste the output of `python check_setup.py`. For Somnotate problems, use `python check_setup.py --require-somnotate --somnotate-root <path>`.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant diagnostic log / traceback
+      description: Paste the relevant end of the log from `logs/` or the terminal. Remove sensitive paths/data if needed.
+      render: text
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I checked that attached screenshots/logs do not contain sensitive or identifying data.
+          required: true

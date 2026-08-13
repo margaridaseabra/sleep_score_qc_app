@@ -1,0 +1,23 @@
+name: somnotate_env
+channels:
+  - conda-forge
+dependencies:
+  # Somnotate 0.5.0 depends on the legacy pomegranate 0.14.x API.
+  # On Windows, the conda-forge pomegranate 0.14.4 build requires Python 3.9.
+  # On Apple Silicon, create this environment with --platform osx-64 and Rosetta.
+  - python=3.9
+  - pomegranate=0.14.4
+  - numpy=1.26.4
+  - scipy=1.13.1
+  - matplotlib=3.9.4
+  - scikit-learn=1.6.1
+  - pandas=2.3.3
+  - six=1.17.0
+  - pyedflib=0.1.42
+  - lspopt=1.4.0
+  # Pin direct/transitive packages observed in the validated Windows runtime.
+  - joblib=1.5.1
+  - networkx=3.2.1
+  - pyyaml=6.0.2
+  - threadpoolctl=3.6.0
+  - pip

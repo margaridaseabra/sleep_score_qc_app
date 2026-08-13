@@ -1,129 +1,60 @@
-.DS_Store
+# Python / editor / OS
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .venv/
 venv/
 .env
-.streamlit/
-outputs/*
-!outputs/.gitkeep
-sleep_stage_qc_v2_app_backup*.py
-recordings/
-somnotate_models/
-somnotate_runs/
-review_undo_stack/
-!somnotate_models/
-!test_data/
-!somnotate_models/.gitkeep
-!test_data/.gitkeep
-
-# Local / generated files
-__pycache__/
-*.pyc
 .DS_Store
+Thumbs.db
 
-# Large data / recordings
-*.mat
-*.npy
-*.npz
-*.h5
-*.hdf5
-recordings/
-Data/
-prepared_data/
-
-# Local backups and patches
-*.zip
-*_backup*/
-dash_app_backup*/
-app_backup*.py
-
-# Backup files created during patching
-*backup*.py
-*backup*.sh
-*_backup_*
-
-# Local docs backups
-README_old*.md
-START_HERE_old*.md
-*_old_streamlit_backup.md
-
-# Local / generated files
-__pycache__/
-*.pyc
-.DS_Store
-
-# Large data / recordings
-*.mat
-*.npy
-*.npz
-*.h5
-*.hdf5
-recordings/
-Data/
-prepared_data/
-
-# Local backups and patches
-*.zip
-*backup*.py
-*backup*.sh
-*_backup_*
-dash_app_backup*/
-app_backup*.py
-final_scoring_before_empty_reset.csv
-final_scoring_backup_*.csv
-
-# Local docs backups
-README_old*.md
-START_HERE_old*.md
-*_old_streamlit_backup.md
-
-# Local / generated files
-__pycache__/
-*.pyc
-.DS_Store
-
-# Large data / recordings
-*.mat
-*.npy
-*.npz
-*.h5
-*.hdf5
-recordings/
-Data/
-prepared_data/
-
-# Local backups and patches
-*.zip
-*backup*.py
-*backup*.sh
-*_backup_*
-dash_app_backup*/
-app_backup*.py
-final_scoring_before_empty_reset.csv
-final_scoring_backup_*.csv
-
-.local_backups_not_committed/
-*backup*.py
-*backup*.sh
-*_backup_*
-dash_app_backup*/
-*.zip
-dash_migration_v2_patch/
-
-.local_backups_not_committed/
-dash_app/app_backup*.py
-*.zip
+# App-generated local state
 logs/
 project_data/
-*.log
-# Local video/data files
+recordings/
+somnotate_runs/
+review_undo_stack/
+outputs/*
+!outputs/.gitkeep
+
+# Large recording / analysis data
+*.mat
+*.npy
+*.npz
+*.h5
+*.hdf5
+Data/
+prepared_data/
+
+# Local videos
 *.avi
 *.mp4
 *.m4v
 *.mov
 *.mkv
 *.wmv
+
+# Local development artifacts
+*.zip
+*.patch
+*.log
+*backup*.py
+*backup*.sh
+*_backup_*
+*_backup*/
+dash_app_backup*/
+app_backup*.py
+.local_backups_not_committed/
+dash_migration_v2_patch/
+fix_somnotate_resolver.py
+
+# Legacy local docs/backups
+README_old*.md
+START_HERE_old*.md
+*_old_streamlit_backup.md
+
+# Final-scoring safety copies
+final_scoring_before_empty_reset.csv
+final_scoring_backup_*.csv

@@ -1,4 +1,3 @@
-\
 @echo off
 setlocal
 cd /d "%~dp0"
@@ -28,7 +27,7 @@ python -c "import sys; print(sys.executable)"
 echo.
 
 echo Starting app at http://127.0.0.1:8050
-python -u dash_app\app.py
+python -u -m dash_app.app
 
 echo.
 echo The app stopped. Review the message above and the logs folder if this was unexpected.

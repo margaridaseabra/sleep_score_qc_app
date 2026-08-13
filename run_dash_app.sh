@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
-set -e
-python -m dash_app.app
+set -euo pipefail
+cd "$(dirname "$0")"
+exec python -m dash_app.app
