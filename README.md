@@ -1,6 +1,6 @@
 # Sleep Stage QC
 
-**Version 0.9.0-rc1**
+**Version 1.1.0-rc1**
 
 Cross-platform Dash app for semi-automated EEG/EMG sleep scoring, quality control, manual review, Somnotate integration, dissociation analysis, synchronized video review, and export.
 
@@ -193,7 +193,7 @@ The pipeline blocks known runtime mismatches for newly trained models unless the
 
 The two historical model files currently bundled with the repository are identical legacy copies and were observed to contain a scikit-learn estimator serialized with **scikit-learn 1.7.2**. The standardized Somnotate environment uses scikit-learn 1.6.1 because of the Python 3.9/pomegranate constraint.
 
-They are retained for backward compatibility and app testing, but a **new model trained/validated in the standardized release environment should replace them before a final scientific v1.0 release**. See `COMPATIBILITY.md`.
+They are retained for backward compatibility and app testing, but a **new model trained/validated in the standardized release environment should replace them before final scientific use**. See `COMPATIBILITY.md`.
 
 > **Model security:** Somnotate models are Python pickle files. Only load model files from a trusted source; unpickling an untrusted file can execute arbitrary code.
 
@@ -277,26 +277,44 @@ project_root/recordings/<recording_id>/final_scoring.csv
 
 ---
 
-# 7. Video QC
+# 7. Video QC and synchronized epoch review
 
-Recommended browser format:
+Recommended source format:
 
 ```text
 MP4 / H.264
 ```
 
-AVI can be converted locally using the app. FFmpeg is installed in the main Conda environment.
-
-Manual equivalent command:
-
-```text
-ffmpeg -i "videoname.avi" -map 0:v:0 -an -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 -movflags +faststart "videoname.mp4"
-```
+AVI/MOV files can be converted locally using the app when FFmpeg is available. FFmpeg is included in the main Conda environment.
 
 Video synchronization uses:
 
 ```text
 video_time_s = recording_time_s - video_offset_s
+```
+
+### Fast review of long recordings
+
+Multi-hour source videos do **not** need to be re-encoded in full. When an interval is selected in QC, the app prepares a short, seek-friendly H.264 clip containing the selection plus context and stores it in a per-user local cache. Nearby selections reuse the same clip. The original video is never modified.
+
+Default cache locations are:
+
+```text
+Windows: %LOCALAPPDATA%\SleepStageQC\video_cache
+macOS:   ~/Library/Caches/SleepStageQC/video_cache
+Linux:   ~/.cache/SleepStageQC/video_cache
+```
+
+The cache is automatically pruned to approximately 10 GB and can also be cleared from **Clear local review cache** in the Video QC panel.
+
+The synchronized review panel shows EEG/EMG beside the local video clip. **Play selection** plays the selected interval while a red browser-side tracer moves across the EEG/EMG plot. **◀ Epoch**, **Epoch ▶**, and **Replay epoch** support manual epoch-by-epoch review.
+
+For best performance, keeping the source video on a local disk is helpful but not required: the interactive browser player uses the short local cached clip rather than seeking repeatedly through the full source video.
+
+Manual conversion command for an unsupported source video:
+
+```text
+ffmpeg -i "videoname.avi" -map 0:v:0 -an -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 -movflags +faststart "videoname.mp4"
 ```
 
 ---
@@ -349,7 +367,9 @@ Do not treat this as a harmless release warning. scikit-learn does not support l
 
 # 9. Release status
 
-`0.9.0-rc1` is a release candidate for cross-platform hardening. Before tagging `v1.0.0`, complete `RELEASE_CHECKLIST.md`, including an end-to-end Windows test and a macOS regression test.
+`1.1.0-rc1` is the current release candidate. Windows setup and the current automated test suite have been validated on the hardening branch. Before tagging `v1.1.0`, complete `RELEASE_CHECKLIST.md`, including a fresh-clone test, synchronization with the latest `main`, an end-to-end Windows regression, and a macOS regression.
+
+The repository already contains the earlier `v1.0.0` and `v1.0.1` tags; this release candidate therefore uses the `1.1.0` version line.
 
 See:
 

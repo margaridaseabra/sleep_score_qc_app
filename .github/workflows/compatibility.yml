@@ -1,4 +1,4 @@
-name: Cross-platform smoke tests
+name: Cross-platform tests
 
 on:
   push:
@@ -32,10 +32,10 @@ jobs:
           pytest
 
       - name: Compile supported Python entry points
-        run: python -m compileall -q dash_app pipelines check_setup.py check_windows_setup.py
+        run: python -m compileall -q dash_app pipelines check_setup.py check_windows_setup.py tools tests
 
-      - name: Run cross-platform compatibility tests
-        run: python -m pytest -q tests/test_cross_platform.py
+      - name: Run full test suite
+        run: python -m pytest -q
 
       - name: Check pinned Somnotate source contract
         shell: bash

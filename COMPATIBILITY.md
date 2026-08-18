@@ -3,7 +3,7 @@
 ## Release candidate
 
 ```text
-Sleep Stage QC: 0.9.0-rc1
+Sleep Stage QC: 1.1.0-rc1
 ```
 
 The goal of this release candidate is to make Windows a first-class target while preserving macOS behavior.
@@ -21,7 +21,7 @@ The separation is necessary because Somnotate 0.5.0 depends on `pomegranate=0.14
 
 ### Apple Silicon
 
-The legacy Conda packages for `pomegranate 0.14.x` are available for Intel macOS (`osx-64`) but not native Apple Silicon (`osx-arm64`). On M-series Macs, create only the Somnotate environment with `--platform osx-64` and run it under Rosetta. The Dash environment remains native. This architecture must be regression-tested before v1.0.0.
+The legacy Conda packages for `pomegranate 0.14.x` are available for Intel macOS (`osx-64`) but not native Apple Silicon (`osx-arm64`). On M-series Macs, create only the Somnotate environment with `--platform osx-64` and run it under Rosetta. The Dash environment remains native. This architecture must be regression-tested before v1.1.0.
 
 ## Tested Somnotate upstream
 
@@ -68,6 +68,14 @@ The app therefore patches only a temporary pipeline copy to use frontal EEG + EM
 
 The tested upstream preprocessing code can pass a floating-point `nperseg` to `lspopt` when sampling frequency is read as a float. The app patches the temporary script to convert the spectrogram window length to an integer.
 
+### Long-video synchronized review
+
+The original recording video may remain on local or network storage. For interactive QC, the app creates short H.264/yuv420p clips in a per-user local cache and maps clip time back to source-video and recording time. The original video is not changed.
+
+Default cache roots are `%LOCALAPPDATA%\SleepStageQC\video_cache` on Windows, `~/Library/Caches/SleepStageQC/video_cache` on macOS, and `$XDG_CACHE_HOME/SleepStageQC/video_cache` (or `~/.cache/...`) on Linux. The app prunes the cache at approximately 10 GB.
+
+The moving red video tracer is browser-side so continuous playback does not require high-frequency Python callbacks or repeated signal-file reloads. FFmpeg must be available in the main app environment to prepare clips.
+
 ## Model versioning policy
 
 New models trained through the app receive a `.metadata.json` file containing the runtime versions and Somnotate Git commit used for training.
@@ -84,7 +92,7 @@ The two bundled legacy `.pickle` files have identical SHA-256 hashes:
 
 They were observed to contain a scikit-learn estimator serialized with scikit-learn 1.7.2. The standardized Somnotate runtime currently uses scikit-learn 1.6.1.
 
-Because scikit-learn does not support cross-version loading of pickled estimators, these models are marked `LEGACY` and should be replaced or explicitly validated before `v1.0.0` is used for final scientific analysis.
+Because scikit-learn does not support cross-version loading of pickled estimators, these models are marked `LEGACY` and should be replaced or explicitly validated before final scientific analysis.
 
 Somnotate model files are Python pickle files and must be treated as executable/trusted artifacts. Do not load `.pickle` models obtained from untrusted sources.
 
@@ -92,7 +100,7 @@ Somnotate model files are Python pickle files and must be treated as executable/
 
 ### Windows
 
-Validated during 0.9.0-rc1 hardening:
+Validated during the 1.1.0-rc1 Windows hardening pass:
 
 - clean app environment creation;
 - Dash startup;
@@ -106,10 +114,13 @@ Validated during 0.9.0-rc1 hardening:
 - result import;
 - state/probability normalization;
 - Apply Somnotate to visible QC window.
+- synchronized EEG/EMG + video review using short local QC clips;
+- browser-side moving video tracer and Play selection;
+- 13 automated tests passing in the validated Windows environment.
 
 ### macOS
 
-The app was developed and used on macOS before this hardening pass. **A complete regression run of the new 0.9.0-rc1 branch is still required before tagging v1.0.0.**
+The app was developed and used on macOS before this hardening pass. **A complete regression run of the 1.1.0-rc1 branch is still required before tagging v1.1.0.**
 
 Run the full macOS section in `RELEASE_CHECKLIST.md` rather than assuming that a cross-platform code change is sufficient.
 

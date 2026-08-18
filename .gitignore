@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 .env
@@ -15,12 +17,16 @@ logs/
 project_data/
 recordings/
 somnotate_runs/
+video_cache/
+.video_cache/
 review_undo_stack/
 outputs/*
 !outputs/.gitkeep
 
 # Large recording / analysis data
 *.mat
+*.edf
+*.bdf
 *.npy
 *.npz
 *.h5
