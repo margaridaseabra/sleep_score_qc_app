@@ -12,5 +12,5 @@ dependencies:
   - plotly>=6,<7
   - dash>=4,<5
   - pyedflib>=0.1.40,<0.2
-  - ffmpeg>=7,<9
+  - ffmpeg>=7,<10
   - pip
