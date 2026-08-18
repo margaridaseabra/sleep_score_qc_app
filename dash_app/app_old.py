@@ -123,11 +123,10 @@ def PInput(*args, **kwargs):
 def PDropdown(*args, **kwargs):
     component_id = kwargs.get("id")
 
-    # Recording/review navigation is session state, not a global preference.
-    # Persisting either of these dropdowns can silently restore an old choice
-    # when the QC tab is mounted, which makes the app appear to load or select
-    # something before the user has asked it to.
-    if component_id in {"recording-dropdown", "qc-diss-event-dropdown"}:
+    # Review/navigation dropdowns must start clean for every mounted QC view.
+    # Persisting qc-diss-event-dropdown can restore a previous event from Edge
+    # localStorage before the recording-load callbacks clear it.
+    if component_id in {"qc-diss-event-dropdown"}:
         kwargs.setdefault("persistence", False)
     else:
         kwargs.setdefault("persistence", True)
@@ -673,6 +672,9 @@ def video_panel_children(video_file: str | Path | None, offset_s: float | int | 
             id="qc-video-player",
             src=video_url_for_path(playback_path),
             controls=True,
+            # Do not make Edge touch a multi-hour source video just because the
+            # recording was loaded. The synchronized reviewer uses short local
+            # QC clips and is unaffected by this setting.
             preload="none",
             muted=True,
             playsInline=True,
@@ -1022,12 +1024,12 @@ def make_epoch_review_figure(
         row_heights=[0.56, 0.44],
     )
     fig.add_trace(
-        go.Scattergl(x=eeg_t_s, y=eeg, mode="lines", line={"color": RAW_TRACE_COLOR, "width": 1}, name="EEG"),
+        go.Scatter(x=eeg_t_s, y=eeg, mode="lines", line={"color": RAW_TRACE_COLOR, "width": 1}, name="EEG"),
         row=1,
         col=1,
     )
     fig.add_trace(
-        go.Scattergl(x=emg_t_s, y=emg, mode="lines", line={"color": RAW_TRACE_COLOR, "width": 1}, name="EMG"),
+        go.Scatter(x=emg_t_s, y=emg, mode="lines", line={"color": RAW_TRACE_COLOR, "width": 1}, name="EMG"),
         row=2,
         col=1,
     )
@@ -3051,24 +3053,7 @@ def set_project_root(n, root):
     return str(p), msg
 
 
-@app.callback(
-    Output("recording-id-store", "data", allow_duplicate=True),
-    Output("window-store", "data", allow_duplicate=True),
-    Output("selected-interval-store", "data", allow_duplicate=True),
-    Input("project-root-store", "data"),
-    prevent_initial_call=True,
-)
-def reset_review_state_on_project_change(project_root):
-    """A project change must never carry an old recording/selection forward."""
-    return None, {"start_min": 0.0, "window_min": 15.0}, None
-
-
-@app.callback(
-    Output("tab-content", "children"),
-    Input("main-tabs", "value"),
-    Input("project-root-store", "data"),
-    Input("manifest-refresh", "data"),
-)
+@app.callback(Output("tab-content", "children"), Input("main-tabs", "value"), State("project-root-store", "data"), Input("manifest-refresh", "data"))
 def render_tab(tab, project_root, _refresh):
     rec_options = available_recordings(project_root)
 
@@ -3114,13 +3099,7 @@ def render_tab(tab, project_root, _refresh):
                 html.H3("QC / Review"),
                 html.Div(style={"display":"flex","gap":"8px","alignItems":"center", "flexWrap":"wrap"}, children=[
                     html.Label("Recording:"),
-                    PDropdown(
-                        id="recording-dropdown",
-                        options=rec_options,
-                        value=None,
-                        placeholder="Choose a recording",
-                        style={"width":"360px"},
-                    ),
+                    PDropdown(id="recording-dropdown", options=rec_options, value=rec_options[0]["value"] if rec_options else None, style={"width":"360px"}),
                     html.Button("Load recording", id="load-recording", n_clicks=0),
                     html.Div(id="load-status", className="status-line"),
                 ]),
@@ -3848,9 +3827,11 @@ def load_recording_cb(n, project_root, recording_id):
     """
     Load selected recording into QC/Review.
 
-    Loading a recording is an explicit user action. Every return path also
-    clears Plotly selectedData and the synchronized-review selection so an old
-    browser selection cannot be resurrected when the new figure mounts.
+    This callback has exactly 10 outputs, so every return path returns exactly
+    10 values in this order:
+    recording_id, figure, graph_style, placeholder_style, window_label,
+    load_status, window_store, selected_interval_store, graph_selected_data,
+    selected_interval_label.
     """
     empty_fig = go.Figure()
 
@@ -3902,9 +3883,6 @@ def load_recording_cb(n, project_root, recording_id):
     try:
         rec = load_recording(project_root, recording_id)
         fig = make_review_figure(project_root, recording_id, 0.0, 15.0)
-        # Force a genuinely fresh Plotly interaction state on each explicit load.
-        # Without this, uirevision can preserve an old box selection/drag mode.
-        fig.update_layout(uirevision=f"load-{recording_id}-{int(n or 0)}", dragmode="pan")
 
         duration_min = float(rec["duration_s"]) / 60.0
         end_min = min(duration_min, 15.0)
