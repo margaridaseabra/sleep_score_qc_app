@@ -2,6 +2,8 @@
 
 ## 1.1.0-rc1 - 2026-08-18
 
+- Added one-click Windows setup with `INSTALL_WINDOWS.bat` and `RUN_APP.bat`; Somnotate is downloaded, pinned, installed, and configured automatically.
+
 Release candidate for the next cross-platform release after `v1.0.1`.
 
 ### Added

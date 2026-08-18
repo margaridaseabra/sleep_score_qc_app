@@ -1,58 +1,75 @@
 # Start here
 
-This is the short setup guide for lab users of **Sleep Stage QC 1.1.0-rc1**.
+This is the short setup guide for **Sleep Stage QC 1.1.0-rc1**.
 
-The supported app is the **Dash** interface at `http://127.0.0.1:8050`. The old Streamlit files are kept only as legacy reference.
+## Windows — recommended
 
-## A. Install the app
+### 1. Install Conda once
 
-Clone the repository and create the main environment:
+Install one of:
 
-```bash
-git clone https://github.com/margaridaseabra/sleep_score_qc_app.git
-cd sleep_score_qc_app
-conda env create -f environment.yml
-conda activate sleep_stage_qc_v2
+- Miniconda
+- Anaconda
+- Miniforge
+
+You do not need to create any environments manually.
+
+### 2. Download Sleep Stage QC
+
+On GitHub choose:
+
+```text
+Code → Download ZIP
 ```
 
-If the environment already exists, update it instead:
+Extract the ZIP to a normal folder.
 
-```bash
-conda env update -f environment.yml --prune
-conda activate sleep_stage_qc_v2
+### 3. Install everything
+
+Double-click:
+
+```text
+INSTALL_WINDOWS.bat
 ```
 
-### Windows
+Wait for:
 
-Open **Anaconda Prompt** in the repository:
-
-```bat
-python check_setup.py
-run_app_windows.bat
+```text
+Installation successful.
 ```
 
-### macOS
+This automatically creates the app environment, creates the Somnotate environment, downloads the supported Somnotate source, installs it, and runs diagnostics.
 
-Open Terminal in the repository:
+### 4. Run the app
 
-```bash
-python check_setup.py
-./run_app.sh
+Double-click:
+
+```text
+RUN_APP.bat
 ```
 
-Open `http://127.0.0.1:8050`.
+The browser should open automatically at:
 
-## B. First workflow
+```text
+http://127.0.0.1:8050
+```
 
-1. Set the **Project root** and click **Load project**.
-2. Open **1. Import .mat / EDF + Layer 1**.
-3. Import a recording.
-4. Compute epoch features.
-5. Run Layer 1.
-6. Open **3. Somnotate** if automatic Wake/NREM/REM scoring is needed.
-7. Open **2. QC / Review** to inspect and correct scoring.
-8. Run **4. Dissociation** if disagreement/event review is needed.
-9. Export Final scoring when review is complete.
+Keep the launcher window open while using the app.
+
+That is the normal Windows installation. No manual Somnotate setup is required.
+
+## First workflow
+
+1. Set **Project root**.
+2. Click **Load project**.
+3. Open **1. Import .mat / EDF + Layer 1** if the recording is not already prepared.
+4. Import the recording.
+5. Compute epoch features.
+6. Run Layer 1.
+7. Open **3. Somnotate** for Wake/NREM/REM scoring.
+8. Open **2. QC / Review** to inspect and correct scoring.
+9. Use **4. Dissociation** if disagreement/event review is needed.
+10. Export Final scoring when review is complete.
 
 Final scoring saves automatically to:
 
@@ -60,7 +77,32 @@ Final scoring saves automatically to:
 project_root/recordings/<recording_id>/final_scoring.csv
 ```
 
-## C. QC shortcuts
+## Video review
+
+In **QC / Review**:
+
+1. Link the recording video.
+2. Set the video offset if needed.
+3. Select an interval in the main QC plot.
+4. Use the synchronized review panel.
+
+The app creates short local QC clips automatically for fast review of long videos.
+
+The panel shows synchronized EEG, EMG and video with a red moving playhead.
+
+## Somnotate on Windows
+
+For normal Windows use, Somnotate is installed automatically by `INSTALL_WINDOWS.bat`.
+
+The installer uses the supported Somnotate source commit:
+
+```text
+a20f33de62511d8c172e333896608b7fc166d0f0
+```
+
+Users normally do not need to clone Somnotate or enter its path manually.
+
+## Keyboard shortcuts
 
 | Key | Action |
 |---|---|
@@ -74,91 +116,37 @@ project_root/recordings/<recording_id>/final_scoring.csv
 | `L` | Layer 1 |
 | `M` | Manual |
 
-## D. Video review
+## macOS
 
-1. Link the recording's video in the Video QC section and set/save the video offset if needed.
-2. Select an interval in the main QC plot.
-3. The app prepares or reuses a short local QC clip for that interval; the original video is not modified.
-4. Use **Play selection** for continuous synchronized playback. A red tracer shows the current video position on the EEG/EMG panel.
-5. Use **◀ Epoch**, **Epoch ▶**, or **Replay epoch** for epoch-by-epoch review.
-6. Use **Clear local review cache** if you want to remove cached clips for the recording.
+The dedicated easy installer is currently Windows-only.
 
-For long videos, the original may remain on a lab/network drive. The interactive review clip is stored locally under the user's OS cache directory, for example `%LOCALAPPDATA%\SleepStageQC\video_cache` on Windows. The cache is automatically limited to about 10 GB.
-
-MP4/H.264 is the recommended source format. FFmpeg is included in the main environment for conversion and local QC-clip preparation.
-
-## E. Install Somnotate if needed
-
-Somnotate uses a **separate environment** from the Dash app. The tested upstream version is Somnotate 0.5.0 at commit:
-
-```text
-a20f33de62511d8c172e333896608b7fc166d0f0
-```
-
-From the app repository:
+For macOS, create the app environment manually:
 
 ```bash
-conda env create -f environment_somnotate.yml
-```
-
-Clone and pin Somnotate:
-
-```bash
-git clone https://github.com/paulbrodersen/somnotate.git
-cd somnotate
-git checkout a20f33de62511d8c172e333896608b7fc166d0f0
-conda activate somnotate_env
-python -m pip install -e . --no-deps
-```
-
-Then verify from the app repository:
-
-```bash
+conda env create -f environment.yml
 conda activate sleep_stage_qc_v2
-python check_setup.py --require-somnotate --somnotate-root /path/to/somnotate
+./run_app.sh
 ```
 
-Typical paths:
+Somnotate uses its own environment. Follow `COMPATIBILITY.md` for the current tested Mac requirements.
+
+## If something is broken on Windows
+
+First run:
 
 ```text
-Windows: C:\Users\YOUR_USER\somnotate
-macOS:   /Users/YOUR_USER/somnotate
+INSTALL_WINDOWS.bat
 ```
 
-On Apple Silicon, create only the Somnotate environment as Intel/Rosetta:
+again.
 
-```bash
-conda env create --platform osx-64 -f environment_somnotate.yml
+It is designed to update or repair the environments and supported Somnotate installation.
+
+For detailed diagnostics:
+
+```bat
+conda activate sleep_stage_qc_v2
+python check_setup.py
 ```
 
-The main Dash environment should remain native.
-
-## F. Somnotate existing-model setup
-
-In the Somnotate tab:
-
-- **Somnotate repository path**: your local Somnotate clone
-- **Somnotate conda env**: `somnotate_env`
-- **Optional Somnotate Python executable**: normally leave blank
-- **Existing model**: choose the intended `.pickle`
-- **Somnotate epoch sec**: must match the model (1 s, 2 s, or 5 s)
-
-For a complete new scoring run, keep these steps selected:
-
-```text
-prepare
-preprocess
-score
-probabilities
-import-results
-```
-
-The app uses a temporary Somnotate pipeline copy and does not modify the Somnotate repository itself.
-
-## G. Important model note
-
-Models trained from the app save environment/version metadata automatically.
-
-The two historical bundled models are marked **LEGACY** because they were serialized with scikit-learn 1.7.2 while the standardized Somnotate environment uses 1.6.1. They are retained for compatibility/testing, but a version-matched and scientifically validated model should be used for final analysis.
-
-For details and troubleshooting, read `README.md` and `COMPATIBILITY.md`.
+For more details, read `README.md` and `COMPATIBILITY.md`.
