@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -101,10 +102,20 @@ DEFAULT_PROJECT_ROOT = os.environ.get("SLEEP_QC_PROJECT_ROOT", str(APP_DIR / "pr
 
 
 def PInput(*args, **kwargs):
-    """Persistent Dash input so fields do not reset after callbacks/tab switches."""
-    kwargs.setdefault("persistence", True)
-    kwargs.setdefault("persistence_type", "local")
-    if kwargs.get("id") == "project-root-input":
+    """Dash input with persistence for settings that are global to the browser.
+
+    Video path/offset are intentionally *not* browser-persistent because they are
+    recording-specific and are stored in that recording's ``metadata.json``.
+    Persisting them in localStorage can show a stale path from another recording
+    and can race with the callback that loads the real per-recording metadata.
+    """
+    component_id = kwargs.get("id")
+    if component_id in {"video-file-input", "video-offset-input"}:
+        kwargs.setdefault("persistence", False)
+    else:
+        kwargs.setdefault("persistence", True)
+        kwargs.setdefault("persistence_type", "local")
+    if component_id == "project-root-input":
         kwargs.setdefault("value", DEFAULT_PROJECT_ROOT)
     return dcc.Input(*args, **kwargs)
 
@@ -285,59 +296,376 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
 def video_url_for_path(video_file: str | Path | None) -> str | None:
     """Return a local Dash/Flask URL for a video path.
 
-    Browser video elements usually cannot reliably read arbitrary local file://
-    paths, so the app serves the selected file through a local Flask route.
-    The video itself remains on the user's computer; it is not copied to GitHub.
+    The path is fully URL-encoded so Windows drive letters, UNC paths, spaces and
+    backslashes survive the browser round-trip.  A file modification token is
+    included to prevent the browser from reusing a stale/black cached video after
+    the user changes or converts the source.
     """
-    if not video_file:
+    raw = str(video_file or "").strip()
+    if not raw:
         return None
-    return "/_local_video?path=" + quote(str(Path(str(video_file)).expanduser()))
+    path = Path(raw).expanduser()
+    try:
+        token = str(path.stat().st_mtime_ns) if path.exists() else "missing"
+    except OSError:
+        token = "unknown"
+    return "/_local_video?path=" + quote(str(path), safe="") + "&v=" + quote(token, safe="")
+
+
+def _ffprobe_video_info(video_file: str | Path | None) -> dict[str, Any]:
+    """Return basic video stream metadata using ffprobe when available."""
+    raw = str(video_file or "").strip()
+    if not raw:
+        return {}
+    path = Path(raw).expanduser()
+    if not path.exists() or not path.is_file():
+        return {}
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {}
+    cmd = [
+        ffprobe,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,pix_fmt,width,height,avg_frame_rate,duration,bit_rate",
+        "-of", "json",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
+        if result.returncode != 0:
+            return {}
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams") or []
+        return dict(streams[0]) if streams else {}
+    except Exception:
+        return {}
+
+
+def browser_mp4_path_for_video(video_path: Path) -> Path:
+    """Deterministic H.264/yuv420p browser copy stored beside the source video."""
+    return video_path.with_name(f"{video_path.stem}_browser.mp4")
+
+
+def _video_cache_root() -> Path:
+    """Return a local per-user cache directory for short QC video clips."""
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        root = base / "SleepStageQC" / "video_cache"
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Caches" / "SleepStageQC" / "video_cache"
+    else:
+        root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "SleepStageQC" / "video_cache"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _source_video_signature(path: Path) -> str:
+    """Stable signature that invalidates cached clips when the source changes."""
+    stat = path.stat()
+    payload = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", errors="replace")
+    return hashlib.sha1(payload).hexdigest()[:16]
+
+
+def _safe_recording_cache_name(recording_id: str | None) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(recording_id or "recording")).strip("._")
+    return value or "recording"
+
+
+def _cached_clip_path(source: Path, recording_id: str | None, start_s: float, end_s: float) -> Path:
+    cache_dir = _video_cache_root() / _safe_recording_cache_name(recording_id)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    sig = _source_video_signature(source)
+    start_ms = int(round(float(start_s) * 1000.0))
+    end_ms = int(round(float(end_s) * 1000.0))
+    return cache_dir / f"{sig}_{start_ms}_{end_ms}_qc.mp4"
+
+
+def _prune_video_cache(max_bytes: int = 10 * 1024**3) -> None:
+    """Keep the local QC cache bounded without touching original videos."""
+    root = _video_cache_root()
+    files = []
+    total = 0
+    for path in root.rglob("*.mp4"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        files.append((stat.st_mtime, stat.st_size, path))
+        total += stat.st_size
+    if total <= max_bytes:
+        return
+    for _, size, path in sorted(files):
+        try:
+            path.unlink()
+            total -= size
+        except OSError:
+            pass
+        if total <= max_bytes:
+            break
+
+
+def clear_video_review_cache(recording_id: str | None = None) -> tuple[bool, str]:
+    """Delete cached short review clips, optionally only for one recording."""
+    root = _video_cache_root()
+    target = root / _safe_recording_cache_name(recording_id) if recording_id else root
+    if not target.exists():
+        return True, "Video review cache is already empty."
+    try:
+        if target == root:
+            for child in list(root.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(target, ignore_errors=True)
+        return True, f"Cleared local video review cache: {target}"
+    except Exception as e:
+        return False, f"Could not clear video review cache: {type(e).__name__}: {e}"
+
+
+def _clip_info_covers_selection(
+    clip_info: dict[str, Any] | None,
+    source: Path,
+    selected_video_start_s: float,
+    selected_video_end_s: float,
+) -> bool:
+    if not clip_info:
+        return False
+    try:
+        clip_path = Path(str(clip_info.get("clip_path", ""))).expanduser()
+        return (
+            clip_path.exists()
+            and str(clip_info.get("source_signature", "")) == _source_video_signature(source)
+            and float(clip_info.get("source_start_s", 0.0)) <= float(selected_video_start_s) + 1e-6
+            and float(clip_info.get("source_end_s", 0.0)) >= float(selected_video_end_s) - 1e-6
+        )
+    except Exception:
+        return False
+
+
+def prepare_local_qc_clip(
+    video_file: str | Path,
+    recording_id: str | None,
+    selected_recording_start_s: float,
+    selected_recording_end_s: float,
+    video_offset_s: float = 0.0,
+    context_s: float = 60.0,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Create/reuse a short, seek-friendly local H.264 clip for synchronized QC.
+
+    The original video can live on a network drive. Only the selected interval
+    plus a small amount of context is decoded and written to the local user cache.
+    Clip timestamps start at zero, while ``source_start_s`` keeps the exact mapping
+    back to the original video and therefore to recording time.
+    """
+    raw = str(video_file or "").strip()
+    if not raw:
+        return False, "No video linked to this recording.", None
+    source = Path(raw).expanduser()
+    if not source.exists() or not source.is_file():
+        return False, f"Video file not found: {source}", None
+
+    offset = float(video_offset_s or 0.0)
+    selected_video_start = max(0.0, float(selected_recording_start_s) - offset)
+    selected_video_end = max(selected_video_start, float(selected_recording_end_s) - offset)
+    if selected_video_end <= selected_video_start:
+        selected_video_end = selected_video_start + 1.0
+
+    info = _ffprobe_video_info(source)
+    duration = safe_float(info.get("duration"), 0.0)
+    clip_start = max(0.0, selected_video_start - float(context_s))
+    clip_end = selected_video_end + float(context_s)
+    if duration > 0:
+        clip_end = min(duration, clip_end)
+    if clip_end <= clip_start:
+        clip_end = clip_start + max(1.0, selected_video_end - selected_video_start)
+
+    out_path = _cached_clip_path(source, recording_id, clip_start, clip_end)
+    signature = _source_video_signature(source)
+    result_info = {
+        "clip_path": str(out_path),
+        "source_path": str(source),
+        "source_signature": signature,
+        "source_start_s": float(clip_start),
+        "source_end_s": float(clip_end),
+        "selected_video_start_s": float(selected_video_start),
+        "selected_video_end_s": float(selected_video_end),
+        "video_offset_s": offset,
+    }
+
+    if out_path.exists() and out_path.is_file() and out_path.stat().st_size > 0:
+        result_info["reused"] = True
+        return True, (
+            f"Local QC clip ready (reused): {clip_start/60:.2f}–{clip_end/60:.2f} video min · "
+            f"{out_path.stat().st_size / (1024**2):.1f} MB"
+        ), result_info
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False, "FFmpeg was not found in the active app environment.", None
+
+    duration_to_encode = max(0.25, clip_end - clip_start)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-ss", f"{clip_start:.3f}",
+        "-i", str(source),
+        "-t", f"{duration_to_encode:.3f}",
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-force_key_frames", "expr:gte(t,n_forced*1)",
+        "-sc_threshold", "0",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    started = datetime.now()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except Exception as e:
+        out_path.unlink(missing_ok=True)
+        return False, f"Could not create local QC clip: {type(e).__name__}: {e}", None
+    elapsed = (datetime.now() - started).total_seconds()
+    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size <= 0:
+        out_path.unlink(missing_ok=True)
+        err = (proc.stderr or proc.stdout or "FFmpeg failed").strip()
+        if len(err) > 2500:
+            err = err[-2500:]
+        return False, f"Could not create local QC clip.\n{err}", None
+
+    _prune_video_cache()
+    result_info["reused"] = False
+    result_info["elapsed_s"] = float(elapsed)
+    result_info["size_mb"] = float(out_path.stat().st_size / (1024**2))
+    return True, (
+        f"Local QC clip ready in {elapsed:.1f} s: {clip_start/60:.2f}–{clip_end/60:.2f} video min · "
+        f"{result_info['size_mb']:.1f} MB"
+    ), result_info
+
+
+def epoch_review_cached_video_children(clip_info: dict[str, Any] | None):
+    """Render the synchronized player for a short local QC clip."""
+    if not clip_info:
+        return html.Div(
+            "Select an interval to prepare a short local QC clip.",
+            className="app-subtitle",
+            style={"padding": "14px"},
+        )
+    clip_path = Path(str(clip_info.get("clip_path", ""))).expanduser()
+    if not clip_path.exists():
+        return html.Div(f"Cached QC clip not found: {clip_path}", className="status-line")
+    source_start = float(clip_info.get("source_start_s", 0.0) or 0.0)
+    source_end = float(clip_info.get("source_end_s", source_start) or source_start)
+    return html.Div([
+        html.Video(
+            id="epoch-review-video-player",
+            src=video_url_for_path(clip_path),
+            controls=True,
+            preload="auto",
+            muted=True,
+            playsInline=True,
+            **{
+                "data-qc-local-clip": "1",
+                "data-source-start-s": f"{source_start:.6f}",
+                "data-source-end-s": f"{source_end:.6f}",
+            },
+            style={
+                "width": "100%",
+                "height": "360px",
+                "objectFit": "contain",
+                "background": "#000",
+                "borderRadius": "10px",
+            },
+        ),
+        html.Div(
+            f"Local QC clip · source video {source_start/60:.2f}–{source_end/60:.2f} min · "
+            f"cache: {clip_path.parent}",
+            className="app-subtitle",
+            style={"marginTop": "5px", "wordBreak": "break-all"},
+        ),
+    ])
+
+
+def _browser_video_choice(video_file: str | Path | None) -> tuple[Path | None, str, bool]:
+    """Choose the best local file for browser playback.
+
+    Returns ``(path_to_play, message, conversion_recommended)``.  If a current
+    ``*_browser.mp4`` copy already exists, it is preferred automatically.
+    """
+    raw = str(video_file or "").strip()
+    if not raw:
+        return None, "No video selected yet.", False
+
+    source = Path(raw).expanduser()
+    if not source.exists() or not source.is_file():
+        return source, f"Video file not found: {source}", False
+
+    browser_copy = browser_mp4_path_for_video(source)
+    if browser_copy.exists() and browser_copy.is_file() and browser_copy.stat().st_size > 0:
+        try:
+            if browser_copy.stat().st_mtime >= source.stat().st_mtime:
+                return browser_copy, f"Using browser-compatible copy: {browser_copy.name}", False
+        except OSError:
+            return browser_copy, f"Using browser-compatible copy: {browser_copy.name}", False
+
+    info = _ffprobe_video_info(source)
+    codec = str(info.get("codec_name", "") or "").lower()
+    pix_fmt = str(info.get("pix_fmt", "") or "").lower()
+    suffix = source.suffix.lower()
+
+    # Chrome/Edge/Safari are most consistently happy with H.264 in an MP4/M4V
+    # container and 4:2:0 pixel formats.  Other combinations may show controls
+    # but render a black frame, which is especially confusing during QC.
+    safe_codec = codec in {"h264", "avc1"}
+    safe_container = suffix in {".mp4", ".m4v"}
+    safe_pix = (not pix_fmt) or pix_fmt in {"yuv420p", "yuvj420p"}
+    if safe_codec and safe_container and safe_pix:
+        detail = f"H.264/{pix_fmt or 'compatible pixel format'}" if codec else "browser-compatible MP4"
+        return source, f"Video codec looks browser-compatible ({detail}).", False
+
+    if not info:
+        if suffix in {".mp4", ".m4v"}:
+            return source, "MP4 selected. If the image is black, make a browser-compatible MP4 below.", True
+        return source, "This video format may not play reliably in the browser. Make a browser-compatible MP4 below.", True
+
+    detail = ", ".join(x for x in [codec or "unknown codec", pix_fmt or "unknown pixel format"] if x)
+    return source, f"Video may render black in the browser ({detail}). Make a browser-compatible H.264 MP4 below.", True
 
 
 def video_format_message(video_file: str | Path | None) -> str:
-    if not video_file:
-        return "No video selected yet."
-    suffix = Path(str(video_file)).suffix.lower()
-    if suffix in {".mp4", ".m4v", ".mov"}:
-        return "Video selected. MP4/MOV playback should work in most browsers."
-    if suffix == ".avi":
-        return "AVI selected. The path is saved, but browser playback may fail. Convert to MP4 if it does not play."
-    return f"Video selected with extension '{suffix}'. MP4 is recommended for browser playback."
+    _, message, _ = _browser_video_choice(video_file)
+    return message
 
 
 def video_panel_children(video_file: str | Path | None, offset_s: float | int | str | None = 0.0):
-    if not video_file:
+    playback_path, message, conversion_recommended = _browser_video_choice(video_file)
+    if playback_path is None:
         return html.Div("No video file saved for this recording yet.", className="app-subtitle")
 
-    p = Path(str(video_file)).expanduser()
-    exists = p.exists()
-    suffix = p.suffix.lower()
+    if not playback_path.exists():
+        return html.Div(message, className="status-line")
 
-    messages = []
-    if not exists:
-        messages.append(html.Div(f"Video file not found: {p}", className="status-line"))
-    elif suffix == ".avi":
+    messages = [html.Div(message, className="status-line")]
+    if conversion_recommended:
         messages.append(html.Div(
-            "AVI path saved. If the .avi file is not loading in this browser, "
-            "try another browser or convert the video to .mp4 using the helper command below, "
-            "then save the new .mp4 path instead.",
-            className="status-line",
+            "Tip: if you see a black player or playback does not start, click “Make browser-compatible MP4”.",
+            className="app-subtitle",
+            style={"marginTop": "4px"},
         ))
-    elif suffix not in {".mp4", ".m4v", ".mov"}:
-        messages.append(html.Div(
-            f"Unsupported or unusual video extension ({suffix}). MP4 is recommended.",
-            className="status-line",
-        ))
-
-    if not exists:
-        return html.Div(messages)
 
     return html.Div(children=messages + [
         html.Video(
             id="qc-video-player",
-            src=video_url_for_path(p),
+            src=video_url_for_path(playback_path),
             controls=True,
-            preload="metadata",
+            preload="auto",
+            muted=True,
+            playsInline=True,
             style={"width": "100%", "maxHeight": "420px", "background": "#000", "borderRadius": "10px"},
         ),
         html.Div(
@@ -348,13 +676,466 @@ def video_panel_children(video_file: str | Path | None, offset_s: float | int | 
     ])
 
 
+def epoch_review_video_children(video_file: str | Path | None, offset_s: float | int | str | None = 0.0):
+    """Video player used by the synchronized epoch-review panel."""
+    if not video_file:
+        return html.Div(
+            [
+                html.Div("No video linked to this recording.", style={"fontWeight": "700"}),
+                html.Div(
+                    "Use Video QC below to save a video path. The EEG/EMG epoch reviewer still works without video.",
+                    className="app-subtitle",
+                    style={"marginTop": "4px"},
+                ),
+            ],
+            style={"padding": "14px"},
+        )
+
+    playback_path, message, conversion_recommended = _browser_video_choice(video_file)
+    if playback_path is None or not playback_path.exists():
+        return html.Div(
+            [
+                html.Div("Saved video could not be found.", style={"fontWeight": "700"}),
+                html.Div(str(playback_path or video_file), className="app-subtitle", style={"marginTop": "4px", "wordBreak": "break-all"}),
+            ],
+            style={"padding": "14px"},
+        )
+
+    notice_style = {"marginTop": "5px"}
+    if conversion_recommended:
+        notice_style["fontWeight"] = "600"
+
+    return html.Div([
+        # Legacy full-source helper. Keep a distinct ID so synchronized-review
+        # JavaScript can never accidentally attach to the 10-hour source video.
+        html.Video(
+            id="epoch-review-full-source-video-player",
+            src=video_url_for_path(playback_path),
+            controls=True,
+            preload="metadata",
+            muted=True,
+            playsInline=True,
+            style={
+                "width": "100%",
+                "height": "360px",
+                "objectFit": "contain",
+                "background": "#000",
+                "borderRadius": "10px",
+            },
+        ),
+        html.Div(message, className="app-subtitle", style=notice_style),
+        html.Div(
+            f"Offset {float(offset_s or 0):.3f} s · video time = recording time − offset",
+            className="app-subtitle",
+            style={"marginTop": "3px"},
+        ),
+    ])
+
+
+def _state_at_time(source: pd.DataFrame | None, label_col: str, time_s: float, default: str = "Undefined") -> str:
+    if source is None or label_col not in source.columns or not {"t0_s", "t1_s"}.issubset(source.columns):
+        return default
+    try:
+        t0 = pd.to_numeric(source["t0_s"], errors="coerce")
+        t1 = pd.to_numeric(source["t1_s"], errors="coerce")
+        m = (t0 <= float(time_s)) & (t1 > float(time_s))
+        if not m.any():
+            return default
+        return normalize_state_label(source.loc[m, label_col].iloc[0])
+    except Exception:
+        return default
+
+
+def _review_epoch_table(rec: dict[str, Any]) -> pd.DataFrame:
+    """Return the canonical scoring epochs used by the main QC plot.
+
+    The main viewer is based on Layer 1 epoch boundaries.  The synchronized
+    video reviewer must use those same boundaries instead of trusting an older
+    ``final_scoring.csv`` file, which may have been created with a different
+    epoch length or may contain stale/invalid time columns after a project is
+    moved or reprocessed.
+    """
+    layer1 = rec.get("layer1")
+    if layer1 is None or not {"t0_s", "t1_s"}.issubset(layer1.columns):
+        return pd.DataFrame()
+
+    cols = ["t0_s", "t1_s"]
+    if "epoch_id" in layer1.columns:
+        cols.insert(0, "epoch_id")
+    out = layer1.loc[:, cols].copy()
+    if "epoch_id" not in out.columns:
+        out.insert(0, "epoch_id", np.arange(len(out), dtype=int))
+
+    out["t0_s"] = pd.to_numeric(out["t0_s"], errors="coerce")
+    out["t1_s"] = pd.to_numeric(out["t1_s"], errors="coerce")
+    out = out.dropna(subset=["t0_s", "t1_s"])
+    out = out[out["t1_s"] > out["t0_s"]].copy()
+    if len(out) == 0:
+        return out
+
+    # Final is a label layer, not the source of epoch geometry.  Sample it at
+    # the canonical epoch midpoint so the summary still shows the reviewed
+    # Final state even when Final and Layer 1 were generated at different times.
+    final = rec.get("final")
+    if final is not None:
+        out["final_state"] = labels_at_epoch_midpoints(out, final, "final_state")
+    else:
+        out["final_state"] = "Undefined"
+
+    return out.sort_values(["t0_s", "t1_s"]).reset_index(drop=True)
+
+
+def _epoch_geometry_from_table(source: pd.DataFrame | None) -> pd.DataFrame:
+    """Extract a clean epoch geometry table from any scoring layer."""
+    if source is None or not {"t0_s", "t1_s"}.issubset(source.columns):
+        return pd.DataFrame()
+    cols = ["t0_s", "t1_s"]
+    if "epoch_id" in source.columns:
+        cols.insert(0, "epoch_id")
+    out = source.loc[:, cols].copy()
+    if "epoch_id" not in out.columns:
+        out.insert(0, "epoch_id", np.arange(len(out), dtype=int))
+    out["t0_s"] = pd.to_numeric(out["t0_s"], errors="coerce")
+    out["t1_s"] = pd.to_numeric(out["t1_s"], errors="coerce")
+    out = out.dropna(subset=["t0_s", "t1_s"])
+    out = out[out["t1_s"] > out["t0_s"]].copy()
+    return out.sort_values(["t0_s", "t1_s"]).reset_index(drop=True)
+
+
+def _epoch_rows_for_selection(rec: dict[str, Any], selected: dict[str, Any] | None) -> pd.DataFrame:
+    """Return scoring epochs overlapping the selected QC interval.
+
+    Layer 1 is normally the canonical epoch grid, but older/moved projects can
+    contain a stale or partial Layer 1 table while Final/manual scoring still
+    has the correct full-recording geometry.  The synchronized reviewer should
+    therefore fall back to another valid scoring layer instead of showing an
+    empty panel for a visibly valid selection.
+    """
+    if not selected:
+        return pd.DataFrame()
+    try:
+        start_s = float(selected.get("start_min", 0.0)) * 60.0
+        end_s = float(selected.get("end_min", selected.get("start_min", 0.0))) * 60.0
+    except Exception:
+        return pd.DataFrame()
+    if end_s <= start_s:
+        return pd.DataFrame()
+
+    # Prefer Layer 1 so review follows the same epoch grid as the main QC plot.
+    # If it does not cover this part of the recording, use the first other
+    # prepared scoring layer that does.  Final is preferred because it normally
+    # uses the app's base scoring epoch length; Somnotate may use a coarser grid.
+    candidates = [
+        _review_epoch_table(rec),
+        _epoch_geometry_from_table(rec.get("final")),
+        _epoch_geometry_from_table(rec.get("manual")),
+        _epoch_geometry_from_table(rec.get("som")),
+    ]
+    for epochs in candidates:
+        if len(epochs) == 0:
+            continue
+        t0 = epochs["t0_s"].to_numpy(float)
+        t1 = epochs["t1_s"].to_numpy(float)
+        mask = (t0 < end_s) & (t1 > start_s)
+        if not mask.any():
+            continue
+        out = epochs.loc[mask].reset_index(drop=True)
+        # Attach Final labels when the fallback geometry came from a layer that
+        # does not already carry them.
+        if "final_state" not in out.columns:
+            final = rec.get("final")
+            out["final_state"] = (
+                labels_at_epoch_midpoints(out, final, "final_state")
+                if final is not None else "Undefined"
+            )
+        return out
+
+    # Prepared scoring tables can occasionally have a short gap or end early
+    # even though the underlying EEG/EMG arrays continue.  For synchronized
+    # review we still want to show the signal and let the user move through the
+    # selected interval. Reconstruct only the geometry; labels remain sampled
+    # from the existing scoring sources and therefore stay Undefined where no
+    # label exists.
+    return _signal_epoch_rows_for_selection(rec, start_s, end_s)
+
+
+def _recording_signal_duration_s(rec: dict[str, Any]) -> float:
+    """Best available EEG/EMG duration without loading full arrays into RAM."""
+    durations: list[float] = []
+    fs = safe_float(rec.get("fs"), 0.0)
+    if fs > 0:
+        recording_dir = Path(rec.get("recording_dir", "."))
+        for name in ("eeg.npy", "emg.npy"):
+            path = recording_dir / name
+            if not path.exists():
+                continue
+            try:
+                arr = np.load(path, mmap_mode="r")
+                durations.append(float(len(arr)) / fs)
+            except Exception:
+                pass
+    meta_duration = safe_float(rec.get("duration_s"), 0.0)
+    if meta_duration > 0:
+        durations.append(meta_duration)
+    return min(durations) if durations else 0.0
+
+
+def _infer_review_epoch_sec(rec: dict[str, Any]) -> float:
+    """Infer the scoring epoch length from prepared layers, then metadata."""
+    for key in ("layer1", "final", "manual", "som"):
+        source = rec.get(key)
+        if source is None or not {"t0_s", "t1_s"}.issubset(source.columns):
+            continue
+        try:
+            dt = (
+                pd.to_numeric(source["t1_s"], errors="coerce")
+                - pd.to_numeric(source["t0_s"], errors="coerce")
+            ).to_numpy(float)
+            dt = dt[np.isfinite(dt) & (dt > 1e-6) & (dt <= 120.0)]
+            if len(dt):
+                return float(np.median(dt))
+        except Exception:
+            pass
+    meta = rec.get("metadata") or {}
+    for key in ("epoch_sec", "time_resolution", "somnotate_epoch_sec"):
+        value = safe_float(meta.get(key), 0.0)
+        if value > 0:
+            return float(value)
+    return 1.0
+
+
+def _signal_epoch_rows_for_selection(rec: dict[str, Any], start_s: float, end_s: float) -> pd.DataFrame:
+    """Reconstruct a visual epoch grid when scoring tables have a gap.
+
+    This is only a review/navigation fallback. Labels are sampled from whichever
+    scoring layers exist; it does not create or alter scoring files.
+    """
+    duration_s = _recording_signal_duration_s(rec)
+    if duration_s <= 0 or start_s >= duration_s:
+        return pd.DataFrame()
+    end_s = min(float(end_s), duration_s)
+    if end_s <= start_s:
+        return pd.DataFrame()
+
+    epoch_s = max(0.001, _infer_review_epoch_sec(rec))
+    first = max(0.0, np.floor(float(start_s) / epoch_s) * epoch_s)
+    # Include every reconstructed epoch that overlaps the selected interval.
+    starts = np.arange(first, end_s + epoch_s, epoch_s, dtype=float)
+    rows = []
+    for t0 in starts:
+        t1 = min(float(t0 + epoch_s), duration_s)
+        if t0 < end_s and t1 > start_s and t1 > t0:
+            rows.append((t0, t1))
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows, columns=["t0_s", "t1_s"])
+    out.insert(0, "epoch_id", np.floor(out["t0_s"].to_numpy(float) / epoch_s + 1e-9).astype(int))
+    final = rec.get("final")
+    out["final_state"] = (
+        labels_at_epoch_midpoints(out, final, "final_state")
+        if final is not None else "Undefined"
+    )
+    out["review_geometry_source"] = "signal_fallback"
+    return out.reset_index(drop=True)
+
+
+def _epoch_review_empty_message(rec: dict[str, Any], selected: dict[str, Any] | None) -> str:
+    if not selected:
+        return "Select an interval in the main QC plot."
+    try:
+        start_s = float(selected.get("start_min", 0.0)) * 60.0
+        end_s = float(selected.get("end_min", selected.get("start_min", 0.0))) * 60.0
+    except Exception:
+        return "Could not interpret the selected interval."
+    duration_s = _recording_signal_duration_s(rec)
+    if duration_s > 0 and start_s >= duration_s:
+        return (
+            f"This selection starts at {_format_recording_clock(start_s)}, but the EEG/EMG arrays end at "
+            f"{_format_recording_clock(duration_s)}. No signal exists here to display."
+        )
+    if duration_s > 0 and end_s > duration_s:
+        return (
+            f"Only part of this selection has EEG/EMG data (signal ends at "
+            f"{_format_recording_clock(duration_s)}). Select an earlier interval."
+        )
+    return "No scoring epochs overlap this selection, and a signal-based review grid could not be reconstructed."
+
+
+def _format_recording_clock(seconds: float) -> str:
+    seconds = max(0.0, float(seconds or 0.0))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
+
+def make_epoch_review_figure(
+    rec: dict[str, Any], epoch_row: pd.Series, selected: dict[str, Any] | None = None
+) -> go.Figure:
+    """Create the EEG/EMG review view for the full selected interval."""
+    t0_s = float(epoch_row["t0_s"])
+    t1_s = float(epoch_row["t1_s"])
+    epoch_s = max(0.001, t1_s - t0_s)
+
+    if selected:
+        selection_start_s = float(selected.get("start_min", t0_s / 60.0)) * 60.0
+        selection_end_s = float(selected.get("end_min", t1_s / 60.0)) * 60.0
+        if selection_end_s < selection_start_s:
+            selection_start_s, selection_end_s = selection_end_s, selection_start_s
+    else:
+        selection_start_s, selection_end_s = t0_s, t1_s
+
+    # A little context keeps the boundaries readable, while the full selected
+    # interval stays on screen for the entire video playback.
+    context_s = min(1.0, epoch_s)
+    view_start_s = max(0.0, selection_start_s - context_s)
+    view_end_s = min(float(rec.get("duration_s", selection_end_s + context_s)), selection_end_s + context_s)
+    if view_end_s <= view_start_s:
+        view_start_s, view_end_s = selection_start_s, selection_end_s
+
+    eeg_t_min, eeg = downsample_npy_window(
+        rec["recording_dir"] / "eeg.npy", rec["fs"], view_start_s, view_end_s, max_points=18000
+    )
+    emg_t_min, emg = downsample_npy_window(
+        rec["recording_dir"] / "emg.npy", rec["fs"], view_start_s, view_end_s, max_points=18000
+    )
+    eeg_t_s = eeg_t_min * 60.0
+    emg_t_s = emg_t_min * 60.0
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.11,
+        subplot_titles=["EEG", "EMG"],
+        row_heights=[0.56, 0.44],
+    )
+    fig.add_trace(
+        go.Scattergl(x=eeg_t_s, y=eeg, mode="lines", line={"color": RAW_TRACE_COLOR, "width": 1}, name="EEG"),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scattergl(x=emg_t_s, y=emg, mode="lines", line={"color": RAW_TRACE_COLOR, "width": 1}, name="EMG"),
+        row=2,
+        col=1,
+    )
+
+    final_state = normalize_state_label(epoch_row.get("final_state", "Undefined"))
+    midpoint = (t0_s + t1_s) / 2.0
+    som_state = _state_at_time(rec.get("som"), "somnotate_state", midpoint)
+    manual_state = _state_at_time(rec.get("manual"), "manual_state", midpoint)
+    layer1_state = _state_at_time(rec.get("layer1"), "layer1_label", midpoint)
+    if layer1_state == "Sleep":
+        layer1_state = "Layer 1 Sleep"
+
+    highlight_state = next(
+        (x for x in [final_state, som_state, manual_state, layer1_state] if x not in {"Undefined", "Uncertain", ""}),
+        "Undefined",
+    )
+    highlight_color = STATE_COLORS.get(highlight_state, STATE_COLORS["Undefined"])
+
+    for row in (1, 2):
+        fig.add_vrect(
+            x0=t0_s,
+            x1=t1_s,
+            fillcolor=highlight_color,
+            opacity=0.14,
+            line={"color": highlight_color, "width": 2},
+            row=row,
+            col=1,
+        )
+
+    # One browser-only tracer across both panels.  Dash/Python never updates
+    # this line while video is playing; JavaScript moves only x0/x1.
+    fig.add_shape(
+        type="line",
+        x0=selection_start_s,
+        x1=selection_start_s,
+        y0=0,
+        y1=1,
+        xref="x",
+        yref="paper",
+        line={"color": "#d62728", "width": 2.5},
+        name="video_playhead",
+        layer="above",
+    )
+
+    # Keep the signal panel deliberately simple: the current scoring epoch is
+    # indicated by the shaded rectangle above.  The video can play continuously,
+    # but the EEG/EMG panel changes only when the user presses Prev/Next/Replay.
+
+    eeg_range = robust_range(eeg)
+    emg_range = robust_range(emg)
+    if eeg_range:
+        fig.update_yaxes(range=eeg_range, row=1, col=1)
+    if emg_range:
+        fig.update_yaxes(range=emg_range, row=2, col=1)
+
+    fig.update_xaxes(range=[view_start_s, view_end_s], row=1, col=1)
+    fig.update_xaxes(range=[view_start_s, view_end_s], title_text="Recording time (s)", row=2, col=1)
+    fig.update_layout(
+        height=330,
+        margin={"l": 52, "r": 18, "t": 42, "b": 44},
+        showlegend=False,
+        hovermode="x unified",
+        uirevision=f"epoch-review-{epoch_row.get('epoch_id', t0_s)}",
+    )
+    return fig
+
+
+def epoch_review_summary(rec: dict[str, Any], epoch_row: pd.Series, position: int, count: int):
+    t0_s = float(epoch_row["t0_s"])
+    t1_s = float(epoch_row["t1_s"])
+    midpoint = (t0_s + t1_s) / 2.0
+    final_state = normalize_state_label(epoch_row.get("final_state", "Undefined"))
+    som_state = _state_at_time(rec.get("som"), "somnotate_state", midpoint)
+    manual_state = _state_at_time(rec.get("manual"), "manual_state", midpoint)
+    layer1_state = _state_at_time(rec.get("layer1"), "layer1_label", midpoint)
+    if layer1_state == "Sleep":
+        layer1_state = "Layer 1 Sleep"
+
+    def badge(label: str, value: str):
+        color = STATE_COLORS.get(value, STATE_COLORS["Undefined"])
+        return html.Span(
+            [html.Span(f"{label}: ", style={"fontWeight": "600"}), html.Span(value)],
+            style={
+                "display": "inline-block",
+                "padding": "4px 8px",
+                "margin": "2px 4px 2px 0",
+                "borderRadius": "999px",
+                "border": f"1px solid {color}",
+                "background": color + "18" if str(color).startswith("#") else "transparent",
+            },
+        )
+
+    return html.Div([
+        html.Div(
+            f"Epoch {position + 1} of {count} · ID {epoch_row.get('epoch_id', position)} · "
+            f"{_format_recording_clock(t0_s)}–{_format_recording_clock(t1_s)} "
+            f"({t1_s - t0_s:.3f} s)",
+            style={"fontWeight": "700", "marginBottom": "5px"},
+        ),
+        html.Div([
+            badge("Final", final_state),
+            badge("Somnotate", som_state),
+            badge("Manual", manual_state),
+            badge("L1", layer1_state),
+        ]),
+    ])
+
+
 def load_video_metadata(project_root: str | Path | None, recording_id: str | None) -> tuple[str, float]:
     if not project_root or not recording_id:
         return "", 0.0
     try:
         rd = recording_dir_from_manifest(project_root, recording_id)
         meta = read_json(rd / "metadata.json")
-        return str(meta.get("video_file", "") or ""), float(meta.get("video_offset_s", 0.0) or 0.0)
+        # ``video_file`` is the preferred browser-playback path.  Older metadata
+        # or interrupted conversions may only contain ``video_source_file``.
+        video_file = str(meta.get("video_file", "") or meta.get("video_source_file", "") or "").strip()
+        return video_file, float(meta.get("video_offset_s", 0.0) or 0.0)
     except Exception:
         return "", 0.0
 
@@ -365,20 +1146,30 @@ def save_video_metadata(project_root: str | Path, recording_id: str, video_file:
         meta_path = rd / "metadata.json"
         meta = read_json(meta_path)
         video_file = str(video_file or "").strip()
+
+        # Never silently erase a valid per-recording video because a dynamic Dash
+        # input briefly reported an empty value while the tab was re-rendering.
+        if not video_file:
+            existing = str(meta.get("video_file", "") or meta.get("video_source_file", "") or "").strip()
+            if existing:
+                return False, f"No video path was received; kept the existing saved video:\n{existing}"
+            return False, "Video path is empty. Paste the full local/network path before clicking Save video."
+
         meta["video_file"] = video_file
         meta["video_offset_s"] = float(video_offset_s or 0.0)
         write_json(meta_path, meta)
 
-        if video_file and not Path(video_file).expanduser().exists():
-            return True, f"Saved video settings, but file does not exist: {video_file}"
-        return True, f"Saved video settings. {video_format_message(video_file)}"
+        source = Path(video_file).expanduser()
+        if not source.exists():
+            return True, f"Saved video settings, but Python cannot currently access this file:\n{video_file}"
+        return True, f"Saved video settings for {recording_id}:\n{video_file}\n{video_format_message(video_file)}"
     except Exception as e:
         return False, f"Could not save video settings: {type(e).__name__}: {e}"
 
 
 def browser_mp4_path_for_avi(avi_path: Path) -> Path:
-    """Return the deterministic local MP4 path stored beside an AVI file."""
-    return avi_path.with_name(f"{avi_path.stem}_browser.mp4")
+    """Backward-compatible alias for the generic browser-copy naming helper."""
+    return browser_mp4_path_for_video(avi_path)
 
 
 def save_video_source_metadata(
@@ -395,44 +1186,44 @@ def save_video_source_metadata(
         meta["video_source_file"] = str(Path(source_video_file).expanduser().resolve())
         meta["video_file"] = str(Path(browser_video_file).expanduser().resolve())
         meta["video_conversion"] = {
-            "format": "mp4_h264",
+            "format": "mp4_h264_yuv420p",
             "storage": "local_beside_source",
         }
         write_json(meta_path, meta)
-        return True, "Saved the original AVI and local browser MP4 paths in metadata.json."
+        return True, "Saved the source video and browser-compatible MP4 paths in metadata.json."
     except Exception as e:
         return False, f"Could not save video conversion metadata: {type(e).__name__}: {e}"
 
 
-def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str | None]:
-    """Convert AVI to a browser-compatible MP4 beside the original file.
+def convert_video_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str | None]:
+    """Create an H.264/yuv420p MP4 that is reliable in Chrome/Edge/Safari.
 
-    The original AVI remains untouched. The converted file is stored locally as
-    ``<original_stem>_browser.mp4``. Existing up-to-date conversions are reused.
-    Returns ``(ok, message, output_path)``.
+    This works for AVI, MOV and MP4 sources, including MP4 files encoded with
+    codecs such as MPEG-4 Part 2 (``mp4v``) that can produce a black HTML5 video
+    element even though the browser can read the duration.  The source file is
+    never modified.
     """
     raw = str(video_file or "").strip()
     if not raw:
-        return False, "Choose an AVI file first.", None
+        return False, "Choose a video file first.", None
 
-    avi_path = Path(raw).expanduser().resolve()
-    if not avi_path.exists() or not avi_path.is_file():
-        return False, f"AVI file not found: {avi_path}", None
+    source = Path(raw).expanduser().resolve()
+    if not source.exists() or not source.is_file():
+        return False, f"Video file not found: {source}", None
 
-    if avi_path.suffix.lower() != ".avi":
-        return False, "Local conversion is only required for .avi files.", None
+    if source.name.lower().endswith("_browser.mp4"):
+        info = _ffprobe_video_info(source)
+        if str(info.get("codec_name", "")).lower() == "h264":
+            return True, f"This is already a browser-compatible MP4:\n{source}", str(source)
 
-    out_path = browser_mp4_path_for_avi(avi_path)
+    out_path = browser_mp4_path_for_video(source)
 
-    # Reuse the local conversion when it is at least as new as the source AVI.
     if out_path.exists() and out_path.stat().st_size > 0:
         try:
-            if out_path.stat().st_mtime >= avi_path.stat().st_mtime:
-                return (
-                    True,
-                    f"Reusing existing local browser video:\n{out_path}",
-                    str(out_path),
-                )
+            if out_path.stat().st_mtime >= source.stat().st_mtime:
+                info = _ffprobe_video_info(out_path)
+                if not info or str(info.get("codec_name", "")).lower() == "h264":
+                    return True, f"Reusing existing browser-compatible MP4:\n{out_path}", str(out_path)
         except OSError:
             pass
 
@@ -440,16 +1231,14 @@ def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str |
     if not ffmpeg:
         return (
             False,
-            "FFmpeg was not found in the active environment. Run: "
-            "conda env update -f environment.yml --prune, then reactivate "
-            "sleep_stage_qc_v2.",
+            "FFmpeg was not found in the active environment. Update the app environment from environment.yml and reactivate sleep_stage_qc_v2.",
             None,
         )
 
     cmd = [
         ffmpeg,
         "-y",
-        "-i", str(avi_path),
+        "-i", str(source),
         "-map", "0:v:0",
         "-an",
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
@@ -462,12 +1251,12 @@ def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str |
     ]
 
     try:
-        p = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="replace")
+        result = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="replace")
     except Exception as e:
         return False, f"Could not run FFmpeg: {type(e).__name__}: {e}", None
 
-    if p.returncode != 0:
-        err = (p.stderr or p.stdout or "").strip()
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
         if len(err) > 3500:
             err = err[-3500:]
         return False, f"FFmpeg conversion failed. Terminal output:\n{err}", None
@@ -475,13 +1264,20 @@ def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str |
     if not out_path.exists() or out_path.stat().st_size == 0:
         return False, f"FFmpeg finished but no usable MP4 was created: {out_path}", None
 
+    info = _ffprobe_video_info(out_path)
+    codec = str(info.get("codec_name", "") or "").lower()
+    pix_fmt = str(info.get("pix_fmt", "") or "").lower()
     return (
         True,
-        "Converted AVI locally. The original AVI was not changed.\n"
-        f"Browser MP4: {out_path}",
+        "Created browser-compatible H.264 MP4. The original video was not changed.\n"
+        f"Browser MP4: {out_path}\nCodec: {codec or 'h264'} / {pix_fmt or 'yuv420p'}",
         str(out_path),
     )
 
+
+def convert_avi_to_browser_mp4(video_file: str | Path) -> tuple[bool, str, str | None]:
+    """Compatibility wrapper retained for older callbacks/tests."""
+    return convert_video_to_browser_mp4(video_file)
 
 
 def safe_float(x, default=0.0) -> float:
@@ -628,6 +1424,40 @@ def available_recordings(project_root: str | Path | None) -> list[dict[str, str]
     return [{"label": str(x), "value": str(x)} for x in manifest["recording_id"].astype(str).tolist()]
 
 
+def somnotate_recording_options(project_root: str | Path | None, *, require_manual: bool = False) -> list[dict[str, Any]]:
+    """Build user-friendly Somnotate recording choices with readiness checks.
+
+    Every manifest recording is shown, but entries that cannot currently be used
+    are disabled with a reason in the label. This avoids launching a long
+    Somnotate command only to fail later because a copied/moved recording is
+    missing prepared files or manual scoring.
+    """
+    options: list[dict[str, Any]] = []
+    for item in available_recordings(project_root):
+        recording_id = str(item["value"])
+        label = recording_id
+        disabled = False
+        try:
+            rec_dir = recording_dir_from_manifest(project_root, recording_id)
+            required = ["metadata.json", "eeg.npy", "emg.npy"]
+            missing = [name for name in required if not (rec_dir / name).exists()]
+            if missing:
+                disabled = True
+                label = f"{recording_id} — not prepared ({', '.join(missing)} missing)"
+            elif require_manual and not (rec_dir / "manual_scoring_aligned.csv").exists():
+                disabled = True
+                label = f"{recording_id} — no manual scoring"
+            elif require_manual:
+                label = f"{recording_id} — ready for model QC"
+            else:
+                label = f"{recording_id} — ready"
+        except Exception:
+            disabled = True
+            label = f"{recording_id} — recording path unavailable"
+        options.append({"label": label, "value": recording_id, "disabled": disabled})
+    return options
+
+
 def _model_metadata(model_path: Path) -> dict[str, Any]:
     candidates = [model_path.with_suffix(".metadata.json"), model_path.with_name(model_path.name + ".metadata.json")]
     for meta_path in candidates:
@@ -675,6 +1505,229 @@ def available_models(project_root: str | Path | None = None) -> list[dict[str, s
             label = "  —  ".join(bits)
             models.append({"label": label, "value": str(p)})
     return models
+
+
+def model_quality_path(model_path: str | Path) -> Path:
+    return Path(model_path).expanduser().with_suffix(".quality.json")
+
+
+def available_quality_reports(project_root: str | Path | None = None) -> list[dict[str, str]]:
+    """Return saved model-QC reports from trained models and explicit evaluations."""
+    candidates: list[Path] = []
+    for item in available_models(project_root):
+        quality = model_quality_path(item["value"])
+        if quality.exists():
+            candidates.append(quality)
+
+    if project_root:
+        qc_dir = Path(project_root).expanduser() / "somnotate_model_qc"
+        if qc_dir.exists():
+            candidates.extend(qc_dir.glob("*.quality.json"))
+
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for report_path in candidates:
+        key = str(report_path.resolve()) if report_path.exists() else str(report_path)
+        if key in seen or not report_path.exists():
+            continue
+        seen.add(key)
+        try:
+            report = read_json(report_path)
+        except Exception:
+            report = {}
+        model_name = Path(str(report.get("model_file") or report_path.stem)).name
+        report_type = str(report.get("report_type") or "training-qc")
+        if report_type == "existing-model-evaluation":
+            context = str(report.get("evaluation_context") or "evaluation")
+            context_label = "independent validation" if context == "independent-validation" else "training/unknown data"
+            label = f"{model_name} — evaluation ({context_label})"
+        else:
+            label = f"{model_name} — training QC"
+        try:
+            stamp = report_path.stat().st_mtime
+        except Exception:
+            stamp = 0.0
+        out.append({"label": label, "value": str(report_path), "_mtime": stamp})
+
+    out.sort(key=lambda x: x.get("_mtime", 0.0), reverse=True)
+    return [{"label": x["label"], "value": x["value"]} for x in out]
+
+
+def _pct_text(value) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{100.0 * float(value):.1f}%"
+    except Exception:
+        return "n/a"
+
+
+def _quality_metric_card(label: str, value: str, note: str = ""):
+    return html.Div(
+        style={
+            "border": "1px solid #d7dce3",
+            "borderRadius": "8px",
+            "padding": "10px 12px",
+            "minWidth": "150px",
+            "background": "rgba(255,255,255,0.6)",
+        },
+        children=[
+            html.Div(label, style={"fontSize": "12px", "fontWeight": "700", "opacity": 0.75}),
+            html.Div(value, style={"fontSize": "22px", "fontWeight": "700", "marginTop": "2px"}),
+            html.Div(note, style={"fontSize": "11px", "opacity": 0.7, "marginTop": "2px"}) if note else None,
+        ],
+    )
+
+
+def render_quality_evaluation(block: dict[str, Any] | None, title: str):
+    if not block:
+        return html.Div([html.H5(title), html.Div("Not available for this report.", className="status-line")])
+
+    cards = html.Div(
+        style={"display": "flex", "gap": "8px", "flexWrap": "wrap", "marginBottom": "10px"},
+        children=[
+            _quality_metric_card("Mean accuracy", _pct_text(block.get("mean_accuracy")), f"{block.get('n_recordings', 0)} recordings"),
+            _quality_metric_card("Worst recording", _pct_text(block.get("worst_accuracy")), "check animal-to-animal robustness"),
+            _quality_metric_card("Balanced accuracy", _pct_text(block.get("balanced_accuracy")), "mean Wake/NREM/REM recall"),
+            _quality_metric_card("Macro F1", _pct_text(block.get("macro_f1")), "equal weight to Wake/NREM/REM"),
+        ],
+    )
+
+    per_state = pd.DataFrame(block.get("per_state", []))
+    state_table = html.Div()
+    if len(per_state):
+        rows = []
+        for _, row in per_state.iterrows():
+            rows.append(
+                html.Tr([
+                    html.Td(str(row.get("state", ""))),
+                    html.Td(_pct_text(row.get("precision"))),
+                    html.Td(_pct_text(row.get("recall"))),
+                    html.Td(_pct_text(row.get("f1"))),
+                    html.Td(str(int(row.get("support", 0)))),
+                ])
+            )
+        state_table = html.Table(
+            style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"},
+            children=[
+                html.Thead(html.Tr([html.Th("State"), html.Th("Precision"), html.Th("Recall"), html.Th("F1"), html.Th("Epochs")])),
+                html.Tbody(rows),
+            ],
+        )
+
+    rec_df = pd.DataFrame(block.get("per_recording", []))
+    rec_table = html.Div()
+    if len(rec_df):
+        rec_table = dash_table.DataTable(
+            data=[{"recording_id": str(r["recording_id"]), "accuracy": _pct_text(r["accuracy"])} for _, r in rec_df.iterrows()],
+            columns=[{"name": "Recording", "id": "recording_id"}, {"name": "Accuracy", "id": "accuracy"}],
+            page_size=min(10, len(rec_df)),
+            sort_action="native",
+            style_table={"overflowX": "auto"},
+            style_cell={"fontSize": "12px", "padding": "5px", "textAlign": "left"},
+        )
+
+    labels = block.get("confusion_labels", [])
+    matrix = block.get("confusion_matrix", [])
+    confusion = html.Div()
+    if labels and matrix:
+        z = np.asarray(matrix, dtype=float)
+        fig = go.Figure(
+            data=go.Heatmap(
+                z=z,
+                x=labels,
+                y=labels,
+                text=z.astype(int),
+                texttemplate="%{text}",
+                showscale=False,
+                hovertemplate="Manual %{y}<br>Predicted %{x}<br>Epochs %{z}<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            title="Confusion matrix",
+            xaxis_title="Predicted",
+            yaxis_title="Manual",
+            height=330,
+            margin=dict(l=60, r=20, t=55, b=55),
+            template="plotly_white",
+        )
+        confusion = dcc.Graph(figure=fig, config={"displayModeBar": False})
+
+    return html.Div(
+        style={"marginTop": "12px"},
+        children=[
+            html.H5(title),
+            cards,
+            html.Div(
+                style={"display": "grid", "gridTemplateColumns": "minmax(300px, 1fr) minmax(300px, 1fr)", "gap": "14px"},
+                children=[
+                    html.Div([html.B("Per-state performance"), state_table]),
+                    html.Div([html.B("Per-recording performance"), rec_table]),
+                ],
+            ),
+            confusion,
+        ],
+    )
+
+
+def render_model_quality_report(report_file: str | Path | None):
+    if not report_file:
+        return html.Div("No saved model-quality report selected yet.", className="status-line")
+    report_path = Path(str(report_file)).expanduser()
+    if not report_path.exists():
+        return html.Div(f"Quality report not found: {report_path}", className="status-line")
+    try:
+        report = read_json(report_path)
+    except Exception as exc:
+        return html.Div(f"Could not read quality report: {type(exc).__name__}: {exc}", className="status-line")
+
+    model = Path(str(report.get("model_file") or "unknown_model"))
+    report_type = str(report.get("report_type") or "training-qc")
+    context = str(report.get("evaluation_context") or "")
+    if report_type == "existing-model-evaluation":
+        if context == "independent-validation":
+            evidence = html.Div(
+                "Independent validation: these recordings were declared not to have been used for training. This is the most informative simple evaluation of a fixed model.",
+                className="status-line",
+                style={"marginTop": "8px", "fontWeight": "600"},
+            )
+        else:
+            evidence = html.Div(
+                "Training/unknown-data evaluation: these scores are descriptive and may be optimistic. They should not be presented as independent validation unless the recordings were genuinely held out from training.",
+                className="status-line",
+                style={"marginTop": "8px", "fontWeight": "600"},
+            )
+        evaluations = [render_quality_evaluation(report.get("evaluation"), "Existing-model evaluation")]
+    else:
+        evidence = html.Div(
+            "Training QC: recording-level cross-validation estimates generalization within the supplied training cohort. Independent held-out recordings provide stronger confirmation when available.",
+            className="status-line",
+            style={"marginTop": "8px"},
+        )
+        evaluations = [
+            render_quality_evaluation(report.get("cross_validation"), "Leave-one-recording-out cross-validation"),
+            render_quality_evaluation(report.get("heldout_test"), "Independent held-out test recordings"),
+        ]
+
+    guidance = report.get("guidance", [])
+    return html.Div(
+        children=[
+            html.Div([html.B("Model: "), html.Span(model.name)]),
+            html.Div([html.B("QC report: "), html.Span(str(report_path))], style={"fontSize": "12px", "opacity": 0.8}),
+            evidence,
+            *evaluations,
+            html.Div(
+                className="status-line",
+                style={"marginTop": "12px", "whiteSpace": "normal"},
+                children=[
+                    html.B("How to judge the model"),
+                    html.Ul([html.Li(str(x)) for x in guidance]) if guidance else html.Div(
+                        "Inspect recording-level performance and Wake/NREM/REM metrics; do not rely on overall accuracy alone."
+                    ),
+                ],
+            ),
+        ]
+    )
 
 
 def state_display_codes(labels: list[str] | np.ndarray, row_name: str = "") -> np.ndarray:
@@ -1781,7 +2834,15 @@ def serve_local_video():
         ".avi": "video/x-msvideo",
     }.get(suffix, "application/octet-stream")
 
-    return send_file(path, mimetype=mimetype, conditional=True, as_attachment=False)
+    response = send_file(path, mimetype=mimetype, conditional=True, as_attachment=False)
+    # Explicitly advertise byte ranges because HTML5 video seeking depends on
+    # them, especially for large recordings on mapped/network drives.
+    response.headers.setdefault("Accept-Ranges", "bytes")
+    # The URL contains the file mtime, so it is safe (and much faster for large
+    # network videos) to let the browser cache byte ranges. A changed/reconverted
+    # file receives a different URL automatically.
+    response.headers["Cache-Control"] = "private, max-age=86400"
+    return response
 
 
 app.layout = html.Div(
@@ -1913,14 +2974,27 @@ dcc.Graph(id="qc-graph"),
     html.Button(id="jump-video-window"), html.Button(id="jump-video-selected"), html.Button(id="convert-video-mp4"),
     html.Div(id="video-status"), html.Div(id="video-player-container"),
     dcc.Store(id="video-seek-store"), html.Div(id="video-seek-feedback"),
+    html.Div(id="epoch-review-panel"), dcc.Graph(id="epoch-review-graph"),
+    html.Button(id="epoch-review-prev"), html.Button(id="epoch-review-play-selection"),
+    html.Button(id="epoch-review-pause"), html.Button(id="epoch-review-replay"), html.Button(id="epoch-review-next"),
+    html.Div(id="epoch-review-summary"), html.Div(id="epoch-review-live-position"),
+    html.Div(id="epoch-review-video-container"), html.Div(id="epoch-review-cache-status"),
+    html.Div(id="epoch-review-video-feedback"), html.Div(id="epoch-review-video-diagnostics"),
+    dcc.Store(id="epoch-review-index-store"), dcc.Store(id="epoch-review-clip-store"),
+    dcc.Store(id="epoch-review-seek-store"), dcc.Store(id="epoch-review-playback-command-store"),
+    dcc.Store(id="epoch-review-playback-time-store"), dcc.Store(id="epoch-review-rendered-position-store"),
+    dcc.Interval(id="epoch-review-clock"), dcc.Interval(id="epoch-review-playhead-clock"),
+    html.Button(id="clear-video-review-cache"),
 
     # Somnotate tab
     PInput(id="som-recording-ids"), PInput(id="som-target-fs"), PDropdown(id="som-epoch-sec"), PInput(id="som-root"),
-    PInput(id="som-conda-env"), PInput(id="som-python"), PDropdown(id="som-model-file"),
+    PInput(id="som-conda-env"), PInput(id="som-python"), PDropdown(id="som-model-file"), PInput(id="som-model-file-custom"),
     html.Div(id="som-epoch-warning"), html.Div(id="som-existing-epoch-summary"), html.Div(id="som-train-epoch-summary"),
     dcc.Checklist(id="som-existing-steps"), html.Button(id="btn-som-existing"),
+    PInput(id="som-eval-ids"), PDropdown(id="som-eval-context"), dcc.Checklist(id="som-eval-steps"), html.Button(id="btn-som-evaluate"),
     PInput(id="som-train-ids"), PInput(id="som-test-ids"), PInput(id="som-model-name"),
     dcc.Checklist(id="som-train-steps"), html.Button(id="btn-som-train"), html.Button(id="btn-som-import-results"),
+    PDropdown(id="som-qc-report-file"), html.Div(id="som-model-qc"),
     html.Div(id="som-action-status"), html.Pre(id="som-log"),
 
     # Dissociation tab
@@ -2058,18 +3132,103 @@ def render_tab(tab, project_root, _refresh):
                     html.Button("5 min ▶", id="forward-5"), html.Button("15 min ▶", id="forward-15"),
                 ]),
 
-                html.Div(id="empty-qc-message", children=[html.H4("No recording loaded yet"), html.P("Load a project and choose a recording first.")], className="empty-panel"),
-                dcc.Graph(id="qc-graph", style={"display":"none"}, config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["select2d", "pan2d", "zoom2d", "resetScale2d"]}),
-                html.Div("Tip: use mouse wheel / trackpad scroll over the QC plot to zoom; press P to pan and S to select scoring windows.", className="app-subtitle", style={"marginTop": "4px"}),
-                html.Div(id="selected-interval-label", className="status-line"),
-
-                html.H4("Apply source to whole visible window"),
-                html.Div(style={"display":"grid", "gridTemplateColumns":"repeat(3, 1fr)", "gap":"6px", "marginBottom":"6px"}, children=[
-                    html.Button("Apply Somnotate to visible window", id="score-window-somnotate"),
-                    html.Button("Apply Layer 1 to visible window", id="score-window-layer1"),
-                    html.Button("Apply Manual to visible window", id="score-window-manual"),
+                html.Div(className="qc-plot-with-actions", children=[
+                    html.Div(className="qc-plot-main", children=[
+                        html.Div(id="empty-qc-message", children=[html.H4("No recording loaded yet"), html.P("Load a project and choose a recording first.")], className="empty-panel"),
+                        dcc.Graph(id="qc-graph", style={"display":"none"}, config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["select2d", "pan2d", "zoom2d", "resetScale2d"]}),
+                        html.Div("Tip: use mouse wheel / trackpad scroll over the QC plot to zoom; press P to pan and S to select scoring windows.", className="app-subtitle", style={"marginTop": "4px"}),
+                        html.Div(id="selected-interval-label", className="status-line"),
+                    ]),
+                    html.Div(className="qc-window-actions", children=[
+                        html.Div("Apply", className="qc-window-actions-title"),
+                        html.Div("visible window", className="qc-window-actions-subtitle"),
+                        html.Button(
+                            "Somnotate",
+                            id="score-window-somnotate",
+                            title="Apply Somnotate scoring to the whole visible window",
+                        ),
+                        html.Button(
+                            "L1",
+                            id="score-window-layer1",
+                            title="Apply Layer 1 scoring to the whole visible window",
+                        ),
+                        html.Button(
+                            "Manual",
+                            id="score-window-manual",
+                            title="Apply manual scoring to the whole visible window",
+                        ),
+                    ]),
                 ]),
                 html.Div(id="score-status", className="status-line", style={"whiteSpace":"pre-wrap", "marginBottom":"12px"}),
+
+                html.Div(
+                    id="epoch-review-panel",
+                    style={"display": "none"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between", "gap": "12px", "alignItems": "flex-start", "flexWrap": "wrap"},
+                            children=[
+                                html.Div([
+                                    html.H4("Synchronized epoch review", style={"margin": "0 0 3px 0"}),
+                                    html.Div(
+                                        "Select an interval in the main QC plot. The video plays the selection; use Prev/Next to inspect EEG/EMG one scoring epoch at a time.",
+                                        className="app-subtitle",
+                                    ),
+                                ], style={"flex": "1 1 520px"}),
+                                html.Div(
+                                    style={"display": "flex", "gap": "6px", "alignItems": "center", "flexWrap": "wrap"},
+                                    children=[
+                                        html.Button("◀ Epoch", id="epoch-review-prev", n_clicks=0, title="Previous scoring epoch"),
+                                        html.Button("▶ Play selection", id="epoch-review-play-selection", n_clicks=0, title="Play the selected video interval"),
+                                        html.Button("⏸ Pause", id="epoch-review-pause", n_clicks=0, title="Pause synchronized playback"),
+                                        html.Button("↻ Replay epoch", id="epoch-review-replay", n_clicks=0, title="Replay only the current scoring epoch"),
+                                        html.Button("Epoch ▶", id="epoch-review-next", n_clicks=0, title="Next scoring epoch"),
+                                    ],
+                                ),
+                            ],
+                        ),
+                        html.Div(id="epoch-review-summary", style={"margin": "9px 0 4px 0"}),
+                        html.Div(
+                            id="epoch-review-live-position",
+                            children="Video: waiting for short local QC clip…",
+                            className="app-subtitle",
+                            style={"margin": "0 0 8px 0", "fontVariantNumeric": "tabular-nums"},
+                        ),
+                        html.Div(
+                            style={"display": "flex", "gap": "12px", "alignItems": "stretch", "flexWrap": "wrap"},
+                            children=[
+                                html.Div(
+                                    dcc.Graph(
+                                        id="epoch-review-graph",
+                                        config={"displayModeBar": False, "scrollZoom": False, "displaylogo": False},
+                                        style={"height": "360px"},
+                                    ),
+                                    style={"flex": "1 1 48%", "minWidth": "420px"},
+                                ),
+                                html.Div(
+                                    [
+                                        dcc.Loading(type="circle", children=html.Div(id="epoch-review-video-container")),
+                                        html.Div(id="epoch-review-cache-status", className="status-line", style={"marginTop": "5px", "whiteSpace": "pre-wrap"}),
+                                        html.Div(id="epoch-review-video-feedback", className="status-line", style={"marginTop": "5px"}),
+                                        html.Div(id="epoch-review-video-diagnostics", className="app-subtitle", style={"marginTop": "3px"}),
+                                    ],
+                                    style={"flex": "1 1 48%", "minWidth": "360px"},
+                                ),
+                            ],
+                        ),
+                        dcc.Store(id="epoch-review-index-store"),
+                        dcc.Store(id="epoch-review-clip-store"),
+                        dcc.Store(id="epoch-review-seek-store"),
+                        dcc.Store(id="epoch-review-playback-command-store"),
+                        dcc.Store(id="epoch-review-playback-time-store"),
+                        dcc.Store(id="epoch-review-rendered-position-store"),
+                        html.Div(id="epoch-review-playhead-dummy", style={"display": "none"}),
+                        dcc.Interval(id="epoch-review-clock", interval=200, n_intervals=0),
+                        # This faster clock is client-side only: it moves the
+                        # Plotly playhead without re-rendering signal data.
+                        dcc.Interval(id="epoch-review-playhead-clock", interval=100, n_intervals=0),
+                    ],
+                ),
 
                 html.Div(className="video-qc-card", children=[
                     html.H4("Video QC"),
@@ -2090,12 +3249,13 @@ def render_tab(tab, project_root, _refresh):
                         children=[
                             html.Button("Jump video to window start", id="jump-video-window", n_clicks=0),
                             html.Button("Play selected video interval", id="jump-video-selected", n_clicks=0),
-                            html.Button("Convert AVI locally to browser MP4", id="convert-video-mp4", n_clicks=0),
+                            html.Button("Make full browser MP4 (optional)", id="convert-video-mp4", n_clicks=0, title="Optional full-video conversion. Synchronized review normally uses short local QC clips instead."),
+                            html.Button("Clear local review cache", id="clear-video-review-cache", n_clicks=0, title="Delete short local QC clips for this recording"),
                             dcc.Loading(type="circle", children=html.Div(id="video-status", className="status-line")),
                         ],
                     ),
                     html.Div(
-                        "Conversion runs locally on this computer. The original AVI stays unchanged, and the browser-compatible MP4 is saved beside it as <name>_browser.mp4. Existing conversions are reused.",
+                        "Synchronized epoch review automatically creates short, seek-friendly local QC clips from the selected interval, so a 10-hour source video does not need a full 30-minute transcode. The original video can stay on a network drive or local disk. Full-video conversion below is optional and mainly useful for the standalone player.",
                         className="app-subtitle",
                         style={"marginTop": "6px"},
                     ),
@@ -2103,9 +3263,9 @@ def render_tab(tab, project_root, _refresh):
                     dcc.Store(id="video-seek-store"),
                     html.Div(id="video-seek-feedback", className="status-line"),
                     html.Details(children=[
-                        html.Summary("How local AVI conversion works"),
+                        html.Summary("How browser-compatible conversion works"),
                         html.Div(
-                            "If your .avi file is not loading in this browser, click “Convert AVI locally to browser MP4” above. You can also do the same conversion manually in Terminal with this command. Replace videoname.avi and videoname.mp4 with your real file names or full paths.",
+                            "For synchronized review, the app re-encodes only a short selected region into the local cache with H.264 and one-second keyframes. If you need the standalone full-video player to be browser-compatible, use the optional full-video conversion above.",
                             className="app-subtitle",
                             style={"marginTop": "6px", "marginBottom": "6px"},
                         ),
@@ -2144,67 +3304,244 @@ def render_tab(tab, project_root, _refresh):
 
     if tab == "tab-somnotate":
         models = available_models(project_root)
+        quality_reports = available_quality_reports(project_root)
+        som_recording_options = somnotate_recording_options(project_root, require_manual=False)
+        som_manual_options = somnotate_recording_options(project_root, require_manual=True)
+        ready_score_ids = [str(o["value"]) for o in som_recording_options if not o.get("disabled")]
+        section_style = {
+            "border": "1px solid #d7dce3",
+            "borderRadius": "10px",
+            "padding": "14px",
+            "marginTop": "14px",
+        }
+        helper_style = {"fontSize": "12px", "opacity": 0.78, "marginTop": "4px", "lineHeight": "1.4"}
         return html.Div(className="card", children=[
             html.H3("Somnotate"),
             html.Div(
-                f"These buttons call the external Somnotate pipeline in a separate environment. Tested upstream: Somnotate {TESTED_SOMNOTATE_VERSION} at commit {TESTED_SOMNOTATE_COMMIT[:7]}. The app modifies only a temporary pipeline copy.",
+                "Score recordings with an existing model, evaluate an already-trained model against manual scoring, or train a new model with recording-level quality control.",
                 className="app-subtitle",
             ),
-            html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"10px"}, children=[
-                html.Div([html.Label("Recording IDs, comma-separated"), PInput(id="som-recording-ids", type="text", value=",".join([o["value"] for o in rec_options[:1]]), style={"width":"100%"})]),
-                html.Div([html.Label("Target fs"), PInput(id="som-target-fs", type="number", value=512.0, style={"width":"100%"})]),
-                html.Div([html.Label("Somnotate epoch sec — applies to scoring and training"), PDropdown(
-                    id="som-epoch-sec",
-                    options=[
-                        {"label": "1 s epochs", "value": "1.0"},
-                        {"label": "2 s epochs", "value": "2.0"},
-                        {"label": "5 s epochs (legacy Somnotate models)", "value": "5.0"},
-                    ],
-                    value="5.0",
-                    clearable=False,
-                    style={"width":"100%"},
-                )]),
-                html.Div([html.Label("Somnotate repository path"), PInput(id="som-root", type="text", value=DEFAULT_SOMNOTATE_ROOT, placeholder=str(Path.home() / "somnotate"), style={"width":"100%"})]),
-                html.Div([html.Label("Somnotate conda env"), PInput(id="som-conda-env", type="text", value="somnotate_env", style={"width":"100%"})]),
-                html.Div([html.Label("Optional Somnotate Python executable"), PInput(id="som-python", type="text", style={"width":"100%"})]),
-                html.Div([html.Label("Existing model"), PDropdown(id="som-model-file", options=models, value=models[0]["value"] if models else None)]),
-            ]),
             html.Div(
-                id="som-epoch-warning",
-                className="status-line",
-                style={"whiteSpace": "pre-wrap", "marginTop": "8px"},
-                children=(
-                    "Somnotate epoch warning: models are epoch-length specific. "
-                    "Use models with the same epoch length used for preprocessing/training. For example: 1 s models with 1 s epochs, 2 s models with 2 s epochs, and legacy 5 s Somnotate models with 5 s epochs. "
-                    "The app saves metadata for newly trained models and blocks known mismatches."
+                f"Tested upstream: Somnotate {TESTED_SOMNOTATE_VERSION} at commit {TESTED_SOMNOTATE_COMMIT[:7]}. The app modifies only a temporary pipeline copy.",
+                style={"fontSize":"12px", "opacity":0.72, "marginTop":"4px"},
+            ),
+
+            html.Div(style=section_style, children=[
+                html.H4("Somnotate setup", style={"marginTop":"0"}),
+                html.Div("These settings are shared by scoring, evaluation and training.", className="app-subtitle"),
+                html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"10px", "marginTop":"10px"}, children=[
+                    html.Div([html.Label("Target sampling rate (Hz)"), PInput(id="som-target-fs", type="number", value=512.0, style={"width":"100%"})]),
+                    html.Div([html.Label("Somnotate epoch length"), PDropdown(
+                        id="som-epoch-sec",
+                        options=[
+                            {"label": "1 s epochs", "value": "1.0"},
+                            {"label": "2 s epochs", "value": "2.0"},
+                            {"label": "5 s epochs (legacy models)", "value": "5.0"},
+                        ],
+                        value="5.0",
+                        clearable=False,
+                        style={"width":"100%"},
+                    )]),
+                    html.Div([html.Label("Somnotate repository"), PInput(id="som-root", type="text", value=DEFAULT_SOMNOTATE_ROOT, placeholder=str(Path.home() / "somnotate"), style={"width":"100%"})]),
+                    html.Div([html.Label("Somnotate Conda environment"), PInput(id="som-conda-env", type="text", value="somnotate_env", style={"width":"100%"})]),
+                    html.Div(style={"gridColumn":"1 / -1"}, children=[
+                        html.Label("Optional Somnotate Python executable"),
+                        PInput(id="som-python", type="text", style={"width":"100%"}),
+                        html.Div("Usually leave this empty; the app resolves the Conda environment automatically.", style=helper_style),
+                    ]),
+                ]),
+            ]),
+
+            html.Div(style=section_style, children=[
+                html.H4("Existing model", style={"marginTop":"0"}),
+                html.Div("Select one model here. The same model is used by both Score and Evaluate below.", className="app-subtitle"),
+                html.Div(style={"display":"grid", "gridTemplateColumns":"1fr 1fr", "gap":"10px", "marginTop":"10px"}, children=[
+                    html.Div([
+                        html.Label("Model from app/project"),
+                        PDropdown(id="som-model-file", options=models, value=models[0]["value"] if models else None, placeholder="Choose a .pickle model"),
+                    ]),
+                    html.Div([
+                        html.Label("Or external model path"),
+                        PInput(id="som-model-file-custom", type="text", placeholder=r"C:\path\to\model.pickle or /path/to/model.pickle", style={"width":"100%"}),
+                        html.Div("If filled, this path takes priority over the dropdown.", style=helper_style),
+                    ]),
+                ]),
+                html.Div(
+                    id="som-epoch-warning",
+                    className="status-line",
+                    style={"whiteSpace": "pre-wrap", "marginTop": "8px"},
+                    children=(
+                        "Somnotate models are epoch-length specific. The selected epoch length must match the model used for scoring/evaluation. "
+                        "New models trained here save this metadata automatically."
+                    ),
                 ),
-            ),
-            html.H4("Use existing model"),
-            html.Div(
-                id="som-existing-epoch-summary",
-                className="status-line",
-                style={"whiteSpace": "pre-wrap", "margin": "4px 0 8px 0"},
-                children="Existing-model scoring uses the Somnotate epoch sec selected above.",
-            ),
-            dcc.Checklist(id="som-existing-steps", options=[{"label":x,"value":x} for x in ["prepare","preprocess","score","probabilities","import-results"]], value=["prepare","preprocess","score","probabilities","import-results"], inline=True),
-            html.Button("Run existing-model workflow", id="btn-som-existing", n_clicks=0),
-            html.H4("Train new model"),
-            html.Div(
-                id="som-train-epoch-summary",
-                className="status-line",
-                style={"whiteSpace": "pre-wrap", "margin": "4px 0 8px 0"},
-                children="Training uses the Somnotate epoch sec selected above. Change it to 1 s, 2 s, or 5 s before pressing Train new model.",
-            ),
-            html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"10px"}, children=[
-                html.Div([html.Label("Train recording IDs"), PInput(id="som-train-ids", type="text", style={"width":"100%"})]),
-                html.Div([html.Label("Test recording IDs, optional"), PInput(id="som-test-ids", type="text", style={"width":"100%"})]),
-                html.Div([html.Label("New model name"), PInput(id="som-model-name", type="text", value="my_somnotate_model", style={"width":"100%"})]),
             ]),
-            dcc.Checklist(id="som-train-steps", options=[{"label":x,"value":x} for x in ["prepare","preprocess"]], value=["prepare","preprocess"], inline=True),
-            html.Button("Train new model", id="btn-som-train", n_clicks=0),
-            html.H4("Import already existing local results"),
-            html.Button("Import Somnotate results", id="btn-som-import-results", n_clicks=0),
-            html.Div(id="som-action-status", className="status-line"),
+
+            html.Div(style=section_style, children=[
+                html.H4("1. Score recordings with the selected model", style={"marginTop":"0"}),
+                html.Div(
+                    "Use this when you already have a trained model and want Somnotate predictions/probabilities for new recordings.",
+                    className="app-subtitle",
+                ),
+                html.Div(style={"marginTop":"10px"}, children=[
+                    html.Label("Recordings to score"),
+                    PDropdown(
+                        id="som-recording-ids",
+                        options=som_recording_options,
+                        value=ready_score_ids[:1],
+                        multi=True,
+                        placeholder="Choose one or more prepared recordings",
+                        style={"width":"100%"},
+                    ),
+                    html.Div("Unavailable recordings are shown but disabled, with the reason in the label.", style=helper_style),
+                ]),
+                html.Div(
+                    id="som-existing-epoch-summary",
+                    className="status-line",
+                    style={"whiteSpace": "pre-wrap", "margin": "6px 0"},
+                    children="Existing-model scoring uses the Somnotate epoch length selected above.",
+                ),
+                dcc.Checklist(
+                    id="som-existing-steps",
+                    options=[
+                        {"label":" Prepare", "value":"prepare"},
+                        {"label":" Preprocess", "value":"preprocess"},
+                        {"label":" Score", "value":"score"},
+                        {"label":" Probabilities", "value":"probabilities"},
+                        {"label":" Import results", "value":"import-results"},
+                    ],
+                    value=["prepare","preprocess","score","probabilities","import-results"],
+                    inline=True,
+                ),
+                html.Button("Run scoring", id="btn-som-existing", n_clicks=0, style={"marginTop":"8px"}),
+            ]),
+
+            html.Div(style=section_style, children=[
+                html.H4("2. Evaluate the selected model", style={"marginTop":"0"}),
+                html.Div(
+                    "No model retraining is done here. The fixed .pickle model is compared directly with manual Wake/NREM/REM scoring.",
+                    className="app-subtitle",
+                ),
+                html.Div(style={"display":"grid", "gridTemplateColumns":"2fr 1fr", "gap":"10px", "marginTop":"10px"}, children=[
+                    html.Div([
+                        html.Label("Manually scored recordings"),
+                        PDropdown(
+                            id="som-eval-ids",
+                            options=som_manual_options,
+                            value=[],
+                            multi=True,
+                            placeholder="Choose recordings with manual scoring",
+                            style={"width":"100%"},
+                        ),
+                        html.Div("Only prepared recordings with manual scoring can be selected; unavailable entries are disabled with a reason.", style=helper_style),
+                    ]),
+                    html.Div([
+                        html.Label("Relationship to model training"),
+                        PDropdown(
+                            id="som-eval-context",
+                            options=[
+                                {"label":"Independent validation — not used to train this model", "value":"independent-validation"},
+                                {"label":"Training recordings / not sure", "value":"training-or-unknown"},
+                            ],
+                            value="independent-validation",
+                            clearable=False,
+                        ),
+                    ]),
+                ]),
+                html.Div(
+                    className="status-line",
+                    style={"marginTop":"8px", "whiteSpace":"normal"},
+                    children=[
+                        html.B("What this tells you: "),
+                        html.Span("Independent held-out recordings provide the clearest test of a fixed model. If these recordings were used for training (or you are unsure), the app labels the result as descriptive rather than independent validation."),
+                    ],
+                ),
+                dcc.Checklist(
+                    id="som-eval-steps",
+                    options=[
+                        {"label":" Prepare recordings", "value":"prepare"},
+                        {"label":" Preprocess signals", "value":"preprocess"},
+                    ],
+                    value=["prepare","preprocess"],
+                    inline=True,
+                    style={"marginTop":"8px"},
+                ),
+                html.Button("Evaluate model", id="btn-som-evaluate", n_clicks=0, style={"marginTop":"8px"}),
+            ]),
+
+            html.Div(style=section_style, children=[
+                html.H4("3. Train your own model", style={"marginTop":"0"}),
+                html.Div(
+                    "Training recordings fit the final model. Optional held-out recordings are excluded from fitting and can be used for independent QC when manual scoring is available.",
+                    className="app-subtitle",
+                ),
+                html.Div(
+                    id="som-train-epoch-summary",
+                    className="status-line",
+                    style={"whiteSpace": "pre-wrap", "margin": "6px 0 8px 0"},
+                    children="Training uses the Somnotate epoch length selected above. Training recordings must contain manual scoring.",
+                ),
+                html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"10px"}, children=[
+                    html.Div([
+                        html.Label("Training recordings"),
+                        PDropdown(id="som-train-ids", options=som_manual_options, value=[], multi=True, placeholder="Choose manually scored training recordings", style={"width":"100%"}),
+                        html.Div("Manual scoring required. Use several independent recordings/animals when possible.", style=helper_style),
+                    ]),
+                    html.Div([
+                        html.Label("Held-out validation recordings (optional)"),
+                        PDropdown(id="som-test-ids", options=som_manual_options, value=[], multi=True, placeholder="Choose recordings excluded from training", style={"width":"100%"}),
+                        html.Div("Keep these out of the training list for an independent final-model check.", style=helper_style),
+                    ]),
+                    html.Div([html.Label("New model name"), PInput(id="som-model-name", type="text", value="my_somnotate_model", style={"width":"100%"})]),
+                ]),
+                dcc.Checklist(
+                    id="som-train-steps",
+                    options=[
+                        {"label":" Prepare recordings", "value":"prepare"},
+                        {"label":" Preprocess signals", "value":"preprocess"},
+                        {"label":" Run recording-level model QC (recommended)", "value":"quality-control"},
+                    ],
+                    value=["prepare","preprocess","quality-control"],
+                    inline=True,
+                    style={"marginTop":"8px"},
+                ),
+                html.Div(
+                    "QC uses leave-one-recording-out cross-validation across the training recordings. It does not overwrite the final trained model. If held-out manually scored recordings are supplied, the final model is also tested on them.",
+                    style=helper_style,
+                ),
+                html.Button("Train model + QC", id="btn-som-train", n_clicks=0, style={"marginTop":"8px"}),
+            ]),
+
+            html.Div(style=section_style, children=[
+                html.H4("Model quality reports", style={"marginTop":"0"}),
+                html.Div(
+                    "Evaluation and training QC reports are saved so they can be reopened later. The newest report is selected automatically after a successful run.",
+                    className="app-subtitle",
+                ),
+                PDropdown(
+                    id="som-qc-report-file",
+                    options=quality_reports,
+                    value=quality_reports[0]["value"] if quality_reports else None,
+                    placeholder="No saved model-quality reports yet",
+                    style={"marginTop":"8px"},
+                ),
+                dcc.Loading(
+                    type="circle",
+                    children=html.Div(
+                        id="som-model-qc",
+                        children=render_model_quality_report(quality_reports[0]["value"] if quality_reports else None),
+                        style={"marginTop":"8px"},
+                    ),
+                ),
+            ]),
+
+            html.Details(style={"marginTop":"14px"}, children=[
+                html.Summary("Advanced: import Somnotate outputs that already exist locally"),
+                html.Div("Use this only when scoring/probability files already exist for the recording and only the app import step is needed.", style={"margin":"8px 0", "fontSize":"12px", "opacity":0.8}),
+                html.Button("Import existing results", id="btn-som-import-results", n_clicks=0),
+            ]),
+
+            html.Div(id="som-action-status", className="status-line", style={"marginTop":"12px"}),
             dcc.Loading(type="circle", children=html.Pre(id="som-log", className="log-box")),
         ])
 
@@ -2283,14 +3620,16 @@ def import_button_feedback(n_detect, n_import, n_features, n_layer1):
 
 @app.callback(
     Output("som-action-status", "children"),
-    Input("btn-som-existing", "n_clicks"), Input("btn-som-train", "n_clicks"), Input("btn-som-import-results", "n_clicks"),
+    Input("btn-som-existing", "n_clicks"), Input("btn-som-evaluate", "n_clicks"),
+    Input("btn-som-train", "n_clicks"), Input("btn-som-import-results", "n_clicks"),
     prevent_initial_call=True,
 )
-def som_button_feedback(n_existing, n_train, n_import):
+def som_button_feedback(n_existing, n_evaluate, n_train, n_import):
     trig = callback_context.triggered_id
     messages = {
-        "btn-som-existing": "Running Somnotate existing-model workflow...",
-        "btn-som-train": "Starting Somnotate model training workflow...",
+        "btn-som-existing": "Running Somnotate scoring with the selected model...",
+        "btn-som-evaluate": "Evaluating the selected model against manual scoring...",
+        "btn-som-train": "Training a new Somnotate model and running requested QC...",
         "btn-som-import-results": "Importing Somnotate results into the project...",
     }
     return messages.get(trig, "Working...")
@@ -2655,7 +3994,11 @@ def update_window(window, project_root, recording_id):
     if not project_root or not recording_id: return no_update, no_update, no_update
     rec = load_recording(project_root, recording_id)
     start = float(window.get("start_min", 0.0)); wmin = float(window.get("window_min", 15.0)); end = min(rec["duration_s"]/60.0, start+wmin)
-    return make_review_figure(project_root, recording_id, start, wmin), f"Window: {start:.2f}–{end:.2f} min", None
+    # Preserve the current scoring/review selection when the visible QC window
+    # refreshes.  Clearing this store here caused the synchronized video to keep
+    # playing from its already prepared local clip while the EEG/EMG reviewer
+    # lost its interval and reset to "Select an interval to review."
+    return make_review_figure(project_root, recording_id, start, wmin), f"Window: {start:.2f}–{end:.2f} min", no_update
 
 
 @app.callback(
@@ -2857,6 +4200,642 @@ def score_or_export(*args):
 
 
 # -----------------------------------------------------------------------------
+# Synchronized epoch + video review
+# -----------------------------------------------------------------------------
+
+
+def _epoch_position_at_recording_time(epochs: pd.DataFrame, recording_time_s: float) -> int:
+    """Map a recording timestamp to the selected epoch index."""
+    if epochs is None or len(epochs) == 0:
+        return 0
+    t = float(recording_time_s)
+    t0 = pd.to_numeric(epochs["t0_s"], errors="coerce").to_numpy(float)
+    t1 = pd.to_numeric(epochs["t1_s"], errors="coerce").to_numpy(float)
+    hit = np.where((t0 <= t) & (t < t1))[0]
+    if len(hit):
+        return int(hit[0])
+    if t < t0[0]:
+        return 0
+    return int(len(epochs) - 1)
+
+
+@app.callback(
+    Output("epoch-review-index-store", "data"),
+    Input("selected-interval-store", "data"),
+    Input("epoch-review-prev", "n_clicks"),
+    Input("epoch-review-next", "n_clicks"),
+    State("epoch-review-index-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def navigate_epoch_review(selected, n_prev, n_next, current, project_root, recording_id):
+    if not selected or not project_root or not recording_id:
+        return None
+
+    rec = load_recording(project_root, recording_id)
+    epochs = _epoch_rows_for_selection(rec, selected)
+    if len(epochs) == 0:
+        return {"position": 0, "count": 0}
+
+    selection_key = f"{float(selected['start_min']):.9f}:{float(selected['end_min']):.9f}:{recording_id}"
+    trig = callback_context.triggered_id
+    old_key = (current or {}).get("selection_key")
+    old_pos = min(max(0, int((current or {}).get("position", 0) or 0)), len(epochs) - 1)
+
+    # Manual review stays manual: Prev/Next always move from the epoch shown in
+    # the signal panel. Continuous video playback does not drive this store.
+    reference_pos = old_pos
+
+    if trig == "selected-interval-store" or old_key != selection_key:
+        pos = 0
+    elif trig == "epoch-review-prev":
+        pos = max(0, reference_pos - 1)
+    elif trig == "epoch-review-next":
+        pos = min(len(epochs) - 1, reference_pos + 1)
+    else:
+        pos = old_pos
+
+    row = epochs.iloc[pos]
+    return {
+        "selection_key": selection_key,
+        "position": int(pos),
+        "count": int(len(epochs)),
+        "epoch_id": int(row["epoch_id"]) if "epoch_id" in row and pd.notna(row["epoch_id"]) else int(pos),
+        "t0_s": float(row["t0_s"]),
+        "t1_s": float(row["t1_s"]),
+    }
+
+
+@app.callback(
+    Output("epoch-review-panel", "style"),
+    Input("selected-interval-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+)
+def show_epoch_review_panel(selected, project_root, recording_id):
+    if not project_root or not recording_id or not selected:
+        return {"display": "none"}
+    return {
+        "display": "block",
+        "margin": "12px 0 16px 0",
+        "padding": "12px",
+        "border": "1px solid rgba(127,127,127,0.35)",
+        "borderRadius": "12px",
+        "background": "rgba(127,127,127,0.045)",
+    }
+
+
+@app.callback(
+    Output("epoch-review-clip-store", "data"),
+    Output("epoch-review-video-container", "children"),
+    Output("epoch-review-cache-status", "children"),
+    Input("selected-interval-store", "data"),
+    Input("video-file-input", "value"),
+    Input("video-offset-input", "value"),
+    Input("epoch-review-play-selection", "n_clicks"),
+    State("epoch-review-clip-store", "data"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+)
+def prepare_epoch_review_video_clip(selected, video_file, offset_s, play_clicks, current_clip, project_root, recording_id):
+    """Prepare the short local clip used by synchronized review.
+
+    Selection changes normally prepare the clip proactively.  The Play Selection
+    button is also an Input on purpose: if a dynamic Dash tab suppressed an
+    earlier initial callback, clicking Play always forces this code path and
+    cannot silently fall back to the full 10-hour source video.
+    """
+    trig = callback_context.triggered_id
+    if not project_root or not recording_id:
+        return None, html.Div("Load a recording first.", className="app-subtitle"), "Load a recording first."
+    if not selected:
+        return current_clip, no_update, "Select an interval to prepare a local QC clip."
+
+    try:
+        # metadata.json is the source of truth if the dynamic input is briefly
+        # empty while the QC tab is being rebuilt.
+        if not str(video_file or "").strip():
+            video_file, saved_offset = load_video_metadata(project_root, recording_id)
+            if offset_s in (None, ""):
+                offset_s = saved_offset
+        if not str(video_file or "").strip():
+            return None, epoch_review_cached_video_children(None), "No video linked to this recording yet."
+
+        source = Path(str(video_file)).expanduser()
+        if not source.exists() or not source.is_file():
+            msg = f"Video file not found: {source}"
+            return None, html.Div(msg, className="status-line"), msg
+
+        offset = safe_float(offset_s, 0.0)
+        recording_start = float(selected.get("start_min", 0.0)) * 60.0
+        recording_end = float(selected.get("end_min", selected.get("start_min", 0.0))) * 60.0
+        selected_video_start = max(0.0, recording_start - offset)
+        selected_video_end = max(selected_video_start, recording_end - offset)
+
+        # Calling this here also guarantees the local cache directory is created
+        # before FFmpeg starts, making failures visible and easy to diagnose.
+        cache_root = _video_cache_root()
+        print(
+            f"[video-qc] trigger={trig} recording={recording_id} "
+            f"selection={recording_start:.3f}-{recording_end:.3f}s source={source} "
+            f"cache={cache_root}",
+            flush=True,
+        )
+
+        if _clip_info_covers_selection(current_clip, source, selected_video_start, selected_video_end):
+            clip_path = Path(str(current_clip.get("clip_path", "")))
+            msg = (
+                f"Local QC clip already covers this selection · "
+                f"video {float(current_clip['source_start_s'])/60:.2f}–"
+                f"{float(current_clip['source_end_s'])/60:.2f} min · {clip_path}"
+            )
+            # IMPORTANT: do not recreate the <video> element when the existing
+            # local clip already covers the requested interval.  Re-mounting it
+            # resets currentTime to 0 and can race the Play Selection callback:
+            # the old element starts playing, then React replaces it with a new
+            # paused element at 0 s.  Keeping the mounted player preserves the
+            # seek/play state and makes nearby selections instant.
+            return current_clip, no_update, msg
+
+        ok, msg, clip_info = prepare_local_qc_clip(
+            source,
+            recording_id,
+            recording_start,
+            recording_end,
+            offset,
+            context_s=30.0,
+        )
+        if not ok or not clip_info:
+            print(f"[video-qc] clip preparation failed: {msg}", flush=True)
+            return None, html.Div(msg, className="status-line", style={"whiteSpace": "pre-wrap"}), msg
+
+        clip_path = Path(str(clip_info.get("clip_path", "")))
+        print(
+            f"[video-qc] clip ready path={clip_path} exists={clip_path.exists()} "
+            f"size={clip_path.stat().st_size if clip_path.exists() else 0}",
+            flush=True,
+        )
+        return clip_info, epoch_review_cached_video_children(clip_info), msg
+    except Exception as e:
+        msg = f"Local QC clip preparation failed: {type(e).__name__}: {e}"
+        print(f"[video-qc] {msg}", flush=True)
+        return None, html.Div(msg, className="status-line", style={"whiteSpace": "pre-wrap"}), msg
+
+
+@app.callback(
+    Output("epoch-review-graph", "figure"),
+    Output("epoch-review-summary", "children"),
+    Output("epoch-review-seek-store", "data"),
+    Output("epoch-review-rendered-position-store", "data"),
+    Input("epoch-review-index-store", "data"),
+    Input("epoch-review-replay", "n_clicks"),
+    # Make the selection itself an Input.  In the dynamic QC layout the
+    # selection can already exist before epoch-review-index-store is mounted;
+    # previously that left the graph stuck on its initial empty figure even
+    # though video clip preparation saw the selection correctly.
+    Input("selected-interval-store", "data"),
+    State("epoch-review-rendered-position-store", "data"),
+    State("video-offset-input", "value"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+)
+def render_epoch_review(index_data, replay_clicks, selected, rendered, offset_s, project_root, recording_id):
+    if not selected or not project_root or not recording_id:
+        return go.Figure(), "Select an interval to review.", None, None
+
+    rec = load_recording(project_root, recording_id)
+    epochs = _epoch_rows_for_selection(rec, selected)
+    if len(epochs) == 0:
+        return go.Figure(), _epoch_review_empty_message(rec, selected), None, None
+
+    trig = callback_context.triggered_id
+    selection_key = f"{float(selected['start_min']):.9f}:{float(selected['end_min']):.9f}:{recording_id}"
+
+    # Do not depend on the navigation store being initialized before the graph.
+    # If it is missing/stale, render the first overlapping epoch immediately.
+    # The navigation callback can populate/update the store afterwards.
+    index_matches_selection = bool(index_data) and index_data.get("selection_key") == selection_key
+    if index_matches_selection and int(index_data.get("count", 0) or 0) > 0:
+        pos = min(max(0, int(index_data.get("position", 0) or 0)), len(epochs) - 1)
+    else:
+        pos = 0
+        index_data = {
+            "selection_key": selection_key,
+            "position": 0,
+            "count": int(len(epochs)),
+            "epoch_id": int(epochs.iloc[0]["epoch_id"]) if "epoch_id" in epochs.columns and pd.notna(epochs.iloc[0]["epoch_id"]) else 0,
+            "t0_s": float(epochs.iloc[0]["t0_s"]),
+            "t1_s": float(epochs.iloc[0]["t1_s"]),
+        }
+
+    # Video playback intentionally does not drive the signal graph.  The graph
+    # is redrawn only for a new selection, Prev/Next, or Replay epoch.
+
+    row = epochs.iloc[pos]
+    fig = make_epoch_review_figure(rec, row, selected)
+    summary = epoch_review_summary(rec, row, pos, len(epochs))
+
+    offset = safe_float(offset_s, 0.0)
+    t0_s = float(row["t0_s"])
+    t1_s = float(row["t1_s"])
+    seek: dict[str, Any] = {
+        "time_s": max(0.0, t0_s - offset),
+        "end_time_s": max(0.0, t1_s - offset),
+        "recording_time_s": t0_s,
+        "recording_end_s": t1_s,
+        "offset_s": offset,
+        "auto_play": trig == "epoch-review-replay",
+        "epoch_position": pos,
+        "epoch_count": len(epochs),
+    }
+
+    return fig, summary, seek, {
+        "selection_key": selection_key,
+        "position": int(pos),
+        "t0_s": float(row["t0_s"]),
+        "t1_s": float(row["t1_s"]),
+    }
+
+
+@app.callback(
+    Output("epoch-review-playback-command-store", "data"),
+    Input("epoch-review-play-selection", "n_clicks"),
+    Input("epoch-review-pause", "n_clicks"),
+    State("selected-interval-store", "data"),
+    State("video-offset-input", "value"),
+    prevent_initial_call=True,
+)
+def request_epoch_review_playback(n_play, n_pause, selected, offset_s):
+    trig = callback_context.triggered_id
+    if trig == "epoch-review-pause":
+        return {"action": "pause"}
+    if trig != "epoch-review-play-selection" or not selected:
+        return no_update
+
+    offset = safe_float(offset_s, 0.0)
+    recording_start_s = float(selected.get("start_min", 0.0)) * 60.0
+    recording_end_s = float(selected.get("end_min", selected.get("start_min", 0.0))) * 60.0
+    return {
+        "action": "play",
+        "time_s": max(0.0, recording_start_s - offset),
+        "end_time_s": max(0.0, recording_end_s - offset),
+        "offset_s": offset,
+    }
+
+
+# Manual epoch navigation / replay. Seeking is asynchronous in HTML5 video, so
+# wait for metadata and the seeked event before calling play(). This avoids the
+# common black/stuck player caused by play() racing currentTime assignment.
+app.clientside_callback(
+    r"""
+    function(data) {
+        if (!data) return "";
+
+        const requestedStart = Math.max(0, Number(data.time_s || 0));
+        const requestedEnd = Math.max(requestedStart, Number(data.end_time_s || requestedStart));
+        const autoPlay = Boolean(data.auto_play);
+        const deadline = Date.now() + 30000;
+
+        function feedback(text) {
+            const el = document.getElementById("epoch-review-video-feedback");
+            if (el) el.textContent = text;
+        }
+        function getLocalVideo() {
+            const video = document.getElementById("epoch-review-video-player");
+            if (!video || video.dataset.qcLocalClip !== "1") return null;
+            const sourceStart = Number(video.dataset.sourceStartS);
+            const sourceEnd = Number(video.dataset.sourceEndS);
+            if (!Number.isFinite(sourceStart) || !Number.isFinite(sourceEnd)) return null;
+            if (requestedStart < sourceStart - 0.10 || requestedStart > sourceEnd + 0.10) return null;
+            return video;
+        }
+        function waitForLocalVideo() {
+            const video = getLocalVideo();
+            if (!video) {
+                if (Date.now() < deadline) {
+                    feedback("Preparing local QC clip…");
+                    window.setTimeout(waitForLocalVideo, 100);
+                } else {
+                    feedback("Timed out waiting for the local QC clip. Check the cache status and terminal output.");
+                }
+                return;
+            }
+
+            const sourceStart = Number(video.dataset.sourceStartS || 0);
+            const start = Math.max(0, requestedStart - sourceStart);
+            const end = Math.max(start, requestedEnd - sourceStart);
+            video.muted = true;
+
+            function clearStop() {
+                if (video._epochReviewStopHandler) {
+                    video.removeEventListener("timeupdate", video._epochReviewStopHandler);
+                    video._epochReviewStopHandler = null;
+                }
+            }
+            function installStop() {
+                clearStop();
+                const stopHandler = function() {
+                    if (video.currentTime >= end - 0.025) {
+                        video.pause();
+                        clearStop();
+                    }
+                };
+                video._epochReviewStopHandler = stopHandler;
+                video.addEventListener("timeupdate", stopHandler);
+            }
+            function doSeek() {
+                video.pause();
+                clearStop();
+                const afterSeek = function() {
+                    feedback("Video aligned to current epoch.");
+                    if (autoPlay && end > start) {
+                        installStop();
+                        const promise = video.play();
+                        if (promise && promise.catch) {
+                            promise.catch(function(err) {
+                                feedback("Video play was blocked/failed: " + err + ".");
+                            });
+                        }
+                    }
+                };
+                if (Math.abs(Number(video.currentTime || 0) - start) < 0.02) {
+                    afterSeek();
+                    return;
+                }
+                video.addEventListener("seeked", afterSeek, {once: true});
+                try { video.currentTime = start; }
+                catch (e) { feedback("Could not seek local QC clip: " + e); }
+            }
+            if (video.readyState < 1) video.addEventListener("loadedmetadata", doSeek, {once: true});
+            else doSeek();
+        }
+
+        waitForLocalVideo();
+        return "Preparing/aligning local QC clip…";
+    }
+    """,
+    Output("epoch-review-video-feedback", "children"),
+    Input("epoch-review-seek-store", "data"),
+)
+
+
+# Continuous playback of the whole selected interval. EEG/EMG following is
+# driven by the lightweight clock callback below rather than by re-seeking the
+# video every epoch.
+app.clientside_callback(
+    r"""
+    function(command) {
+        if (!command) return window.dash_clientside.no_update;
+
+        function feedback(text) {
+            const el = document.getElementById("epoch-review-video-feedback");
+            if (el) el.textContent = text;
+        }
+
+        if (command.action === "pause") {
+            const current = document.getElementById("epoch-review-video-player");
+            if (current && current.dataset.qcLocalClip === "1") current.pause();
+            return "Paused synchronized playback.";
+        }
+        if (command.action !== "play") return window.dash_clientside.no_update;
+
+        const requestedStart = Math.max(0, Number(command.time_s || 0));
+        const requestedEnd = Math.max(requestedStart, Number(command.end_time_s || requestedStart));
+        const deadline = Date.now() + 30000;
+
+        function getLocalVideo() {
+            const video = document.getElementById("epoch-review-video-player");
+            if (!video || video.dataset.qcLocalClip !== "1") return null;
+            const sourceStart = Number(video.dataset.sourceStartS);
+            const sourceEnd = Number(video.dataset.sourceEndS);
+            if (!Number.isFinite(sourceStart) || !Number.isFinite(sourceEnd)) return null;
+            if (requestedStart < sourceStart - 0.10 || requestedEnd > sourceEnd + 0.10) return null;
+            return video;
+        }
+
+        function waitAndPlay() {
+            const video = getLocalVideo();
+            if (!video) {
+                if (Date.now() < deadline) {
+                    feedback("Preparing local QC clip…");
+                    window.setTimeout(waitAndPlay, 100);
+                } else {
+                    feedback("Timed out waiting for a local QC clip covering this selection. Check the cache status and terminal output.");
+                }
+                return;
+            }
+
+            video.muted = true;
+            if (video._epochReviewStopHandler) {
+                video.removeEventListener("timeupdate", video._epochReviewStopHandler);
+                video._epochReviewStopHandler = null;
+            }
+
+            const sourceStart = Number(video.dataset.sourceStartS || 0);
+            const start = Math.max(0, requestedStart - sourceStart);
+            const end = Math.max(start, requestedEnd - sourceStart);
+            const stopHandler = function() {
+                if (video.currentTime >= end - 0.025) {
+                    video.pause();
+                    video.removeEventListener("timeupdate", stopHandler);
+                    video._epochReviewStopHandler = null;
+                    feedback("Selected interval finished.");
+                }
+            };
+            video._epochReviewStopHandler = stopHandler;
+            video.addEventListener("timeupdate", stopHandler);
+
+            function begin() {
+                feedback("Starting synchronized playback…");
+                const promise = video.play();
+                if (promise && promise.then) {
+                    promise.then(function() {
+                        feedback("Playing selected interval.");
+                    }).catch(function(err) {
+                        feedback("Video could not play: " + err + ".");
+                    });
+                }
+            }
+            function afterSeek() {
+                if (video.readyState >= 3) begin();
+                else video.addEventListener("canplay", begin, {once: true});
+            }
+            function seekThenPlay() {
+                if (Math.abs(Number(video.currentTime || 0) - start) < 0.02) afterSeek();
+                else {
+                    video.addEventListener("seeked", afterSeek, {once: true});
+                    try { video.currentTime = start; }
+                    catch (e) { feedback("Could not seek local QC clip: " + e); }
+                }
+            }
+            if (video.readyState < 1) video.addEventListener("loadedmetadata", seekThenPlay, {once: true});
+            else seekThenPlay();
+        }
+
+        waitAndPlay();
+        return "Preparing local QC clip for synchronized playback…";
+    }
+    """,
+    Output("epoch-review-video-feedback", "children", allow_duplicate=True),
+    Input("epoch-review-playback-command-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+# Poll only lightweight DOM state. The server callback above updates the signal
+# plot only when currentTime crosses into a different scoring epoch.
+app.clientside_callback(
+    r"""
+    function(n, offsetValue, renderedEpoch) {
+        const video = document.getElementById("epoch-review-video-player");
+        if (!video || video.dataset.qcLocalClip !== "1") {
+            return [window.dash_clientside.no_update, "Waiting for short local QC clip…"];
+        }
+        const offset = Number(offsetValue || 0);
+        const sourceStart = Number(video.dataset.sourceStartS || 0);
+        const err = video.error;
+        const clipTime = Number(video.currentTime || 0);
+        const sourceVideoTime = clipTime + sourceStart;
+        const recordingTime = sourceVideoTime + offset;
+        if (err) {
+            const meanings = {1:"aborted", 2:"network error", 3:"decode error", 4:"source/codec not supported"};
+            const msg = "Video error " + err.code + " (" + (meanings[err.code] || "unknown") + ").";
+            return [{video_time_s:sourceVideoTime, clip_time_s:clipTime, recording_time_s:recordingTime, paused:true, error_code:err.code}, msg];
+        }
+
+        let msg = "";
+        if (video.readyState < 1) msg = "Loading local QC clip metadata…";
+        else if (video.readyState < 3 && !video.paused) msg = "Buffering local QC clip…";
+        else if (video.paused) msg = "Video paused · recording " + recordingTime.toFixed(3) + " s · local clip " + clipTime.toFixed(3) + " s.";
+        else msg = "Video playing · recording " + recordingTime.toFixed(3) + " s · local clip " + clipTime.toFixed(3) + " s.";
+
+        // The moving playhead is updated by a separate fully client-side callback.
+        // Only notify Python when playback leaves the epoch currently rendered in
+        // the EEG/EMG panel.  Previously this store changed every 200 ms, causing
+        // Dash to reread several large CSV files five times per second while the
+        // same Flask server was also serving video byte ranges. That can make a
+        // local short clip feel as if it is buffering or not playing at all.
+        const t0 = renderedEpoch ? Number(renderedEpoch.t0_s) : NaN;
+        const t1 = renderedEpoch ? Number(renderedEpoch.t1_s) : NaN;
+        const insideRenderedEpoch = Number.isFinite(t0) && Number.isFinite(t1) &&
+                                    recordingTime >= t0 && recordingTime < t1;
+
+        if (insideRenderedEpoch) {
+            video._epochReviewLastServerRequestMs = 0;
+            return [window.dash_clientside.no_update, msg];
+        }
+
+        // If Python is still rendering the next epoch, do not queue duplicate
+        // requests on every clock tick. One request roughly every 750 ms is enough
+        // to keep 1-s scoring epochs visually in step while playback itself stays
+        // smooth and entirely browser-driven.
+        const now = Date.now();
+        const last = Number(video._epochReviewLastServerRequestMs || 0);
+        if (now - last < 750) {
+            return [window.dash_clientside.no_update, msg];
+        }
+        video._epochReviewLastServerRequestMs = now;
+
+        const data = {
+            video_time_s: sourceVideoTime,
+            clip_time_s: clipTime,
+            recording_time_s: recordingTime,
+            paused: Boolean(video.paused),
+            ended: Boolean(video.ended),
+            ready_state: Number(video.readyState || 0),
+            network_state: Number(video.networkState || 0)
+        };
+        return [data, msg];
+    }
+    """,
+    Output("epoch-review-playback-time-store", "data"),
+    Output("epoch-review-video-diagnostics", "children"),
+    Input("epoch-review-clock", "n_intervals"),
+    State("video-offset-input", "value"),
+    State("epoch-review-rendered-position-store", "data"),
+)
+
+
+# Pure browser-side playhead.  This does exactly one thing: read video.currentTime
+# and move the named red Plotly line.  It never writes a Dash Store used by Python,
+# never redraws the EEG/EMG traces, and never changes video playback.
+app.clientside_callback(
+    r"""
+    function(n, selected, offsetValue) {
+        if (!selected) return "";
+
+        const start = Number(selected.start_min) * 60.0;
+        const end = Number(selected.end_min) * 60.0;
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return "";
+
+        const graphWrap = document.getElementById("epoch-review-graph");
+        const gd = graphWrap ? graphWrap.querySelector(".js-plotly-plot") : null;
+        if (!gd || !window.Plotly || !gd.layout) return "";
+
+        let recordingTime = start;
+        const video = document.getElementById("epoch-review-video-player");
+        if (video && video.dataset.qcLocalClip === "1" && video.readyState >= 1) {
+            const sourceStart = Number(video.dataset.sourceStartS || 0);
+            const offset = Number(offsetValue || 0);
+            const clipTime = Number(video.currentTime || 0);
+            const candidate = sourceStart + clipTime + offset;
+            if (Number.isFinite(candidate)) recordingTime = candidate;
+        }
+
+        // Before Play, the cached clip may be sitting at clip time 0, which is
+        // intentionally earlier than the selected interval. Keep the tracer at
+        // the selection start until the player has actually sought there.
+        recordingTime = Math.max(start, Math.min(end, recordingTime));
+
+        const shapes = (gd.layout.shapes || []);
+        let idx = -1;
+        for (let i = 0; i < shapes.length; i++) {
+            if (shapes[i] && shapes[i].name === "video_playhead") {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) return "";
+
+        const update = {};
+        update["shapes[" + idx + "].x0"] = recordingTime;
+        update["shapes[" + idx + "].x1"] = recordingTime;
+        window.Plotly.relayout(gd, update);
+
+        return recordingTime.toFixed(3);
+    }
+    """,
+    Output("epoch-review-playhead-dummy", "children"),
+    Input("epoch-review-playhead-clock", "n_intervals"),
+    State("selected-interval-store", "data"),
+    State("video-offset-input", "value"),
+)
+
+# Lightweight text status only; it does not touch the graph.
+app.clientside_callback(
+    r"""
+    function(n, offsetValue) {
+        const video = document.getElementById("epoch-review-video-player");
+        if (!video || video.dataset.qcLocalClip !== "1") {
+            return "Video: waiting for short local QC clip…";
+        }
+        const offset = Number(offsetValue || 0);
+        const clipTime = Number(video.currentTime || 0);
+        const sourceStart = Number(video.dataset.sourceStartS || 0);
+        const recordingTime = clipTime + sourceStart + offset;
+        const state = video.paused ? "paused" : "playing";
+        return "Video: recording " + recordingTime.toFixed(3) +
+               " s · local clip " + clipTime.toFixed(3) + " s · " + state;
+    }
+    """,
+    Output("epoch-review-live-position", "children"),
+    Input("epoch-review-playhead-clock", "n_intervals"),
+    State("video-offset-input", "value"),
+)
+
+
+# -----------------------------------------------------------------------------
 # Optional video QC callbacks
 # -----------------------------------------------------------------------------
 
@@ -2868,12 +4847,13 @@ def score_or_export(*args):
     Input("recording-id-store", "data"),
     Input("save-video-settings", "n_clicks"),
     Input("convert-video-mp4", "n_clicks"),
+    Input("clear-video-review-cache", "n_clicks"),
     State("project-root-store", "data"),
     State("video-file-input", "value"),
     State("video-offset-input", "value"),
     prevent_initial_call=True,
 )
-def update_video_panel(recording_id, save_clicks, convert_clicks, project_root, video_file_value, video_offset_value):
+def update_video_panel(recording_id, save_clicks, convert_clicks, clear_cache_clicks, project_root, video_file_value, video_offset_value):
     if not project_root or not recording_id:
         return "", 0.0, html.Div("Load a recording to enable video QC.", className="app-subtitle"), "Load a recording first."
 
@@ -2883,12 +4863,32 @@ def update_video_panel(recording_id, save_clicks, convert_clicks, project_root, 
         video_file = str(video_file_value or "").strip()
         offset_s = safe_float(video_offset_value, 0.0)
         ok, msg = save_video_metadata(project_root, recording_id, video_file, offset_s)
+
+        # Always read back from metadata after saving.  This makes the UI reflect
+        # exactly what was persisted for this recording and catches stale browser
+        # persistence/race conditions immediately.
+        saved_video, saved_offset = load_video_metadata(project_root, recording_id)
+        if ok:
+            if not saved_video:
+                msg = (msg + "\nERROR: metadata.json did not contain a video path after save.").strip()
+            elif saved_video != video_file:
+                msg = (msg + f"\nSaved metadata resolves to:\n{saved_video}").strip()
+            return saved_video, saved_offset, video_panel_children(saved_video, saved_offset), msg
+
+        # If saving failed because the input was transiently empty, preserve and
+        # reload any previously stored recording-specific video rather than blanking
+        # the player.
+        return saved_video, saved_offset, video_panel_children(saved_video, saved_offset), msg
+
+    if trig == "clear-video-review-cache":
+        ok, msg = clear_video_review_cache(recording_id)
+        video_file, offset_s = load_video_metadata(project_root, recording_id)
         return video_file, offset_s, video_panel_children(video_file, offset_s), msg
 
     if trig == "convert-video-mp4":
         original_video_file = str(video_file_value or "").strip()
         offset_s = safe_float(video_offset_value, 0.0)
-        ok, msg, converted_path = convert_avi_to_browser_mp4(original_video_file)
+        ok, msg, converted_path = convert_video_to_browser_mp4(original_video_file)
         if not ok or not converted_path:
             return original_video_file, offset_s, video_panel_children(original_video_file, offset_s), msg
 
@@ -3055,9 +5055,11 @@ def update_somnotate_epoch_summaries(som_epoch_sec):
 @app.callback(
     Output("som-epoch-warning", "children"),
     Input("som-model-file", "value"),
+    Input("som-model-file-custom", "value"),
     Input("som-epoch-sec", "value"),
 )
-def update_somnotate_epoch_warning(model_file, som_epoch_sec):
+def update_somnotate_epoch_warning(model_file, custom_model_file, som_epoch_sec):
+    model_file = str(custom_model_file or "").strip() or model_file
     selected_epoch = safe_float(som_epoch_sec, 1.0)
     base = (
         "Somnotate epoch warning: models are epoch-length specific. "
@@ -3101,7 +5103,15 @@ def update_somnotate_epoch_warning(model_file, som_epoch_sec):
 
 
 def _split_recording_ids(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
     return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
+
+def _recording_ids_cli(value) -> str:
+    return ",".join(_split_recording_ids(value))
 
 
 def validate_somnotate_ui_inputs(*, som_root, model_file=None, recording_ids=None, training=False) -> str | None:
@@ -3131,34 +5141,146 @@ def validate_somnotate_ui_inputs(*, som_root, model_file=None, recording_ids=Non
     return None
 
 
-@app.callback(Output("som-log", "children"), Input("btn-som-existing", "n_clicks"), Input("btn-som-train", "n_clicks"), Input("btn-som-import-results", "n_clicks"), State("project-root-store", "data"), State("som-recording-ids", "value"), State("som-target-fs", "value"), State("som-epoch-sec", "value"), State("som-root", "value"), State("som-conda-env", "value"), State("som-python", "value"), State("som-model-file", "value"), State("som-existing-steps", "value"), State("som-train-ids", "value"), State("som-test-ids", "value"), State("som-model-name", "value"), State("som-train-steps", "value"), prevent_initial_call=True)
-def run_somnotate(n_exist, n_train, n_import, project_root, rec_ids, target_fs, som_epoch_sec, som_root, som_env, som_py, model_file, steps, train_ids, test_ids, model_name, train_steps):
-    if not project_root: return "Load project first."
+@app.callback(
+    Output("som-log", "children"),
+    Output("som-qc-report-file", "options"),
+    Output("som-qc-report-file", "value"),
+    Input("btn-som-existing", "n_clicks"),
+    Input("btn-som-evaluate", "n_clicks"),
+    Input("btn-som-train", "n_clicks"),
+    Input("btn-som-import-results", "n_clicks"),
+    State("project-root-store", "data"),
+    State("som-recording-ids", "value"),
+    State("som-target-fs", "value"),
+    State("som-epoch-sec", "value"),
+    State("som-root", "value"),
+    State("som-conda-env", "value"),
+    State("som-python", "value"),
+    State("som-model-file", "value"),
+    State("som-model-file-custom", "value"),
+    State("som-existing-steps", "value"),
+    State("som-eval-ids", "value"),
+    State("som-eval-context", "value"),
+    State("som-eval-steps", "value"),
+    State("som-train-ids", "value"),
+    State("som-test-ids", "value"),
+    State("som-model-name", "value"),
+    State("som-train-steps", "value"),
+    prevent_initial_call=True,
+)
+def run_somnotate(
+    n_exist, n_evaluate, n_train, n_import,
+    project_root, rec_ids, target_fs, som_epoch_sec, som_root, som_env, som_py,
+    model_file, custom_model_file, steps,
+    eval_ids, eval_context, eval_steps,
+    train_ids, test_ids, model_name, train_steps,
+):
+    if not project_root:
+        return "Load project first.", no_update, no_update
+
     trig = callback_context.triggered_id
-    base = [sys.executable, str(PIPELINES_DIR/"10_somnotate_layer.py")]
+    base = [sys.executable, str(PIPELINES_DIR / "10_somnotate_layer.py")]
     epoch_arg = str(som_epoch_sec or "1.0")
+    effective_model_file = str(custom_model_file or "").strip() or model_file
+
     if trig == "btn-som-existing":
-        problem = validate_somnotate_ui_inputs(som_root=som_root, model_file=model_file, recording_ids=rec_ids, training=False)
+        problem = validate_somnotate_ui_inputs(
+            som_root=som_root,
+            model_file=effective_model_file,
+            recording_ids=rec_ids,
+            training=False,
+        )
         if problem:
-            return "Somnotate setup problem: " + problem
-        cmd = base + ["use-existing-model", "--project-root", str(project_root), "--recording-ids", str(rec_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-file", str(model_file or ""), "--target-fs", str(target_fs or 512), "--epoch-sec", epoch_arg]
-        if som_py: cmd += ["--somnotate-python", str(som_py)]
-        for s in steps or []: cmd += [f"--{s}"]
+            return "Somnotate setup problem: " + problem, no_update, no_update
+        cmd = base + [
+            "use-existing-model",
+            "--project-root", str(project_root),
+            "--recording-ids", _recording_ids_cli(rec_ids),
+            "--somnotate-root", str(som_root or ""),
+            "--somnotate-conda-env", str(som_env or "somnotate_env"),
+            "--model-file", str(effective_model_file or ""),
+            "--target-fs", str(target_fs or 512),
+            "--epoch-sec", epoch_arg,
+        ]
+        if som_py:
+            cmd += ["--somnotate-python", str(som_py)]
+        for step in steps or []:
+            cmd += [f"--{step}"]
+
+    elif trig == "btn-som-evaluate":
+        problem = validate_somnotate_ui_inputs(
+            som_root=som_root,
+            model_file=effective_model_file,
+            recording_ids=eval_ids,
+            training=False,
+        )
+        if problem:
+            return "Somnotate evaluation setup problem: " + problem, no_update, no_update
+        cmd = base + [
+            "evaluate-model",
+            "--project-root", str(project_root),
+            "--recording-ids", _recording_ids_cli(eval_ids),
+            "--somnotate-root", str(som_root or ""),
+            "--somnotate-conda-env", str(som_env or "somnotate_env"),
+            "--model-file", str(effective_model_file or ""),
+            "--target-fs", str(target_fs or 512),
+            "--epoch-sec", epoch_arg,
+            "--evaluation-context", str(eval_context or "training-or-unknown"),
+        ]
+        if som_py:
+            cmd += ["--somnotate-python", str(som_py)]
+        for step in eval_steps or []:
+            cmd += [f"--{step}"]
+
     elif trig == "btn-som-train":
-        problem = validate_somnotate_ui_inputs(som_root=som_root, recording_ids=train_ids, training=True)
+        problem = validate_somnotate_ui_inputs(
+            som_root=som_root,
+            recording_ids=train_ids,
+            training=True,
+        )
         if problem:
-            return "Somnotate setup problem: " + problem
-        cmd = base + ["train-model", "--project-root", str(project_root), "--train-recording-ids", str(train_ids or ""), "--test-recording-ids", str(test_ids or ""), "--somnotate-root", str(som_root or ""), "--somnotate-conda-env", str(som_env or "somnotate_env"), "--model-name", str(model_name or "model"), "--target-fs", str(target_fs or 512), "--epoch-sec", epoch_arg]
-        if som_py: cmd += ["--somnotate-python", str(som_py)]
-        for s in train_steps or []: cmd += [f"--{s}"]
+            return "Somnotate setup problem: " + problem, no_update, no_update
+        cmd = base + [
+            "train-model",
+            "--project-root", str(project_root),
+            "--train-recording-ids", _recording_ids_cli(train_ids),
+            "--test-recording-ids", _recording_ids_cli(test_ids),
+            "--somnotate-root", str(som_root or ""),
+            "--somnotate-conda-env", str(som_env or "somnotate_env"),
+            "--model-name", str(model_name or "model"),
+            "--target-fs", str(target_fs or 512),
+            "--epoch-sec", epoch_arg,
+        ]
+        if som_py:
+            cmd += ["--somnotate-python", str(som_py)]
+        for step in train_steps or []:
+            cmd += [f"--{step}"]
+
     elif trig == "btn-som-import-results":
-        cmd = base + ["import-results", "--project-root", str(project_root), "--recording-ids", str(rec_ids or ""), "--epoch-sec", epoch_arg]
+        cmd = base + [
+            "import-results",
+            "--project-root", str(project_root),
+            "--recording-ids", _recording_ids_cli(rec_ids),
+            "--epoch-sec", epoch_arg,
+        ]
     else:
-        return no_update
+        return no_update, no_update, no_update
+
     code, out = run_command(cmd)
-    return f"$ {' '.join(cmd)}\n\n{out}"
+    log_text = f"$ {' '.join(cmd)}\n\n{out}"
+    if trig in {"btn-som-evaluate", "btn-som-train"} and code == 0:
+        reports = available_quality_reports(project_root)
+        selected = reports[0]["value"] if reports else no_update
+        return log_text, reports, selected
+    return log_text, no_update, no_update
 
 
+@app.callback(
+    Output("som-model-qc", "children"),
+    Input("som-qc-report-file", "value"),
+)
+def update_somnotate_model_quality(report_file):
+    return render_model_quality_report(report_file)
 
 
 

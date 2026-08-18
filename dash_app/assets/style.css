@@ -303,3 +303,83 @@ input, textarea, select {
 .video-qc-card video {
   display: block;
 }
+
+/* Compact scoring actions beside the QC plot. The panel stays visible while
+   scrolling through a tall QC figure, so accepting a source does not require
+   scrolling below the plot. */
+.qc-plot-with-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 104px;
+  gap: 10px;
+  align-items: start;
+}
+
+.qc-plot-main {
+  min-width: 0;
+}
+
+.qc-window-actions {
+  position: sticky;
+  top: 10px;
+  z-index: 5;
+  margin-top: 8px;
+  padding: 9px 7px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+  text-align: center;
+}
+
+.theme-dark .qc-window-actions {
+  background: rgba(17, 24, 39, 0.96);
+  border-color: #374151;
+}
+
+.qc-window-actions-title {
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.qc-window-actions-subtitle {
+  margin: 2px 0 6px;
+  color: #6b7280;
+  font-size: 10px;
+  line-height: 1.1;
+}
+
+.theme-dark .qc-window-actions-subtitle {
+  color: #9ca3af;
+}
+
+.qc-window-actions button {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+  .qc-plot-with-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .qc-window-actions {
+    position: static;
+    display: grid;
+    grid-template-columns: auto auto repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    align-items: center;
+    margin-top: 6px;
+    text-align: left;
+  }
+
+  .qc-window-actions-title,
+  .qc-window-actions-subtitle,
+  .qc-window-actions button {
+    margin: 0;
+  }
+}

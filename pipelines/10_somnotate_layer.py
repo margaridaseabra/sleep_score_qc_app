@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -33,6 +34,11 @@ def run_step(cmd: list[str], title: str, cwd: Path | None = None) -> subprocess.
     print("=" * 80)
     print(" ".join(str(x) for x in cmd))
     print()
+    env = os.environ.copy()
+    # Somnotate's validation script calls plt.show() even without --show.
+    # Force a non-interactive backend so model QC works on Windows/macOS/Linux
+    # without opening or blocking on a GUI window.
+    env.setdefault("MPLBACKEND", "Agg")
     result = subprocess.run(
         [str(x) for x in cmd],
         capture_output=True,
@@ -40,6 +46,7 @@ def run_step(cmd: list[str], title: str, cwd: Path | None = None) -> subprocess.
         encoding="utf-8",
         errors="replace",
         cwd=str(cwd) if cwd else None,
+        env=env,
     )
     if result.stdout:
         print(result.stdout)
@@ -171,6 +178,60 @@ def split_ids(x: str | None) -> list[str]:
     return [s.strip() for s in str(x or "").split(",") if s.strip()]
 
 
+def resolve_recording_dir(
+    project_root: Path,
+    recording_id: str,
+    required_files: tuple[str, ...] = (),
+) -> Path:
+    """Resolve a recording folder portably across moved/copied projects.
+
+    Prefer ``<project_root>/recordings/<recording_id>``, but fall back to the
+    ``recording_dir`` stored in ``recordings_manifest.csv`` when that points to
+    a valid folder.  ``required_files`` prevents an empty/stale canonical
+    folder from hiding a usable manifest location.
+    """
+    project_root = Path(project_root).expanduser().resolve()
+    canonical = project_root / "recordings" / str(recording_id)
+    candidates: list[Path] = [canonical]
+
+    manifest_path = project_root / "recordings_manifest.csv"
+    if manifest_path.exists():
+        try:
+            manifest = pd.read_csv(manifest_path)
+            if "recording_id" in manifest.columns:
+                match = manifest[manifest["recording_id"].astype(str) == str(recording_id)]
+                if len(match) and "recording_dir" in match.columns:
+                    raw = match.iloc[0]["recording_dir"]
+                    if pd.notna(raw) and str(raw).strip():
+                        candidate = Path(str(raw)).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = project_root / candidate
+                        if candidate not in candidates:
+                            candidates.append(candidate)
+        except Exception:
+            # A malformed manifest should not prevent the canonical layout from
+            # being tried; the final error below will show what was checked.
+            pass
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if all((candidate / rel).exists() for rel in required_files):
+            return candidate.resolve()
+
+    checked = "\n".join(f"  - {candidate}" for candidate in candidates)
+    missing = ""
+    if required_files:
+        missing = "\nRequired files: " + ", ".join(required_files)
+    raise FileNotFoundError(
+        f"Recording '{recording_id}' is not available as a prepared Sleep Stage QC recording.\n"
+        f"Checked recording folders:\n{checked}{missing}\n\n"
+        "If the recording was moved between computers, update/reload the project so "
+        "recordings_manifest.csv points to the current location. If it has not yet "
+        "been imported into the app, import/prepare it before running Somnotate QC."
+    )
+
+
 def read_metadata(rec_dir: Path) -> dict[str, Any]:
     path = rec_dir / "metadata.json"
     if not path.exists():
@@ -285,11 +346,23 @@ def write_edf(edf_path: Path, eeg: np.ndarray, emg: np.ndarray, fs: float) -> No
         f.writeSamples(signals)
 
 
-def export_manual_for_somnotate(manual_csv: Path, out_path: Path) -> str:
-    """Export app manual scoring as Somnotate-style state/end-time TSV.
+def somnotate_state_label(x: Any) -> str:
+    """Convert app labels to labels expected by Somnotate's example pipeline."""
+    state = normalize_state(x)
+    return {
+        "Wake": "awake",
+        "NREM": "non-REM",
+        "REM": "REM",
+        "Undefined": "undefined",
+    }.get(state, "undefined")
 
-    This format is interval based, so it works for both 1 s and 2 s Somnotate
-    epochs. Somnotate converts it to a model-sample vector using time_resolution.
+
+def export_manual_for_somnotate(manual_csv: Path, out_path: Path) -> str:
+    """Export app manual scoring as a Visbrain/Somnotate hypnogram.
+
+    Somnotate 0.5.0 reads this format with two header lines followed by
+    ``state<TAB>end_time_seconds`` rows.  Using the upstream labels here is
+    essential for model training (awake / non-REM / REM / undefined).
     """
     if not manual_csv.exists():
         return ""
@@ -298,12 +371,15 @@ def export_manual_for_somnotate(manual_csv: Path, out_path: Path) -> str:
         return ""
 
     manual = manual.sort_values("t0_s").reset_index(drop=True)
+    if len(manual) == 0:
+        return ""
+
     rows: list[tuple[str, float]] = []
     current_state: str | None = None
     current_end: float | None = None
 
     for _, r in manual.iterrows():
-        state = normalize_state(r["manual_state"])
+        state = somnotate_state_label(r["manual_state"])
         end_s = float(r["t1_s"])
         if current_state is None:
             current_state = state
@@ -319,15 +395,20 @@ def export_manual_for_somnotate(manual_csv: Path, out_path: Path) -> str:
     if current_state is not None and current_end is not None:
         rows.append((current_state, float(current_end)))
 
+    total_duration = float(max(end_s for _, end_s in rows))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w") as f:
+    with out_path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(f"*Duration_sec\t{total_duration:.6f}\n")
+        f.write("*Datafile\tUnspecified\n")
         for state, end_s in rows:
             f.write(f"{state}\t{end_s:.6f}\n")
     return str(out_path)
 
 
 def prepare_one_recording(project_root: Path, recording_id: str, target_fs: float, epoch_sec: float) -> Path:
-    rec_dir = project_root / "recordings" / recording_id
+    rec_dir = resolve_recording_dir(
+        project_root, recording_id, required_files=("metadata.json", "eeg.npy", "emg.npy")
+    )
     som_dir = rec_dir / "somnotate"
     som_dir.mkdir(parents=True, exist_ok=True)
 
@@ -426,7 +507,8 @@ def prepare_one_recording(project_root: Path, recording_id: str, target_fs: floa
 def _rebase_somnotate_manifest_row(project_root: Path, recording_id: str, row: dict[str, Any], epoch_sec: float) -> dict[str, Any]:
     """Repair generated Somnotate paths after a project is moved between machines."""
     tag = epoch_tag(epoch_sec)
-    som_dir = project_root / "recordings" / recording_id / "somnotate"
+    rec_dir = resolve_recording_dir(project_root, recording_id)
+    som_dir = rec_dir / "somnotate"
     row = dict(row)
     canonical = {
         "file_path_raw_signals": som_dir / f"somnotate_input_{tag}.edf",
@@ -450,7 +532,10 @@ def combine_manifests(project_root: Path, recording_ids: list[str], out_path: Pa
     tag = epoch_tag(epoch_sec)
     rows = []
     for rec_id in recording_ids:
-        manifest_path = project_root / "recordings" / rec_id / "somnotate" / f"somnotate_manifest_{tag}.csv"
+        rec_dir = resolve_recording_dir(
+            project_root, rec_id, required_files=(f"somnotate/somnotate_manifest_{tag}.csv",)
+        )
+        manifest_path = rec_dir / "somnotate" / f"somnotate_manifest_{tag}.csv"
         if not manifest_path.exists():
             raise FileNotFoundError(
                 f"Somnotate manifest missing for {rec_id}: {manifest_path}. "
@@ -501,6 +586,7 @@ def find_somnotate_pipeline_dir(somnotate_root: Path) -> Path:
     for c in unique:
         if all((c / name).exists() for name in [
             "01_preprocess_signals.py",
+            "02_test_state_annotation.py",
             "03_train_state_annotation.py",
             "04_run_state_annotation.py",
             "07_compute_state_probabilities.py",
@@ -515,6 +601,7 @@ def find_somnotate_pipeline_dir(somnotate_root: Path) -> Path:
         f"Input path was: {root}\n\n"
         "Expected a folder containing at least:\n"
         " 01_preprocess_signals.py\n"
+        " 02_test_state_annotation.py\n"
         " 03_train_state_annotation.py\n"
         " 04_run_state_annotation.py\n"
         " 07_compute_state_probabilities.py\n"
@@ -650,6 +737,7 @@ def create_epoch_pipeline_copy(somnotate_root: Path, project_root: Path, epoch_s
 def somnotate_scripts(tmp_pipeline_dir: Path) -> dict[str, Path]:
     required = {
         "preprocess": tmp_pipeline_dir / "01_preprocess_signals.py",
+        "test": tmp_pipeline_dir / "02_test_state_annotation.py",
         "train": tmp_pipeline_dir / "03_train_state_annotation.py",
         "score": tmp_pipeline_dir / "04_run_state_annotation.py",
         "probabilities": tmp_pipeline_dir / "07_compute_state_probabilities.py",
@@ -683,6 +771,148 @@ def probabilities_manifest(py: str, tmp_pipeline_dir: Path, manifest_path: Path,
     if not model_file.exists():
         raise FileNotFoundError(model_file)
     run_step([py, str(scripts["probabilities"]), str(manifest_path), str(model_file)], "Somnotate probability computation", cwd=tmp_pipeline_dir)
+
+
+def test_model_manifest(
+    py: str,
+    tmp_pipeline_dir: Path,
+    manifest_path: Path,
+    save_file: Path,
+    model_file: Path | None = None,
+    title: str = "Somnotate model quality control",
+) -> Path:
+    """Run Somnotate's own recording-level validation script and save results."""
+    scripts = somnotate_scripts(tmp_pipeline_dir)
+    save_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [py, str(scripts["test"]), str(manifest_path), "--savefile", str(save_file)]
+    if model_file is not None:
+        cmd += ["--model", str(model_file)]
+    run_step(cmd, title, cwd=tmp_pipeline_dir)
+    if not save_file.exists():
+        raise FileNotFoundError(f"Somnotate QC did not create expected results: {save_file}")
+    return save_file
+
+
+SOMNOTATE_STATE_TO_INT = {"undefined": 0, "awake": 1, "non-REM": 2, "REM": 3}
+SOMNOTATE_INT_TO_APP_STATE = {0: "Undefined", 1: "Wake", 2: "NREM", 3: "REM"}
+
+
+def _manual_state_ids_from_manifest(manifest_path: Path) -> list[int]:
+    """Recover state IDs present in manual annotations, matching Somnotate ordering."""
+    df = pd.read_csv(manifest_path)
+    present: set[int] = set()
+    for value in df.get("file_path_manual_state_annotation", pd.Series(dtype=object)).fillna(""):
+        path = Path(str(value)).expanduser()
+        if not str(value).strip() or not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()[2:]:
+            parts = line.split("\t")
+            if not parts:
+                continue
+            state = parts[0].strip()
+            if state in SOMNOTATE_STATE_TO_INT:
+                present.add(SOMNOTATE_STATE_TO_INT[state])
+    return sorted(present)
+
+
+def _safe_div(num: float, den: float) -> float | None:
+    if den <= 0:
+        return None
+    return float(num / den)
+
+
+def quality_report_from_npz(npz_path: Path, manifest_path: Path, kind: str) -> dict[str, Any]:
+    """Convert Somnotate's accuracy/confusion arrays into a portable JSON report."""
+    z = np.load(npz_path, allow_pickle=False)
+    accuracy = np.asarray(z["accuracy"], dtype=float).ravel()
+    confusion = np.asarray(z["confusion"], dtype=float)
+    manifest = pd.read_csv(manifest_path)
+    ids = manifest.get("recording_id", pd.Series([f"recording_{i+1}" for i in range(len(accuracy))])).astype(str).tolist()
+    if len(ids) != len(accuracy):
+        ids = [f"recording_{i+1}" for i in range(len(accuracy))]
+
+    state_ids = _manual_state_ids_from_manifest(manifest_path)
+    n_states = int(confusion.shape[-1]) if confusion.ndim == 3 else 0
+    if len(state_ids) != n_states:
+        # Somnotate orders confusion labels by sorted unique integer state IDs.
+        # For standard Wake/NREM/REM data this is [1,2,3].
+        state_ids = [1, 2, 3][:n_states] if n_states <= 3 else list(range(n_states))
+
+    aggregate = confusion.sum(axis=0) if confusion.ndim == 3 and len(confusion) else np.zeros((n_states, n_states))
+    per_state = []
+    for i, state_id in enumerate(state_ids):
+        tp = float(aggregate[i, i])
+        actual = float(aggregate[i, :].sum())
+        predicted = float(aggregate[:, i].sum())
+        precision = _safe_div(tp, predicted)
+        recall = _safe_div(tp, actual)
+        f1 = None
+        if precision is not None and recall is not None and precision + recall > 0:
+            f1 = float(2 * precision * recall / (precision + recall))
+        per_state.append(
+            {
+                "state_id": int(state_id),
+                "state": SOMNOTATE_INT_TO_APP_STATE.get(int(state_id), str(state_id)),
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "support": int(round(actual)),
+            }
+        )
+
+    core = [x for x in per_state if x["state"] in {"Wake", "NREM", "REM"} and x["support"] > 0]
+    recalls = [x["recall"] for x in core if x["recall"] is not None]
+    f1s = [x["f1"] for x in core if x["f1"] is not None]
+
+    per_recording = [
+        {"recording_id": rid, "accuracy": float(acc)}
+        for rid, acc in zip(ids, accuracy.tolist())
+    ]
+    report = {
+        "kind": kind,
+        "n_recordings": int(len(accuracy)),
+        "mean_accuracy": float(np.mean(accuracy)) if len(accuracy) else None,
+        "std_accuracy": float(np.std(accuracy)) if len(accuracy) else None,
+        "worst_accuracy": float(np.min(accuracy)) if len(accuracy) else None,
+        "balanced_accuracy": float(np.mean(recalls)) if recalls else None,
+        "macro_f1": float(np.mean(f1s)) if f1s else None,
+        "per_recording": per_recording,
+        "per_state": per_state,
+        "confusion_labels": [SOMNOTATE_INT_TO_APP_STATE.get(int(x), str(x)) for x in state_ids],
+        "confusion_matrix": aggregate.astype(int).tolist(),
+        "raw_results_npz": str(npz_path),
+        "manifest_path": str(manifest_path),
+    }
+    return report
+
+
+def print_quality_summary(report: dict[str, Any], heading: str) -> None:
+    def pct(x):
+        return "n/a" if x is None else f"{100 * float(x):.1f}%"
+
+    print()
+    print(heading)
+    print("-" * len(heading))
+    print("Recordings:", report.get("n_recordings", 0))
+    print("Mean accuracy:", pct(report.get("mean_accuracy")))
+    print("Worst-recording accuracy:", pct(report.get("worst_accuracy")))
+    print("Balanced accuracy (Wake/NREM/REM):", pct(report.get("balanced_accuracy")))
+    print("Macro F1 (Wake/NREM/REM):", pct(report.get("macro_f1")))
+    print("Per-state performance:")
+    for row in report.get("per_state", []):
+        print(
+            f"  {row['state']}: precision={pct(row.get('precision'))}, "
+            f"recall={pct(row.get('recall'))}, F1={pct(row.get('f1'))}, support={row.get('support', 0)}"
+        )
+
+
+def _manifest_rows_with_manual(manifest_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(manifest_path)
+    mask = []
+    for value in df.get("file_path_manual_state_annotation", pd.Series([""] * len(df))).fillna(""):
+        text = str(value).strip()
+        mask.append(bool(text) and Path(text).expanduser().exists())
+    return df.loc[mask].copy()
 
 
 # =============================================================================
@@ -938,7 +1168,7 @@ def infer_epoch_from_current_metadata(som_dir: Path, default_epoch_sec: float) -
 
 
 def import_one_recording(project_root: Path, recording_id: str, epoch_sec: float | None = None) -> Path:
-    rec_dir = project_root / "recordings" / recording_id
+    rec_dir = resolve_recording_dir(project_root, recording_id, required_files=("metadata.json",))
     som_dir = rec_dir / "somnotate"
     metadata = read_metadata(rec_dir)
     duration_s = float(metadata["duration_s"])
@@ -1063,6 +1293,97 @@ def workflow_use_existing_model(args: argparse.Namespace) -> None:
             import_one_recording(project_root, rec_id, epoch_sec)
 
 
+def workflow_evaluate_model(args: argparse.Namespace) -> None:
+    """Evaluate a fixed, already-trained model without retraining it."""
+    project_root = Path(args.project_root).expanduser().resolve()
+    somnotate_root = Path(args.somnotate_root).expanduser().resolve()
+    py = resolve_python(args.somnotate_python, args.somnotate_conda_env)
+    model_file = Path(args.model_file).expanduser().resolve()
+    recording_ids = split_ids(args.recording_ids)
+    epoch_sec = float(args.epoch_sec)
+
+    if not recording_ids:
+        raise ValueError("No evaluation recording IDs provided.")
+
+    runtime = preflight_somnotate_runtime(somnotate_root, py, model_file=model_file)
+    check_model_epoch_compatibility(model_file, epoch_sec, allow_mismatch=args.allow_epoch_mismatch)
+    check_model_runtime_compatibility(model_file, runtime, allow_mismatch=args.allow_version_mismatch)
+
+    if args.prepare:
+        for rec_id in recording_ids:
+            prepare_one_recording(project_root, rec_id, args.target_fs, epoch_sec)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ep_tag = epoch_tag(epoch_sec)
+    manifest_path = project_root / "somnotate_runs" / f"evaluate_existing_model_{ep_tag}_{stamp}.csv"
+    combine_manifests(project_root, recording_ids, manifest_path, epoch_sec)
+
+    manifest = pd.read_csv(manifest_path)
+    manual_rows = _manifest_rows_with_manual(manifest_path)
+    if len(manual_rows) != len(manifest):
+        manual_ids = set(manual_rows.get("recording_id", pd.Series(dtype=str)).astype(str).tolist())
+        all_ids = manifest.get("recording_id", pd.Series(recording_ids)).astype(str).tolist()
+        missing = [rid for rid in all_ids if rid not in manual_ids]
+        raise FileNotFoundError(
+            "Model evaluation requires manual scoring for every selected recording. "
+            "Missing manual annotations for: " + ", ".join(missing)
+        )
+
+    tmp_pipeline_dir = create_epoch_pipeline_copy(somnotate_root, project_root, epoch_sec)
+    if args.preprocess:
+        preprocess_manifest(py, tmp_pipeline_dir, manifest_path)
+
+    qc_dir = project_root / "somnotate_model_qc"
+    qc_dir.mkdir(parents=True, exist_ok=True)
+    safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_file.stem).strip("_") or "somnotate_model"
+    npz_path = qc_dir / f"{safe_model}_{ep_tag}_{stamp}.npz"
+    test_model_manifest(
+        py,
+        tmp_pipeline_dir,
+        manifest_path,
+        npz_path,
+        model_file=model_file,
+        title="Somnotate existing-model evaluation",
+    )
+    evaluation = quality_report_from_npz(npz_path, manifest_path, "existing-model-evaluation")
+    print_quality_summary(evaluation, "Existing-model evaluation")
+
+    independent = args.evaluation_context == "independent-validation"
+    guidance = [
+        "Inspect the worst-performing recording, not only the mean accuracy.",
+        "Inspect Wake, NREM and REM precision/recall/F1 separately; overall accuracy can hide weak minority-state performance.",
+        "Check the confusion matrix for systematic errors, especially REM confused with Wake or NREM.",
+        "Visually review representative EEG/EMG and disagreement periods before relying on automated labels.",
+        "There is no universal accuracy threshold that guarantees a scientifically valid sleep-stage model.",
+    ]
+    if independent:
+        guidance.insert(0, "These recordings were declared independent of model training, so this report can be interpreted as held-out validation.")
+    else:
+        guidance.insert(0, "These recordings may have been used for training (or their status is unknown), so this report is descriptive and may be optimistic.")
+
+    report = {
+        "report_type": "existing-model-evaluation",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model_file": str(model_file),
+        "somnotate_epoch_sec": float(epoch_sec),
+        "target_fs": float(args.target_fs),
+        "recording_ids": recording_ids,
+        "evaluation_context": args.evaluation_context,
+        "evaluation": evaluation,
+        "somnotate_root": str(somnotate_root),
+        "somnotate_git_commit": somnotate_git_commit(somnotate_root),
+        "runtime_versions": runtime,
+        "guidance": guidance,
+    }
+    report_path = qc_dir / f"{safe_model}_{ep_tag}_{stamp}.quality.json"
+    write_json(report_path, report)
+
+    print()
+    print("Existing model was evaluated without retraining.")
+    print("Quality report saved here:")
+    print(report_path)
+
+
 def workflow_train_model(args: argparse.Namespace) -> None:
     project_root = Path(args.project_root).expanduser().resolve()
     somnotate_root = Path(args.somnotate_root).expanduser().resolve()
@@ -1073,6 +1394,12 @@ def workflow_train_model(args: argparse.Namespace) -> None:
 
     if not train_ids:
         raise ValueError("No training recording IDs provided.")
+    overlap = sorted(set(train_ids) & set(test_ids))
+    if overlap:
+        raise ValueError(
+            "Training and held-out test recordings must be separate. "
+            f"Remove these IDs from one set: {', '.join(overlap)}"
+        )
 
     runtime = preflight_somnotate_runtime(somnotate_root, py)
 
@@ -1086,7 +1413,15 @@ def workflow_train_model(args: argparse.Namespace) -> None:
             prepare_one_recording(project_root, rec_id, args.target_fs, epoch_sec)
 
     for rec_id in train_ids:
-        manifest_path = project_root / "recordings" / rec_id / "somnotate" / f"somnotate_manifest_{epoch_tag(epoch_sec)}.csv"
+        rec_dir = resolve_recording_dir(
+            project_root, rec_id,
+            required_files=(f"somnotate/somnotate_manifest_{epoch_tag(epoch_sec)}.csv",),
+        )
+        manifest_path = rec_dir / "somnotate" / f"somnotate_manifest_{epoch_tag(epoch_sec)}.csv"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Somnotate manifest missing for training recording {rec_id}: {manifest_path}. Run Prepare first."
+            )
         df = pd.read_csv(manifest_path)
         manual_path = str(df.iloc[0].get("file_path_manual_state_annotation", ""))
         if not manual_path or manual_path == "nan" or not Path(manual_path).exists():
@@ -1097,19 +1432,60 @@ def workflow_train_model(args: argparse.Namespace) -> None:
 
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     ep_tag = epoch_tag(epoch_sec)
-    safe_name = str(args.model_name or "model").strip().replace(" ", "_").replace("/", "_")
-    # Include epoch tag in the filename unless the user already did it.
+    safe_name = str(args.model_name or "model").strip().replace(" ", "_").replace("/", "_").replace("\\\\", "_")
     if ep_tag not in safe_name:
         safe_name = f"{safe_name}_{ep_tag}"
 
     train_manifest = project_root / "somnotate_runs" / f"{safe_name}_training_manifest_{tag}.csv"
     model_file = project_root / "somnotate_models" / f"{safe_name}_{tag}.pickle"
     combine_manifests(project_root, train_ids, train_manifest, epoch_sec)
+    present_state_ids = set(_manual_state_ids_from_manifest(train_manifest))
+    missing_states = [SOMNOTATE_INT_TO_APP_STATE[x] for x in (1, 2, 3) if x not in present_state_ids]
+    if missing_states:
+        raise ValueError(
+            "Training annotations do not contain all three sleep states. "
+            f"Missing across the training set: {', '.join(missing_states)}. "
+            "A Wake/NREM/REM model should be trained with examples of every state."
+        )
 
     tmp_pipeline_dir = create_epoch_pipeline_copy(somnotate_root, project_root, epoch_sec)
 
     if args.preprocess:
         preprocess_manifest(py, tmp_pipeline_dir, train_manifest)
+
+    quality: dict[str, Any] = {
+        "report_type": "training-qc",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model_file": str(model_file),
+        "somnotate_epoch_sec": float(epoch_sec),
+        "train_recording_ids": train_ids,
+        "test_recording_ids": test_ids,
+        "guidance": [
+            "Prefer recording/animal-level validation; do not randomly split neighbouring epochs from the same recording.",
+            "Check the worst-performing recording, not only the mean accuracy.",
+            "Inspect Wake, NREM and REM precision/recall/F1 separately; overall accuracy can hide weak minority-state performance.",
+            "Whenever possible, reserve independent held-out recordings/animals that were not used for final model fitting.",
+            "There is no universal accuracy threshold that guarantees a scientifically valid model; visually review disagreements and representative EEG/EMG before relying on it.",
+        ],
+    }
+
+    if args.quality_control:
+        if len(train_ids) >= 2:
+            cv_npz = model_file.with_name(model_file.stem + "_cv.npz")
+            test_model_manifest(
+                py,
+                tmp_pipeline_dir,
+                train_manifest,
+                cv_npz,
+                model_file=None,
+                title="Somnotate leave-one-recording-out cross-validation",
+            )
+            quality["cross_validation"] = quality_report_from_npz(cv_npz, train_manifest, "leave-one-recording-out")
+            print_quality_summary(quality["cross_validation"], "Training-set cross-validation")
+        else:
+            quality["cross_validation"] = None
+            print()
+            print("Model QC warning: leave-one-recording-out cross-validation requires at least 2 training recordings.")
 
     train_model(py, tmp_pipeline_dir, train_manifest, model_file)
 
@@ -1143,15 +1519,46 @@ def workflow_train_model(args: argparse.Namespace) -> None:
         combine_manifests(project_root, test_ids, test_manifest, epoch_sec)
         if args.preprocess:
             preprocess_manifest(py, tmp_pipeline_dir, test_manifest)
+
+        manual_test = _manifest_rows_with_manual(test_manifest)
+        if args.quality_control and len(manual_test):
+            heldout_manifest = project_root / "somnotate_runs" / f"{safe_name}_heldout_qc_manifest_{tag}.csv"
+            manual_test.to_csv(heldout_manifest, index=False)
+            heldout_npz = model_file.with_name(model_file.stem + "_heldout_test.npz")
+            test_model_manifest(
+                py,
+                tmp_pipeline_dir,
+                heldout_manifest,
+                heldout_npz,
+                model_file=model_file,
+                title="Somnotate held-out model quality control",
+            )
+            quality["heldout_test"] = quality_report_from_npz(heldout_npz, heldout_manifest, "held-out")
+            print_quality_summary(quality["heldout_test"], "Held-out test performance")
+        elif args.quality_control:
+            quality["heldout_test"] = None
+            print()
+            print("Held-out QC not calculated: none of the test recordings has manual scoring.")
+
         score_manifest(py, tmp_pipeline_dir, test_manifest, model_file)
         probabilities_manifest(py, tmp_pipeline_dir, test_manifest, model_file)
         for rec_id in test_ids:
             import_one_recording(project_root, rec_id, epoch_sec)
 
+    if args.quality_control:
+        quality_path = model_file.with_suffix(".quality.json")
+        write_json(quality_path, quality)
+        meta = read_model_metadata(model_file) or {}
+        meta["quality_report_file"] = str(quality_path)
+        write_model_metadata(model_file, meta)
+        print()
+        print("Model quality report saved here:")
+        print(quality_path)
+
 
 def workflow_attach_outputs(args: argparse.Namespace) -> None:
     project_root = Path(args.project_root).expanduser().resolve()
-    rec_dir = project_root / "recordings" / args.recording_id
+    rec_dir = resolve_recording_dir(project_root, args.recording_id)
     som_dir = rec_dir / "somnotate"
     som_dir.mkdir(parents=True, exist_ok=True)
     epoch_sec = float(args.epoch_sec)
@@ -1229,6 +1636,26 @@ def main() -> None:
     p.add_argument("--probabilities", action="store_true")
     p.add_argument("--import-results", action="store_true")
 
+    p = sub.add_parser("evaluate-model")
+    p.add_argument("--project-root", required=True)
+    p.add_argument("--recording-ids", required=True)
+    p.add_argument("--somnotate-root", required=True)
+    p.add_argument("--somnotate-python", default="")
+    p.add_argument("--somnotate-conda-env", default="somnotate_env")
+    p.add_argument("--model-file", required=True)
+    p.add_argument("--target-fs", type=float, default=512.0)
+    add_epoch_arg(p)
+    p.add_argument(
+        "--evaluation-context",
+        choices=["independent-validation", "training-or-unknown"],
+        default="independent-validation",
+        help="Whether the manually scored evaluation recordings were independent of model training.",
+    )
+    p.add_argument("--allow-epoch-mismatch", action="store_true", help="Advanced/debug only: do not block model epoch mismatch.")
+    p.add_argument("--allow-version-mismatch", action="store_true", help="Advanced/debug only: do not block version mismatch for app-trained models.")
+    p.add_argument("--prepare", action="store_true")
+    p.add_argument("--preprocess", action="store_true")
+
     p = sub.add_parser("train-model")
     p.add_argument("--project-root", required=True)
     p.add_argument("--train-recording-ids", required=True)
@@ -1241,6 +1668,11 @@ def main() -> None:
     add_epoch_arg(p)
     p.add_argument("--prepare", action="store_true")
     p.add_argument("--preprocess", action="store_true")
+    p.add_argument(
+        "--quality-control",
+        action="store_true",
+        help="Run leave-one-recording-out CV and held-out evaluation (when manual test labels exist).",
+    )
 
     p = sub.add_parser("attach-outputs")
     p.add_argument("--project-root", required=True)
@@ -1262,6 +1694,8 @@ def main() -> None:
             prepare_one_recording(project_root, rec_id, args.target_fs, float(args.epoch_sec))
     elif args.command == "use-existing-model":
         workflow_use_existing_model(args)
+    elif args.command == "evaluate-model":
+        workflow_evaluate_model(args)
     elif args.command == "train-model":
         workflow_train_model(args)
     elif args.command == "attach-outputs":
