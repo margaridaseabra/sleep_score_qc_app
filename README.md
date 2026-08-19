@@ -60,6 +60,28 @@ Users normally do **not** need to enter or manage that path manually.
 
 The installer can be run again later to repair or update the environments.
 
+
+### Starting a QC session
+
+After `RUN_APP.bat` opens the app:
+
+1. Load or select the project folder.
+2. Choose a recording from the **Recording** dropdown.
+3. Click **Load recording**.
+4. Review the EEG/EMG and scoring layers in **QC / Review**.
+
+A recording is intentionally not loaded automatically when a project is opened. This prevents accidentally opening the first recording in a project.
+
+The **Synchronized epoch review** panel also remains inactive until an interval is explicitly selected.
+
+To start synchronized review:
+
+1. Switch the QC plot to **Select** mode (`S`).
+2. Drag over the interval you want to inspect.
+3. The synchronized EEG/EMG/video review panel will appear.
+
+Dissociation events can also be selected manually from the dissociation review queue to jump directly to an event.
+
 ## Main workflow
 
 The app supports:
