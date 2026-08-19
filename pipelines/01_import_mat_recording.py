@@ -233,9 +233,9 @@ def main():
         "eeg_fs_key": args.eeg_fs_key,
         "ach_fs_key": args.ach_fs_key,
 
-        "eeg_file": str(eeg_path),
-        "emg_file": str(emg_path),
-        "ach_file": ach_path,
+        "eeg_file": "eeg.npy",
+        "emg_file": "emg.npy",
+        "ach_file": "ach.npy" if ach_path else None,
 
         "sampling_rate_hz": eeg_fs,
         "eeg_sampling_rate_hz": eeg_fs,
@@ -268,11 +268,11 @@ def main():
 
         manual_path = rec_dir / "manual_scoring_aligned.csv"
         manual.to_csv(manual_path, index=False)
-        manual_file = str(manual_path)
+        manual_file = "manual_scoring_aligned.csv"
 
     manifest_row = {
         "recording_id": args.recording_id,
-        "recording_dir": str(rec_dir),
+        "recording_dir": f"recordings/{args.recording_id}",
         "source_mat_file": str(mat_file),
         "mouse_id": args.mouse_id,
         "group": args.group,
@@ -283,7 +283,7 @@ def main():
         "eeg_sampling_rate_hz": eeg_fs,
         "emg_sampling_rate_hz": emg_fs,
         "ach_sampling_rate_hz": ach_fs,
-        "ach_file": ach_path,
+        "ach_file": "ach.npy" if ach_path else None,
         "manual_scoring_file": manual_file,
         "preprocessing_done": True,
     }

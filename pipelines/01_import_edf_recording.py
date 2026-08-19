@@ -362,7 +362,7 @@ def import_edf(args: argparse.Namespace) -> None:
             project_root,
             {
                 "recording_id": str(args.recording_id),
-                "recording_dir": str(recording_dir),
+                "recording_dir": f"recordings/{args.recording_id}",
                 "source_file": str(edf_path),
                 "source_format": metadata["source_format"],
                 "sampling_rate_hz": target_fs,

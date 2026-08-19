@@ -1,117 +1,115 @@
 # Sleep Stage QC
 
-A cross-platform Dash application for semi-automated EEG/EMG sleep scoring, quality control, and manual review.
+**Sleep Stage QC** is a Dash-based application for semi-automated EEG/EMG sleep scoring quality control.
 
-The app supports importing recordings, computing initial Wake/Sleep scoring, running or importing Somnotate scoring, reviewing EEG/EMG/photometry signals, identifying disagreements between scoring layers, manually correcting sleep states, linking local video, and exporting reviewed scoring.
+It supports recording import, Layer 1 Wake/Sleep scoring, Somnotate Wake/NREM/REM scoring, manual review, synchronized video QC, dissociation analysis, and export of final reviewed scoring.
 
-> **Recommended application:** Dash  
-> **Legacy application:** The older Streamlit version is retained only for reference.
+> **Current release candidate:** `1.1.0-rc1`
 
----
+## Windows: easiest installation
 
-## Features
+For normal Windows users, you do **not** need to create Python environments or install Somnotate manually.
 
-- MATLAB (`.mat`) and EDF (`.edf`) import
-- Automatic Layer 1 Wake/Sleep scoring
-- Somnotate Wake/NREM/REM integration
-- Interactive EEG, EMG, photometry and spectrogram review
-- Manual interval scoring and keyboard shortcuts
-- Dissociation analysis between scoring layers
-- Optional local video synchronization
-- Local AVI-to-MP4 conversion for browser playback
-- CSV, MATLAB and EDF export
-- 1-second and 2-second final scoring epochs
-- 1-second, 2-second and legacy 5-second Somnotate model support
-- macOS and Windows support
+### Prerequisite
 
----
+Install one Conda distribution first:
 
-## Installation
+- Miniconda
+- Anaconda
+- Miniforge
 
-### 1. Clone the repository
+Then:
 
-```bash
-git clone https://github.com/margaridaseabra/sleep_score_qc_app.git
-cd sleep_score_qc_app
-```
+1. Open this repository on GitHub.
+2. Choose **Code → Download ZIP**.
+3. Extract the ZIP to a normal folder.
+4. Double-click **`INSTALL_WINDOWS.bat`**.
+5. Wait until it reports **Installation successful**.
+6. Double-click **`RUN_APP.bat`** whenever you want to use the app.
 
-### 2. Create the Conda environment
-
-```bash
-conda env create -f environment.yml
-conda activate sleep_stage_qc_v2
-```
-
-If the environment already exists:
-
-```bash
-conda env update -f environment.yml --prune
-conda activate sleep_stage_qc_v2
-```
-
-The environment installs Dash and FFmpeg. FFmpeg is used only for local AVI conversion; it is not bundled in the repository.
-
----
-
-## Run on macOS
-
-Open Terminal in the repository folder:
-
-```bash
-conda activate sleep_stage_qc_v2
-bash run_app.sh
-```
-
-Alternatively:
-
-```bash
-python dash_app/app.py
-```
-
-## Run on Windows
-
-Open **Anaconda Prompt** in the repository folder:
-
-```bat
-conda activate sleep_stage_qc_v2
-run_app_windows.bat
-```
-
-Alternatively:
-
-```bat
-python dash_app\app.py
-```
-
-The app normally opens at:
+`RUN_APP.bat` starts the Dash server and opens:
 
 ```text
 http://127.0.0.1:8050
 ```
 
-### Windows diagnostics
+### What the Windows installer does
 
-```bat
-python check_windows_setup.py
+`INSTALL_WINDOWS.bat` automatically:
+
+- creates or updates the `sleep_stage_qc_v2` Conda environment;
+- creates or updates the separate `somnotate_env` environment;
+- downloads Somnotate from the official `paulbrodersen/somnotate` GitHub repository;
+- pins Somnotate to the tested commit:
+
+```text
+a20f33de62511d8c172e333896608b7fc166d0f0
 ```
 
-The diagnostic script checks Python, the active Conda environment, required packages, pipeline scripts, write permissions and FFmpeg availability.
+- installs Somnotate into its dedicated environment;
+- checks that the Somnotate source matches the app's supported pipeline contract;
+- runs the app setup diagnostics.
 
----
+The supported Somnotate source is stored automatically under the user's local application-data directory, approximately:
 
-## Typical workflow
+```text
+C:\Users\<USER>\AppData\Local\SleepStageQC\somnotate_a20f33de
+```
 
-1. Import a MATLAB or EDF recording.
+Users normally do **not** need to enter or manage that path manually.
+
+The installer can be run again later to repair or update the environments.
+
+
+### Starting a QC session
+
+After `RUN_APP.bat` opens the app:
+
+1. Load or select the project folder.
+2. Choose a recording from the **Recording** dropdown.
+3. Click **Load recording**.
+4. Review the EEG/EMG and scoring layers in **QC / Review**.
+
+A recording is intentionally not loaded automatically when a project is opened. This prevents accidentally opening the first recording in a project.
+
+The **Synchronized epoch review** panel also remains inactive until an interval is explicitly selected.
+
+To start synchronized review:
+
+1. Switch the QC plot to **Select** mode (`S`).
+2. Drag over the interval you want to inspect.
+3. The synchronized EEG/EMG/video review panel will appear.
+
+Dissociation events can also be selected manually from the dissociation review queue to jump directly to an event.
+
+## Main workflow
+
+The app supports:
+
+1. Import `.mat` or EDF recordings.
 2. Compute epoch features.
 3. Run Layer 1 Wake/Sleep scoring.
-4. Run or import Somnotate scoring, if required.
-5. Review and correct scoring in **QC / Review**.
-6. Run dissociation analysis, if required.
-7. Export the final reviewed scoring.
+4. Run Somnotate Wake/NREM/REM scoring with an existing model, or train/evaluate a model.
+5. Review EEG, EMG, probabilities and scoring layers.
+6. Correct Final scoring manually or copy labels from Somnotate, Layer 1 or Manual scoring.
+7. Review dissociation/disagreement events.
+8. Use synchronized video QC when video is available.
+9. Export final scoring.
 
----
+The scoring layers are:
 
-## Project structure
+| Layer | Meaning |
+|---|---|
+| Layer 1 | Automatic Wake/Sleep |
+| Somnotate | Automatic Wake/NREM/REM |
+| Manual | Imported manual scoring |
+| Final | Reviewed scoring created by the user |
+
+**Final scoring starts empty/Undefined by default** and is filled only when the user explicitly applies or accepts labels.
+
+## Project folder structure
+
+A prepared project typically looks like:
 
 ```text
 project_root/
@@ -129,221 +127,218 @@ project_root/
             └── somnotate_results_timeseries.csv
 ```
 
-Raw recordings and videos should remain outside the Git repository, for example on a local disk, external drive, OneDrive or shared data drive.
-
----
-
-## Import and Layer 1
-
-Supported recording formats:
-
-| Format | Support |
-|---|---|
-| MATLAB (`.mat`) | Yes |
-| EDF (`.edf`) | Yes |
-
-Supported signals include EEG, EMG and optional ACh/fiber photometry.
-
-After import, run **Compute epoch features** and then **Run Layer 1**. The main generated files are:
-
-```text
-epoch_features.csv
-layer1_wake_sleep.csv
-```
-
----
-
-## Somnotate
-
-The app supports existing or newly trained Somnotate models using:
-
-- 1-second epochs
-- 2-second epochs
-- legacy 5-second models
-
-The Somnotate scoring epoch length must match the epoch length used during model training.
-
-Somnotate is installed separately from its upstream repository:
-
-```text
-https://github.com/paulbrodersen/somnotate
-```
-
----
+Keep real recording data outside this Git repository.
 
 ## QC / Review
 
 The QC viewer can display:
 
-- Final, Somnotate, Layer 1 and Manual scoring rows
-- Raw EEG
-- EEG spectrogram
-- Raw EMG
-- Optional ACh/fiber photometry
-- State probabilities
-- Dissociation review events
-- Optional synchronized video
+- scoring rows;
+- EEG;
+- EEG spectrogram;
+- EMG;
+- optional ACh/fiber-photometry trace;
+- Somnotate state probabilities;
+- Final scoring;
+- dissociation-review events.
 
-The coloured overlays over the traces represent the current **Final** scoring.
-
-### Keyboard shortcuts
+Useful keyboard shortcuts:
 
 | Key | Action |
 |---|---|
 | `P` | Pan |
-| `S` | Select an interval |
+| `S` | Select interval |
 | `Z` | Zoom |
-| `1` | Apply Wake |
-| `2` | Apply NREM |
-| `3` | Apply REM |
+| `1` | Wake |
+| `2` | NREM |
+| `3` | REM |
 | `A` | Apply Somnotate |
 | `L` | Apply Layer 1 |
-| `M` | Apply Manual scoring |
+| `M` | Apply Manual |
 
-After an interval is scored, the selection is cleared to reduce accidental rescoring of an older selection.
-
----
-
-## Local video synchronization
-
-The app stores only the path to a video on the user's computer. Videos are not uploaded to GitHub or copied into the application.
-
-Recommended browser format:
-
-```text
-MP4 with H.264 video
-```
-
-### AVI conversion
-
-Most browsers cannot play AVI directly. When an AVI is selected, use **Convert AVI locally to browser MP4**.
-
-The app then:
-
-1. Keeps the original AVI unchanged.
-2. Runs FFmpeg locally on the user's computer.
-3. Saves the converted file beside the AVI as:
-
-```text
-original_name_browser.mp4
-```
-
-4. Reuses that MP4 on future runs when it is already up to date.
-5. Stores the original AVI path and browser MP4 path in the recording's `metadata.json`.
-
-Example local files:
-
-```text
-D:\sleep_data\mouse12\mouse12.avi
-D:\sleep_data\mouse12\mouse12_browser.mp4
-```
-
-or on macOS:
-
-```text
-/Volumes/T7/sleep_data/mouse12/mouse12.avi
-/Volumes/T7/sleep_data/mouse12/mouse12_browser.mp4
-```
-
-Video synchronization follows:
-
-```text
-video_time_s = recording_time_s - video_offset_s
-```
-
-The converted video remains part of the user's local dataset and is ignored by Git.
-
----
-
-## Dissociation analysis
-
-The Dissociation tab highlights periods where scoring layers disagree, including:
-
-- Layer 1 versus Somnotate
-- Final versus Somnotate
-- Low-confidence periods
-- Frequently corrected scoring patterns
-
-After running the analysis, use the dissociation queue in **QC / Review** to inspect the flagged intervals.
-
----
-
-## Final scoring and export
-
-Final scoring starts as `Undefined` and changes only when the reviewer applies labels or fills empty epochs from another scoring source.
-
-Final scoring is continuously saved to:
+Final scoring is written to:
 
 ```text
 project_root/recordings/<recording_id>/final_scoring.csv
 ```
 
-Export formats:
+## Synchronized video QC
 
-- CSV
-- MATLAB (`.mat`)
-- EDF (`.edf`)
+A recording can be linked to an `.mp4`, `.mov`, or `.avi` video.
 
----
+For reliable browser playback, H.264 MP4 is recommended.
 
-## Troubleshooting
+Long source videos do not need to be converted in full. During synchronized review, the app creates short optimized **local QC clips** and reuses them for nearby selections. This avoids repeatedly seeking through multi-hour videos.
 
-### No recordings appear
+The original video is not modified.
 
-Confirm that the selected project root contains:
+The synchronized review panel provides:
+
+- EEG and EMG for the selected interval;
+- synchronized video;
+- Play selection;
+- previous/next epoch controls;
+- replay current epoch;
+- a browser-side red playhead showing the current video position on EEG/EMG;
+- a local review cache that can be cleared from the app.
+
+Synchronization uses:
 
 ```text
-recordings/
+video_time_s = recording_time_s - video_offset_s
 ```
 
-and at least one imported recording folder.
+## Somnotate
 
-### Feature extraction fails
+Somnotate runs in a separate environment because the supported Somnotate 0.5.0 stack uses older scientific dependencies than the main Dash app.
 
-Update and reactivate the environment:
+### Normal Windows users
 
-```bash
-conda env update -f environment.yml --prune
-conda activate sleep_stage_qc_v2
-```
-
-Check the pipeline log in the repository's `logs/` folder.
-
-### Layer 1 does not run
-
-Confirm that `epoch_features.csv` exists in the recording folder. Layer 1 depends on that file.
-
-### AVI conversion is unavailable
-
-Confirm FFmpeg is available in the active environment:
-
-```bash
-ffmpeg -version
-```
-
-If it is missing:
-
-```bash
-conda env update -f environment.yml --prune
-conda activate sleep_stage_qc_v2
-```
-
-### Somnotate feature mismatch
-
-Use a Somnotate model trained with the same epoch duration as the scoring run.
-
-### Windows setup problems
+Do not install Somnotate manually.
 
 Run:
 
-```bat
-python check_windows_setup.py
+```text
+INSTALL_WINDOWS.bat
 ```
 
-and share the generated output and relevant file from `logs/` when reporting a problem.
+The installer downloads and configures the supported Somnotate version automatically.
 
----
+### Advanced/manual Somnotate setup
 
-## Legacy Streamlit application
+For development, troubleshooting, macOS setup, or manual installation:
 
-The previous Streamlit application is retained only for reference. New scoring and development should use the Dash application.
+```bash
+git clone https://github.com/paulbrodersen/somnotate.git
+cd somnotate
+git checkout a20f33de62511d8c172e333896608b7fc166d0f0
+```
+
+From the Sleep Stage QC repository:
+
+```bash
+conda env create -f environment_somnotate.yml
+conda activate somnotate_env
+python -m pip install -e /path/to/somnotate --no-deps
+```
+
+The tested Windows Somnotate runtime uses:
+
+```text
+Python          3.9
+Somnotate       0.5.0
+pomegranate     0.14.4
+numpy           1.26.4
+pandas          2.3.3
+scikit-learn    1.6.1
+scipy           1.13.1
+matplotlib      3.9.4
+pyedflib        0.1.42
+lspopt          1.4.0
+```
+
+The app runs Somnotate using a temporary compatibility copy of its example pipeline. The upstream Somnotate checkout itself is not modified.
+
+## Bundled models
+
+The repository can contain Somnotate model files under:
+
+```text
+somnotate_models/
+```
+
+Historical models may have been serialized under a different scikit-learn version. Model metadata and runtime warnings should therefore be reviewed before using a model for final scientific analyses.
+
+For reproducible final work, prefer a model trained and saved with the standardized supported environment.
+
+## macOS
+
+The current Windows installer is the supported easy-install path for v1.1.
+
+For macOS, use the manual setup described in `START_HERE.md` and `COMPATIBILITY.md` until the dedicated Mac installer has completed regression testing.
+
+Apple Silicon may require the Somnotate environment to run as `osx-64` under Rosetta because of the legacy `pomegranate 0.14.4` dependency.
+
+## Diagnostics and tests
+
+Check the current setup with:
+
+```bash
+python check_setup.py
+```
+
+Run the test suite with:
+
+```bash
+python -m pytest -q
+```
+
+The repository CI runs the supported tests on Windows and macOS.
+
+## Repository structure
+
+```text
+sleep_score_qc_app/
+├── INSTALL_WINDOWS.bat
+├── RUN_APP.bat
+├── README.md
+├── START_HERE.md
+├── COMPATIBILITY.md
+├── CHANGELOG.md
+├── RELEASE_CHECKLIST.md
+├── VERSION
+├── environment.yml
+├── environment_somnotate.yml
+├── check_setup.py
+├── check_windows_setup.py
+├── run_app.sh
+├── dash_app/
+├── pipelines/
+├── somnotate_models/
+├── tests/
+├── tools/
+└── .github/
+```
+
+## Troubleshooting
+
+### Conda is not found
+
+Install Miniconda, Anaconda, or Miniforge, then run `INSTALL_WINDOWS.bat` again.
+
+### App environment is missing or damaged
+
+Run `INSTALL_WINDOWS.bat` again. It is designed to update/repair the environments.
+
+### Somnotate is missing
+
+Run `INSTALL_WINDOWS.bat` again. The installer automatically restores the supported Somnotate source and environment.
+
+### App does not open automatically
+
+Open:
+
+```text
+http://127.0.0.1:8050
+```
+
+while `RUN_APP.bat` is still running.
+
+### No recordings appear
+
+Confirm that the selected project root contains a `recordings/` folder and prepared recording files.
+
+### Video review is slow
+
+Use the synchronized review panel. It creates short local QC clips specifically to avoid repeated random seeking through long source videos.
+
+## Development / release status
+
+`1.1.0-rc1` is a release candidate.
+
+Before final `1.1.0`:
+
+- complete fresh-install Windows validation;
+- complete full macOS regression;
+- verify the same Somnotate model/recording produces equivalent outputs across supported platforms;
+- then merge the release branch and tag the final release.

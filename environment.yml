@@ -2,18 +2,15 @@ name: sleep_stage_qc_v2
 channels:
   - conda-forge
 dependencies:
+  # Supported app runtime. Keep this separate from Somnotate's legacy runtime.
   - python=3.11
-  - h5py
-  - numpy
-  - pandas
-  - scikit-learn
-  - scipy
-  - plotly
-  - dash
-  - ffmpeg
-  - streamlit
+  - numpy>=2.0,<3
+  - pandas>=2.2,<4
+  - scipy>=1.13,<2
+  - scikit-learn>=1.6,<2
+  - h5py>=3.10,<4
+  - plotly>=6,<7
+  - dash>=4,<5
+  - pyedflib>=0.1.40,<0.2
+  - ffmpeg>=7,<10
   - pip
-  - dash
-  - pip:
-      - streamlit-plotly-events
-      - pyedflib
