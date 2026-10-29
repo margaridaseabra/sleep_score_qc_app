@@ -249,7 +249,12 @@ cross-animal calibrated effect sizes.
 `ach_sampling_rate_hz`, `photometry_sampling_rate_hz`, or
 `ne_frequency` in `metadata.json`. It checks the auxiliary duration
 against the scoring duration and **skips** inconsistent or unspecified time
-bases rather than assuming EEG sampling rate. Unless already calibrated by
+bases rather than assuming EEG sampling rate. If the photometry stream starts
+at a known offset from EEG t=0, set `photometry_offset_s` (or
+`ach_offset_s`) in `metadata.json`; a **positive** offset means the
+photometry starts later than the EEG. This is separate from the video offset.
+If the onset is unknown, verify the synchronization externally before
+interpreting its timing. Unless already calibrated by
 your preparation pipeline, raw numbers remain in unverified sensor units:
 the app **does not infer ΔF/F, acetylcholine concentration or NE from
 voltages**. Z-score denotes only a descriptive baseline relative to this
