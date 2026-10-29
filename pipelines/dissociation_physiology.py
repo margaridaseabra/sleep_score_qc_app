@@ -168,18 +168,32 @@ def align_photometry(epochs: pd.DataFrame, rec_dir: Path, metadata: dict):
         info["status"] = "Photometry file present, but no explicit photometry sampling rate. Skipped."
         return means, std, info
 
+    # Optional recording-relative signal onset: +10 means photometry starts
+    # 10 seconds after EEG t=0. Video offsets are deliberately unrelated.
+    try:
+        onset_s = float(metadata.get("photometry_offset_s",
+                                    metadata.get("ach_offset_s", 0.0)))
+    except (ValueError, TypeError):
+        info["status"] = "Invalid photometry_offset_s / ach_offset_s. Skipped."
+        return means, std, info
+    if not np.isfinite(onset_s):
+        info["status"] = "Non-finite photometry time offset. Skipped."
+        return means, std, info
+
     try:
         signal = np.load(path, mmap_mode="r", allow_pickle=False)
         if signal.ndim != 1:
             raise ValueError("expected 1D photometry array")
         signal_duration = len(signal) / fs
         reference_duration = float(pd.to_numeric(epochs["t1_s"], errors="coerce").max())
+        expected_duration = reference_duration - onset_s
         if (not np.isfinite(reference_duration) or reference_duration <= 0 or
-            signal_duration <= 0 or
-            abs(signal_duration - reference_duration) > max(2, 0.05 * reference_duration)):
+            expected_duration <= 0 or signal_duration <= 0 or
+            abs(signal_duration - expected_duration) > max(2, 0.05 * reference_duration)):
             info["status"] = (
                 f"Photometry time base unverified: {signal_duration:.1f}s from array/fs "
-                f"vs {reference_duration:.1f}s scoring. Skipped to prevent misalignment."
+                f"vs expected {expected_duration:.1f}s (scoring {reference_duration:.1f}s, "
+                f"photometry onset {onset_s:+.1f}s). Skipped to prevent misalignment."
             )
             return means, std, info
 
@@ -189,8 +203,8 @@ def align_photometry(epochs: pd.DataFrame, rec_dir: Path, metadata: dict):
         for i, (t0, t1) in enumerate(zip(start, end)):
             if not (np.isfinite(t0) and np.isfinite(t1) and t1 > t0):
                 continue
-            a = min(len(signal), max(0, int(np.ceil(t0 * fs - 1e-8))))
-            b = min(len(signal), max(0, int(np.ceil(t1 * fs - 1e-8))))
+            a = min(len(signal), max(0, int(np.ceil((t0 - onset_s) * fs - 1e-8))))
+            b = min(len(signal), max(0, int(np.ceil((t1 - onset_s) * fs - 1e-8))))
             if b <= a:
                 continue
             slice_ = np.asarray(signal[a:b], dtype=float)
@@ -205,7 +219,7 @@ def align_photometry(epochs: pd.DataFrame, rec_dir: Path, metadata: dict):
         unit = str(metadata.get("photometry_units") or metadata.get("ach_units") or
                    metadata.get("ne_units") or "unverified raw units")
         info.update(available=bool(np.isfinite(means).any()), source=source,
-                    sampling_rate_hz=fs, units=unit, status="aligned")
+                    sampling_rate_hz=fs, onset_s=onset_s, units=unit, status="aligned")
     except (OSError, ValueError, TypeError) as exc:
         info["status"] = f"Could not safely read photometry: {exc}"
     return means, std, info
