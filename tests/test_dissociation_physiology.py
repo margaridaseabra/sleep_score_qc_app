@@ -65,6 +65,20 @@ def test_photometry_uses_its_own_fs_and_raw_scale(tmp_path):
     assert info["sampling_rate_hz"] == 2.0
 
 
+def test_explicit_photometry_onset_aligns_sample_time(tmp_path):
+    epochs = pd.DataFrame({"t0_s": [0., 2., 4.], "t1_s": [2., 4., 6.]})
+    # Auxiliary signal starts at EEG t=2s, lasts until t=6s (2 Hz).
+    np.save(tmp_path / "ach.npy", np.arange(8, dtype=np.float32))
+    mean, _, info = align_photometry(
+        epochs, tmp_path,
+        {"ach_file": "ach.npy", "ach_sampling_rate_hz": 2,
+         "photometry_offset_s": 2},
+    )
+    assert np.isnan(mean[0])
+    assert mean[1:].tolist() == pytest.approx([1.5, 5.5])
+    assert info["onset_s"] == 2.0
+
+
 def test_photometry_missing_fs_and_wrong_time_base_are_not_assumed(tmp_path):
     epochs = pd.DataFrame({"t0_s": [0, 1, 2, 3], "t1_s": [1, 2, 3, 4]})
     np.save(tmp_path / "ach.npy", np.arange(10, dtype=np.float32))
