@@ -200,7 +200,11 @@ def event_raster_figure(events):
             x=(group["start"] + group["end"]) / 2, y=[reason] * len(group),
             mode="markers", name=reason, showlegend=False,
             marker=dict(size=9, color=colors[i % len(colors)]),
-            customdata=np.stack([group["id"], group["peak"], (group["end"] - group["start"]) * 3600], axis=1),
+            customdata=np.array(list(zip(
+                group["id"].astype(str),
+                group["peak"].astype(float),
+                ((group["end"] - group["start"]) * 3600).astype(float),
+            )), dtype=object),
             hovertemplate="Event %{customdata[0]}<br>" + reason +
                           "<br>Peak: %{customdata[1]:.2f}<br>Core duration: %{customdata[2]:.1f} s<extra></extra>",
         ))
