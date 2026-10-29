@@ -23,6 +23,17 @@ from flask import abort, request, send_file
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+try:
+    from dash_app.dissociation_physiology_viz import (
+        physiology_overview_figure, event_contrast_heatmap,
+        event_detail_figure, event_metric_rows,
+    )
+except ModuleNotFoundError:
+    from dissociation_physiology_viz import (
+        physiology_overview_figure, event_contrast_heatmap,
+        event_detail_figure, event_metric_rows,
+    )
+
 # Works both with "python dash_app/app.py" and "python -m dash_app.app".
 try:
     from dash_app.dissociation_viz import (
@@ -2977,6 +2988,7 @@ app.validation_layout = html.Div([
     PDropdown(id="qc-diss-event-dropdown"), html.Button(id="qc-next-diss-event"), html.Div(id="qc-diss-event-status"),
     html.Button(id="qc-diss-mark-reviewed"), html.Button(id="qc-diss-reopen"),
     dcc.Store(id="qc-diss-review-refresh"), html.Div(id="qc-diss-review-status"),
+    html.Div(id="qc-diss-physiology"),
     
                 html.Div(className="qc-mode-bar", children=[
                     html.Div("Mouse mode:", style={"fontWeight": "700"}),
@@ -3156,6 +3168,7 @@ def render_tab(tab, project_root, _refresh):
                     html.Div(id="qc-diss-review-status", className="status-line"),
                     dcc.Store(id="qc-diss-review-refresh"),
                     html.Div(id="qc-diss-event-status", className="status-line"),
+                    dcc.Loading(type="circle", children=html.Div(id="qc-diss-physiology")),
                 ]),
 
                 html.Div(className="timeline-card", children=[
@@ -5716,6 +5729,67 @@ def update_qc_dissociation_review(n_mark, n_reopen, event_id, project_root, reco
 
 
 @app.callback(
+    Output("qc-diss-physiology", "children"),
+    Input("qc-diss-event-dropdown", "value"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def show_qc_dissociation_physiology(event_id, project_root, recording_id):
+    if not event_id or not project_root or not recording_id:
+        return ""
+    events = load_dissociation_events_for_recording(project_root, recording_id)
+    event = get_event_row(events, event_id)
+    if event is None:
+        return "No physiology available for this event."
+    try:
+        project_root = Path(project_root).expanduser().resolve()
+        rec_dir = recording_dir_from_manifest(project_root, recording_id)
+        analysis_dir = rec_dir / "dissociation_analysis"
+        epochs = safe_read_csv(analysis_dir / "dissociation_epochs.csv")
+        event_profiles = safe_read_csv(analysis_dir / "dissociation_event_physiology.csv")
+        chart = event_detail_figure(epochs, event)
+        children = [html.H5("Physiology of selected dissociation event")]
+        children.append(html.Div(
+            "Core-event physiology is shown relative to other epochs in this recording, "
+            "not a diagnosis. Red shading shows the unpadded event; Final scoring is unchanged.",
+            className="app-subtitle",
+        ))
+        if chart is not None:
+            children.append(dcc.Graph(figure=chart))
+        if event_profiles is not None and "event_id" in event_profiles:
+            profiles = event_profiles[event_profiles["event_id"].astype(str) == str(event_id)]
+            if len(profiles):
+                profile = profiles.iloc[0]
+                rows = event_metric_rows(profile)
+                if rows:
+                    children.append(dash_table.DataTable(
+                        data=rows,
+                        columns=[{"name": c, "id": c} for c in rows[0]],
+                        page_size=8,
+                        style_table={"overflowX": "auto"},
+                        style_cell={"fontSize": 12, "padding": "8px", "textAlign": "left"},
+                    ))
+                src = profile.get("reference_source") or "none"
+                state = profile.get("reference_state") or "undefined"
+                count = int(profile.get("reference_n_epochs") or 0)
+                children.append(html.Div(
+                    f"Same-state background: {src} = {state}, "
+                    f"{count} unflagged epochs in the same recording. "
+                    "Contrast requires >=10 finite background values per feature.",
+                    className="app-subtitle",
+                ))
+        if chart is None and len(children) <= 3:
+            children.append(html.Div(
+                "No time-aligned EEG/EMG/photometry features for this event.",
+                className="app-subtitle",
+            ))
+        return html.Div(className="card", children=children)
+    except Exception as exc:
+        return f"Event physiology unavailable: {exc}"
+
+
+@app.callback(
     Output("window-store", "data", allow_duplicate=True),
     Output("selected-interval-store", "data", allow_duplicate=True),
     Output("qc-diss-event-status", "children", allow_duplicate=True),
@@ -6506,6 +6580,9 @@ def render_dissociation_dashboard(analysis_dir):
     state = safe_read_csv(analysis_dir / "dissociation_state_summary.csv")
     epochs = safe_read_csv(analysis_dir / "dissociation_epochs.csv")
     events = safe_read_csv(analysis_dir / "dissociation_events.csv")
+    epoch_physiology = safe_read_csv(analysis_dir / "dissociation_epochs.csv")
+    event_physiology = safe_read_csv(analysis_dir / "dissociation_event_physiology.csv")
+    physiology_info_file = analysis_dir / "dissociation_physiology_info.json"
     settings_path = analysis_dir / "analysis_settings.json"
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
@@ -6572,6 +6649,62 @@ def render_dissociation_dashboard(analysis_dir):
         raster = event_raster_figure(events)
         if raster is not None:
             children.append(html.Div(className="card", children=[dcc.Graph(figure=raster)]))
+
+    # Physiological characterization is descriptive, separate from the
+    # disagreement-based event detection and ranking.
+    if epoch_physiology is not None and len(epoch_physiology):
+        info = {}
+        if physiology_info_file.exists():
+            try:
+                info = json.loads(physiology_info_file.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                info = {}
+        data_info = info.get("data", {})
+        photo_info = data_info.get("photometry", {})
+        provenance = [
+            html.B("Data provenance: "),
+            html.Span(data_info.get("eeg_emg", "Epoch features unavailable. ")),
+            html.Span(" Photometry: " + str(photo_info.get("status", "Not available."))),
+        ]
+        if photo_info.get("available"):
+            provenance.append(html.Span(
+                f" Source {photo_info.get('source')}; "
+                f"sampling {photo_info.get('sampling_rate_hz')} Hz; "
+                f"units {photo_info.get('units')}."
+            ))
+        overview = physiology_overview_figure(epoch_physiology, events)
+        contrast = event_contrast_heatmap(event_physiology, events)
+        physiol_children = [
+            html.H4("Event physiology: EEG, EMG and optional photometry"),
+            html.Div(
+                "EEG bandpower and theta/delta are from existing epoch features; EMG is log-RMS / P95. "
+                "Photometry is the raw stored signal summarized per epoch and standardized within this recording; "
+                "it is NOT assumed to be ΔF/F or acetylcholine concentration. "
+                "Red regions indicate detected event cores, not proven hybrid sleep states.",
+                className="app-subtitle",
+            ),
+            html.Div(provenance, className="status-line"),
+        ]
+        if overview is not None:
+            physiol_children.append(dcc.Graph(figure=overview))
+        if contrast is not None:
+            physiol_children.extend([
+                html.Div(
+                    "Each heatmap cell is the median feature z-score during the core event minus "
+                    "the median from unflagged epochs of the same predicted state. "
+                    "Requires at least 10 finite background epochs per feature. "
+                    "Missing values mean no trustworthy comparison; no p-values are implied.",
+                    className="app-subtitle",
+                ),
+                dcc.Graph(figure=contrast),
+            ])
+        if overview is None and contrast is None:
+            physiol_children.append(html.Div(
+                "No valid physiological feature data found. Run Compute epoch features, "
+                "and verify photometry sampling metadata if supplied.",
+                className="app-subtitle",
+            ))
+        children.append(html.Div(className="card", children=physiol_children))
 
     children.append(html.Div(className="card", children=[
         html.H4("How events are ranked"),
