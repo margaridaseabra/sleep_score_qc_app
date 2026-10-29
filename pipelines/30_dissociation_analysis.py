@@ -7,6 +7,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from dissociation_physiology import (
+    load_epoch_physiology, summarize_event_physiology,
+)
+
 
 STATE_ORDER = ["Wake", "NREM", "REM", "Sleep", "Uncertain", "Undefined", "Artifact"]
 
@@ -384,17 +388,9 @@ def build_analysis(project_root, recording_id, threshold=0.20, evidence="combine
         out["final_state"] = "Undefined"
         out["final_review_status"] = "missing"
 
-    # EMG features
-    feat_file = rec_dir / "epoch_features.csv"
-
-    if feat_file.exists():
-        feat = pd.read_csv(feat_file)
-        if "epoch_id" in feat.columns:
-            for col in ["emg_rms_z", "emg_abs_p95_z"]:
-                if col in feat.columns:
-                    out = out.merge(feat[["epoch_id", col]], on="epoch_id", how="left")
-    if "emg_rms_z" not in out.columns:
-        out["emg_rms_z"] = np.nan
+    # Time-aligned EEG spectral, EMG, and optional photometry physiology.
+    # This deliberately does not add speculative spectral/ACh detection weights.
+    out, physiology_provenance = load_epoch_physiology(rec_dir, out)
 
     pair_rows = []
     state_rows = []
@@ -512,6 +508,16 @@ def build_analysis(project_root, recording_id, threshold=0.20, evidence="combine
         pad_s=pad_s, min_duration_s=min_duration_s,
     )
 
+    event_physiology = summarize_event_physiology(out, events, threshold=threshold)
+    if len(events):
+        # Keep physiology columns available in the ranked event table and QC queue.
+        events = events.merge(
+            event_physiology,
+            on=["event_id", "core_start_s", "core_end_s"],
+            how="left",
+            validate="one_to_one",
+        )
+
     analysis_dir = rec_dir / "dissociation_analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -519,6 +525,8 @@ def build_analysis(project_root, recording_id, threshold=0.20, evidence="combine
     events_path = analysis_dir / "dissociation_events.csv"
     pair_path = analysis_dir / "dissociation_pairwise_summary.csv"
     state_path = analysis_dir / "dissociation_state_summary.csv"
+    event_phys_path = analysis_dir / "dissociation_event_physiology.csv"
+    physiology_info_path = analysis_dir / "dissociation_physiology_info.json"
 
     (analysis_dir / "analysis_settings.json").write_text(json.dumps({
         "threshold": float(threshold),
@@ -529,8 +537,33 @@ def build_analysis(project_root, recording_id, threshold=0.20, evidence="combine
         "description": "A review-priority index, not a biological diagnosis or validated probability.",
     }, indent=2), encoding="utf-8")
 
+    physiology_info_path.write_text(json.dumps({
+        "data": physiology_provenance,
+        "feature_descriptions": {
+            "eeg_delta": "Welch bandpower 0.5–4 Hz in epoch_features.csv",
+            "eeg_theta": "Welch bandpower 5–10 Hz in epoch_features.csv",
+            "eeg_sigma": "Welch bandpower 10–15 Hz in epoch_features.csv",
+            "eeg_theta_delta_ratio": "Theta/delta ratio (epoch features)",
+            "emg_rms": "EMG epoch RMS",
+            "emg_abs_p95": "95th percentile absolute EMG amplitude",
+            "photometry_mean_raw": "Epoch mean of stored raw signal, units per metadata",
+            "photometry_mean_z": "Robust z relative to this recording, not ΔF/F",
+        },
+        "comparison": "Core-event median vs unflagged epochs in this recording "
+                      "with matching Somnotate/Final/Manual state (where available). "
+                      "Background requires >=10 finite epochs per feature; descriptive only.",
+        "assumptions": [
+            "EEG spectral bands and EMG epoch features come from existing pipeline, not recomputed",
+            "Photometry samples start at the same t=0 as EEG unless metadata says otherwise; "
+            "unaligned durations are skipped",
+            "No photometry-derived dissociation index is assigned",
+            "No EEG/EMG/photometry-derived effect is an independent biological validation",
+        ],
+    }, indent=2), encoding="utf-8")
+
     out.to_csv(epochs_path, index=False)
     events.to_csv(events_path, index=False)
+    event_physiology.to_csv(event_phys_path, index=False)
     pd.DataFrame(pair_rows).to_csv(pair_path, index=False)
     pd.DataFrame(state_rows).to_csv(state_path, index=False)
 
@@ -539,6 +572,10 @@ def build_analysis(project_root, recording_id, threshold=0.20, evidence="combine
     print("Events:", events_path)
     print("Pairwise summary:", pair_path)
     print("State summary:", state_path)
+    print("Event physiology:", event_phys_path)
+    print("Physiology provenance:", physiology_info_path)
+    print("EEG/EMG coverage:", physiology_provenance["eeg_emg"])
+    print("Photometry:", physiology_provenance["photometry"]["status"])
     print("Number of dissociation events:", len(events))
 
     if len(events):
