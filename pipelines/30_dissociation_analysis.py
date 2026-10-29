@@ -7,6 +7,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# Support both script execution (python pipelines/30_...) and test/module import.
+try:
+    from pipelines.dissociation_physiology import (
+        load_epoch_physiology, summarize_event_physiology,
+    )
+except ModuleNotFoundError:
+    from dissociation_physiology import (
+        load_epoch_physiology, summarize_event_physiology,
+    )
+
 
 STATE_ORDER = ["Wake", "NREM", "REM", "Sleep", "Uncertain", "Undefined", "Artifact"]
 
@@ -21,7 +31,7 @@ def normalize_state(x):
         "WK": "Wake",
         "NREM": "NREM",
         "SWS": "NREM",
-        "Sleep": "NREM",
+        "Sleep": "Sleep",
         "REM": "REM",
         "PS": "REM",
         "Uncertain": "Uncertain",
@@ -121,9 +131,9 @@ def add_disagreement_column(out, col_a, col_b, out_col, mode="3state"):
         a2 = np.array([normalize_state(x) for x in a], dtype=object)
         b2 = np.array([normalize_state(x) for x in b], dtype=object)
 
-    comparable = ~np.isin(a2, ["Undefined", "Uncertain", "Artifact"]) & ~np.isin(
-        b2, ["Undefined", "Uncertain", "Artifact"]
-    )
+    # Binary Layer 1 Sleep must never be treated as NREM in a 3-state table.
+    valid_states = ["Wake", "Sleep"] if mode == "wake_sleep" else ["Wake", "NREM", "REM"]
+    comparable = np.isin(a2, valid_states) & np.isin(b2, valid_states)
 
     disagree = comparable & (a2 != b2)
 
@@ -202,7 +212,7 @@ def state_disagreement_summary(out, pair_name, ref_col, other_col, disagree_col,
     return rows
 
 
-def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10):
+def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10, min_duration_s=0):
     flagged = epoch_df[epoch_df["dissociation_index"] >= float(min_index)].copy()
 
     if len(flagged) == 0:
@@ -210,7 +220,7 @@ def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10):
             "event_id", "start_s", "end_s", "start_min", "end_min",
             "duration_s", "max_dissociation_index", "mean_dissociation_index",
             "main_reason", "states_at_peak",
-            "n_epochs",
+            "n_epochs", "core_start_s", "core_end_s", "review_duration_s",
         ])
 
     flagged = flagged.sort_values("t0_s").reset_index(drop=True)
@@ -246,6 +256,9 @@ def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10):
     rows = []
 
     for i, ev in enumerate(events):
+        core_duration_s = float(ev["end_s"]) - float(ev["start_s"])
+        if core_duration_s < float(min_duration_s):
+            continue
         ev_df = pd.DataFrame(ev["rows"])
         peak_idx = ev_df["dissociation_index"].astype(float).idxmax()
         peak = ev_df.loc[peak_idx]
@@ -275,7 +288,11 @@ def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10):
             "end_s": end_s,
             "start_min": start_s / 60,
             "end_min": end_s / 60,
-            "duration_s": end_s - start_s,
+            # Biological duration is measured before review-window padding.
+            "duration_s": core_duration_s,
+            "review_duration_s": end_s - start_s,
+            "core_start_s": float(ev["start_s"]),
+            "core_end_s": float(ev["end_s"]),
             "max_dissociation_index": float(ev_df["dissociation_index"].max()),
             "mean_dissociation_index": float(ev_df["dissociation_index"].mean()),
             "main_reason": main_reason,
@@ -284,6 +301,13 @@ def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10):
         })
 
     out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=[
+            "event_id", "start_s", "end_s", "start_min", "end_min",
+            "duration_s", "review_duration_s", "core_start_s", "core_end_s",
+            "max_dissociation_index", "mean_dissociation_index",
+            "main_reason", "states_at_peak", "n_epochs", "rank",
+        ])
     out = out.sort_values(
         ["max_dissociation_index", "mean_dissociation_index", "duration_s"],
         ascending=[False, False, False],
@@ -294,7 +318,13 @@ def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10):
     return out
 
 
-def build_analysis(project_root, recording_id, threshold=0.20):
+def build_analysis(project_root, recording_id, threshold=0.20, evidence="combined", max_gap_s=5, pad_s=10, min_duration_s=0):
+    if evidence not in {"combined", "disagreement", "confidence", "physiology"}:
+        raise ValueError(f"Unsupported evidence mode: {evidence}")
+    if not 0 < float(threshold) <= 1:
+        raise ValueError("Event threshold must be greater than 0 and at most 1")
+    if min(float(max_gap_s), float(pad_s), float(min_duration_s)) < 0:
+        raise ValueError("Gap, padding and minimum duration must be non-negative")
     project_root = Path(project_root)
     rec_dir = project_root / "recordings" / recording_id
 
@@ -311,8 +341,10 @@ def build_analysis(project_root, recording_id, threshold=0.20):
     # Layer 1 states
     out["layer1_label"] = layer1["layer1_label"].fillna("Undefined").astype(str)
     out["layer1_wake_sleep"] = out["layer1_label"].map(wake_sleep_state)
+    # Keep this compatibility field, but an undifferentiated Sleep label is
+    # NOT a NREM prediction; it cannot enter a 3-state comparison.
     out["layer1_3state"] = out["layer1_label"].map(
-        lambda x: "Wake" if str(x) == "Wake" else ("NREM" if str(x) == "Sleep" else "Undefined")
+        lambda x: "Wake" if normalize_state(x) == "Wake" else "Undefined"
     )
 
     out["layer1_confidence"] = np.nan
@@ -362,17 +394,9 @@ def build_analysis(project_root, recording_id, threshold=0.20):
         out["final_state"] = "Undefined"
         out["final_review_status"] = "missing"
 
-    # EMG features
-    feat_file = rec_dir / "epoch_features.csv"
-
-    if feat_file.exists():
-        feat = pd.read_csv(feat_file)
-        if "epoch_id" in feat.columns:
-            for col in ["emg_rms_z", "emg_abs_p95_z"]:
-                if col in feat.columns:
-                    out = out.merge(feat[["epoch_id", col]], on="epoch_id", how="left")
-    if "emg_rms_z" not in out.columns:
-        out["emg_rms_z"] = np.nan
+    # Time-aligned EEG spectral, EMG, and optional photometry physiology.
+    # This deliberately does not add speculative spectral/ACh detection weights.
+    out, physiology_provenance = load_epoch_physiology(rec_dir, out)
 
     pair_rows = []
     state_rows = []
@@ -384,8 +408,7 @@ def build_analysis(project_root, recording_id, threshold=0.20):
         pair_defs.append(("Manual vs Somnotate", "manual_state", "somnotate_state", "manual_vs_somnotate_3state", "3state"))
 
     if som is not None:
-        pair_defs.append(("Layer 1 vs Somnotate", "layer1_3state", "somnotate_state", "layer1_vs_somnotate_3state", "3state"))
-        pair_defs.append(("Layer 1 vs Somnotate WS", "layer1_label", "somnotate_state", "layer1_vs_somnotate_ws", "wake_sleep"))
+        pair_defs.append(("Layer 1 vs Somnotate Wake/Sleep", "layer1_label", "somnotate_state", "layer1_vs_somnotate_ws", "wake_sleep"))
 
     if manual is not None:
         pair_defs.append(("Layer 1 vs Manual WS", "layer1_label", "manual_state", "layer1_vs_manual_ws", "wake_sleep"))
@@ -415,35 +438,40 @@ def build_analysis(project_root, recording_id, threshold=0.20):
         "missing": 1.0,
     }
 
+    out["n_comparable_pairs"] = 0
+    out["n_disagree_pairs"] = 0
     for _, _, _, out_col, mode in pair_defs:
         w = weights["wake_sleep"] if mode == "wake_sleep" else weights["3state"]
         comparable = out[out_col + "_comparable"].astype(bool).to_numpy()
         disagree = out[out_col].astype(bool).to_numpy()
+        out["n_comparable_pairs"] += comparable.astype(int)
+        out["n_disagree_pairs"] += disagree.astype(int)
 
-        max_possible[comparable] += w
-        score[disagree] += w
+        if evidence in {"combined", "disagreement"}:
+            max_possible[comparable] += w
+            score[disagree] += w
 
-        for idx in np.where(disagree)[0]:
-            reasons[idx].append(out_col)
+            for idx in np.where(disagree)[0]:
+                reasons[idx].append(out_col)
 
-    if "somnotate_confidence" in out.columns:
+    if evidence in {"combined", "confidence"} and "somnotate_confidence" in out.columns:
         conf = pd.to_numeric(out["somnotate_confidence"], errors="coerce").to_numpy(dtype=float)
-        valid = np.isfinite(conf)
+        valid = np.isfinite(conf) & out["somnotate_state"].isin(["Wake", "NREM", "REM"]).to_numpy()
         max_possible[valid] += weights["som_uncertainty"]
         add = np.zeros(len(out), dtype=float)
         add[valid] = (1 - np.clip(conf[valid], 0, 1)) * weights["som_uncertainty"]
         score += add
-        for idx in np.where(add > 0.4)[0]:
+        for idx in np.where(add >= 0.2 * weights["som_uncertainty"])[0]:
             reasons[idx].append("low_somnotate_confidence")
 
-    if "layer1_confidence" in out.columns:
+    if evidence in {"combined", "confidence"} and "layer1_confidence" in out.columns:
         conf = pd.to_numeric(out["layer1_confidence"], errors="coerce").to_numpy(dtype=float)
-        valid = np.isfinite(conf)
+        valid = np.isfinite(conf) & out["layer1_wake_sleep"].isin(["Wake", "Sleep"]).to_numpy()
         max_possible[valid] += weights["layer1_uncertainty"]
         add = np.zeros(len(out), dtype=float)
         add[valid] = (1 - np.clip(conf[valid], 0, 1)) * weights["layer1_uncertainty"]
         score += add
-        for idx in np.where(add > 0.3)[0]:
+        for idx in np.where(add >= 0.2 * weights["layer1_uncertainty"])[0]:
             reasons[idx].append("low_layer1_confidence")
 
     # REM with high EMG from any REM-like source
@@ -455,22 +483,23 @@ def build_analysis(project_root, recording_id, threshold=0.20):
     )
     high_emg = rem_any & np.isfinite(emg) & (emg > 2.0)
 
-    max_possible[rem_any] += weights["rem_high_emg"]
-    score[high_emg] += weights["rem_high_emg"]
-
-    for idx in np.where(high_emg)[0]:
-        reasons[idx].append("REM_with_high_EMG")
+    # Do not dilute the score when EMG was not recorded.
+    emg_eligible = rem_any & np.isfinite(emg)
+    if evidence in {"combined", "physiology"}:
+        max_possible[emg_eligible] += weights["rem_high_emg"]
+        score[high_emg] += weights["rem_high_emg"]
+        for idx in np.where(high_emg)[0]:
+            reasons[idx].append("REM_with_high_EMG")
+    out["rem_high_emg"] = high_emg
 
     missing = (
         out["somnotate_state"].astype(str).isin(["Undefined", "Uncertain"]).to_numpy()
         | out["layer1_label"].astype(str).isin(["Undefined", "Uncertain"]).to_numpy()
     )
-    max_possible[missing] += weights["missing"]
-    score[missing] += weights["missing"]
-
-    for idx in np.where(missing)[0]:
-        reasons[idx].append("missing_or_uncertain_model_state")
-
+    # Missing scoring is a DATA COVERAGE issue, not evidence of a biological
+    # disagreement. Report it separately rather than manufacturing events.
+    out["missing_model_state"] = missing
+    out["evidence_available"] = max_possible > 0
     out["raw_dissociation_score"] = score
     out["dissociation_index"] = np.divide(
         score,
@@ -480,7 +509,20 @@ def build_analysis(project_root, recording_id, threshold=0.20):
     )
     out["dissociation_reason"] = ["; ".join(sorted(set(r))) for r in reasons]
 
-    events = merge_dissociation_events(out, min_index=threshold, max_gap_s=5, pad_s=10)
+    events = merge_dissociation_events(
+        out, min_index=threshold, max_gap_s=max_gap_s,
+        pad_s=pad_s, min_duration_s=min_duration_s,
+    )
+
+    event_physiology = summarize_event_physiology(out, events, threshold=threshold)
+    if len(events):
+        # Keep physiology columns available in the ranked event table and QC queue.
+        events = events.merge(
+            event_physiology,
+            on=["event_id", "core_start_s", "core_end_s"],
+            how="left",
+            validate="one_to_one",
+        )
 
     analysis_dir = rec_dir / "dissociation_analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -489,9 +531,45 @@ def build_analysis(project_root, recording_id, threshold=0.20):
     events_path = analysis_dir / "dissociation_events.csv"
     pair_path = analysis_dir / "dissociation_pairwise_summary.csv"
     state_path = analysis_dir / "dissociation_state_summary.csv"
+    event_phys_path = analysis_dir / "dissociation_event_physiology.csv"
+    physiology_info_path = analysis_dir / "dissociation_physiology_info.json"
+
+    (analysis_dir / "analysis_settings.json").write_text(json.dumps({
+        "threshold": float(threshold),
+        "evidence": evidence,
+        "max_gap_s": float(max_gap_s),
+        "pad_s": float(pad_s),
+        "min_duration_s": float(min_duration_s),
+        "description": "A review-priority index, not a biological diagnosis or validated probability.",
+    }, indent=2), encoding="utf-8")
+
+    physiology_info_path.write_text(json.dumps({
+        "data": physiology_provenance,
+        "feature_descriptions": {
+            "eeg_delta": "Welch bandpower 0.5–4 Hz in epoch_features.csv",
+            "eeg_theta": "Welch bandpower 5–10 Hz in epoch_features.csv",
+            "eeg_sigma": "Welch bandpower 10–15 Hz in epoch_features.csv",
+            "eeg_theta_delta_ratio": "Theta/delta ratio (epoch features)",
+            "emg_rms": "EMG epoch RMS",
+            "emg_abs_p95": "95th percentile absolute EMG amplitude",
+            "photometry_mean_raw": "Epoch mean of stored raw signal, units per metadata",
+            "photometry_mean_z": "Robust z relative to this recording, not ΔF/F",
+        },
+        "comparison": "Core-event median vs unflagged epochs in this recording "
+                      "with matching Somnotate/Final/Manual state (where available). "
+                      "Background requires >=10 finite epochs per feature; descriptive only.",
+        "assumptions": [
+            "EEG spectral bands and EMG epoch features come from existing pipeline, not recomputed",
+            "Photometry samples start at the same t=0 as EEG unless metadata says otherwise; "
+            "unaligned durations are skipped",
+            "No photometry-derived dissociation index is assigned",
+            "No EEG/EMG/photometry-derived effect is an independent biological validation",
+        ],
+    }, indent=2), encoding="utf-8")
 
     out.to_csv(epochs_path, index=False)
     events.to_csv(events_path, index=False)
+    event_physiology.to_csv(event_phys_path, index=False)
     pd.DataFrame(pair_rows).to_csv(pair_path, index=False)
     pd.DataFrame(state_rows).to_csv(state_path, index=False)
 
@@ -500,6 +578,10 @@ def build_analysis(project_root, recording_id, threshold=0.20):
     print("Events:", events_path)
     print("Pairwise summary:", pair_path)
     print("State summary:", state_path)
+    print("Event physiology:", event_phys_path)
+    print("Physiology provenance:", physiology_info_path)
+    print("EEG/EMG coverage:", physiology_provenance["eeg_emg"])
+    print("Photometry:", physiology_provenance["photometry"]["status"])
     print("Number of dissociation events:", len(events))
 
     if len(events):
@@ -511,6 +593,10 @@ def main():
     parser.add_argument("--project-root", required=True)
     parser.add_argument("--recording-id", required=True)
     parser.add_argument("--threshold", type=float, default=0.20)
+    parser.add_argument("--evidence", choices=["combined", "disagreement", "confidence", "physiology"], default="combined")
+    parser.add_argument("--max-gap-s", type=float, default=5.0)
+    parser.add_argument("--pad-s", type=float, default=10.0)
+    parser.add_argument("--min-duration-s", type=float, default=0.0)
 
     args = parser.parse_args()
 
@@ -518,6 +604,10 @@ def main():
         project_root=args.project_root,
         recording_id=args.recording_id,
         threshold=args.threshold,
+        evidence=args.evidence,
+        max_gap_s=args.max_gap_s,
+        pad_s=args.pad_s,
+        min_duration_s=args.min_duration_s,
     )
 
 

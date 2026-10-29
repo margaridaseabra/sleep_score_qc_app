@@ -24,6 +24,29 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 try:
+    from dash_app.dissociation_physiology_viz import (
+        physiology_overview_figure, event_contrast_heatmap,
+        event_detail_figure, event_metric_rows,
+    )
+except ModuleNotFoundError:
+    from dissociation_physiology_viz import (
+        physiology_overview_figure, event_contrast_heatmap,
+        event_detail_figure, event_metric_rows,
+    )
+
+# Works both with "python dash_app/app.py" and "python -m dash_app.app".
+try:
+    from dash_app.dissociation_viz import (
+        confusion_figure, score_timeline_figure, hourly_burden_figure,
+        event_raster_figure, final_coverage_figure, REASON_NAMES,
+    )
+except ModuleNotFoundError:
+    from dissociation_viz import (
+        confusion_figure, score_timeline_figure, hourly_burden_figure,
+        event_raster_figure, final_coverage_figure, REASON_NAMES,
+    )
+
+try:
     import h5py
 except Exception:
     h5py = None
@@ -2963,6 +2986,9 @@ app.validation_layout = html.Div([
     html.Button(id="forward-5"), html.Button(id="forward-15"), html.Div(id="window-label"),
     html.Button(id="qc-refresh-diss-events"), html.Button(id="qc-prev-diss-event"),
     PDropdown(id="qc-diss-event-dropdown"), html.Button(id="qc-next-diss-event"), html.Div(id="qc-diss-event-status"),
+    html.Button(id="qc-diss-mark-reviewed"), html.Button(id="qc-diss-reopen"),
+    dcc.Store(id="qc-diss-review-refresh"), html.Div(id="qc-diss-review-status"),
+    html.Div(id="qc-diss-physiology"),
     
                 html.Div(className="qc-mode-bar", children=[
                     html.Div("Mouse mode:", style={"fontWeight": "700"}),
@@ -3009,6 +3035,7 @@ dcc.Graph(id="qc-graph"),
 
     # Dissociation tab
     PDropdown(id="stats-recording"), PInput(id="diss-threshold"), html.Button(id="btn-run-diss"),
+    PDropdown(id="diss-evidence"), PInput(id="diss-max-gap"), PInput(id="diss-min-duration"),
     html.Div(id="diss-action-status"), html.Div(id="diss-log"), html.Div(id="diss-pairwise"),
     html.Div(id="diss-state"), html.Div(id="diss-events"),
 ])
@@ -3134,7 +3161,14 @@ def render_tab(tab, project_root, _refresh):
                         PDropdown(id="qc-diss-event-dropdown", options=[], placeholder="Choose dissociation event", style={"width":"100%"}),
                         html.Button("Next", id="qc-next-diss-event", n_clicks=0),
                     ]),
+                    html.Div(style={"display": "flex", "gap": "8px", "marginTop": "8px", "flexWrap": "wrap"}, children=[
+                        html.Button("Mark selected event reviewed", id="qc-diss-mark-reviewed", n_clicks=0),
+                        html.Button("Reopen selected event", id="qc-diss-reopen", n_clicks=0),
+                    ]),
+                    html.Div(id="qc-diss-review-status", className="status-line"),
+                    dcc.Store(id="qc-diss-review-refresh"),
                     html.Div(id="qc-diss-event-status", className="status-line"),
+                    dcc.Loading(type="circle", children=html.Div(id="qc-diss-physiology")),
                 ]),
 
                 html.Div(className="timeline-card", children=[
@@ -3581,11 +3615,25 @@ def render_tab(tab, project_root, _refresh):
     if tab == "tab-stats":
         return html.Div(className="card", children=[
             html.H3("Dissociation review dashboard"),
-            html.Div("Find where Layer 1, Somnotate, Manual and Final scoring disagree, then jump to those periods from the QC viewer.", className="app-subtitle"),
+            html.Div("Explore which biological states disagree, when discrepancies occur, and which intervals merit closer EEG/EMG/video review. These are review prompts, not diagnoses.", className="app-subtitle"),
             html.Div(style={"display":"flex","gap":"8px","alignItems":"center", "flexWrap":"wrap"}, children=[
                 html.Label("Recording:"), PDropdown(id="stats-recording", options=rec_options, value=rec_options[0]["value"] if rec_options else None, style={"width":"360px"}),
                 html.Label("Event threshold:"), PInput(id="diss-threshold", type="number", value=0.20, step=0.05, style={"width":"100px"}),
                 html.Button("Run dissociation analysis", id="btn-run-diss", n_clicks=0),
+            ]),
+            html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap", "marginTop": "10px"}, children=[
+                html.Label("Evidence to prioritize:"),
+                PDropdown(id="diss-evidence", value="combined", clearable=False,
+                    options=[
+                        {"label": "Combined (default)", "value": "combined"},
+                        {"label": "State disagreements only", "value": "disagreement"},
+                        {"label": "Low model confidence only", "value": "confidence"},
+                        {"label": "REM with high EMG only", "value": "physiology"},
+                    ], style={"width": "270px"}),
+                html.Label("Merge gap (s):"),
+                PInput(id="diss-max-gap", type="number", value=5, min=0, step=1, style={"width": "80px"}),
+                html.Label("Minimum event (s):"),
+                PInput(id="diss-min-duration", type="number", value=0, min=0, step=1, style={"width": "80px"}),
             ]),
             html.Div(
                 className="status-line",
@@ -3596,7 +3644,9 @@ def render_tab(tab, project_root, _refresh):
                         "The pipeline gives each epoch a dissociation score from 0 to 1. "
                         "Epochs with score ≥ threshold are grouped into review events. "
                         "Lower values catch more possible problems; higher values show fewer, stronger disagreements. "
-                        "Start around 0.20 for broad review and increase to 0.30 if the event list is too noisy."
+                        "Start around 0.20 for broad review and increase to 0.30 if the event list is too noisy. "
+                        "The evidence selector limits what contributes to the index; merge gap joins nearby flagged epochs, "
+                        "and minimum event duration filters brief episodes before review padding."
                     ),
                 ],
             ),
@@ -5400,7 +5450,77 @@ def load_dissociation_events_for_recording(project_root, recording_id):
         events = events.copy()
         events["rank"] = np.arange(1, len(events) + 1)
 
-    return events
+    return attach_dissociation_review_status(events, rec_dir / "dissociation_analysis")
+
+
+def _dissociation_event_key(row):
+    """Key a review decision to unpadded event bounds, not ephemeral rank."""
+    start = row.get("core_start_s", row.get("start_s"))
+    end = row.get("core_end_s", row.get("end_s"))
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(start) and np.isfinite(end)):
+        return None
+    return (round(start, 3), round(end, 3))
+
+
+def attach_dissociation_review_status(events, analysis_dir):
+    """Annotate events without touching Final scoring or detection output."""
+    if events is None:
+        return None
+    result = events.copy()
+    result["qc_review_status"] = "pending"
+    path = Path(analysis_dir) / "dissociation_review_log.csv"
+    saved = safe_read_csv(path)
+    if saved is None or not {"core_start_s", "core_end_s", "review_status"}.issubset(saved.columns):
+        return result
+    decisions = {}
+    for _, row in saved.iterrows():
+        key = _dissociation_event_key(row)
+        if key is not None and row["review_status"] in {"reviewed", "pending"}:
+            decisions[key] = row["review_status"]
+    result["qc_review_status"] = [
+        decisions.get(_dissociation_event_key(row), "pending")
+        for _, row in result.iterrows()
+    ]
+    return result
+
+
+def persist_dissociation_review_status(project_root, recording_id, event_id, status):
+    if status not in {"reviewed", "pending"}:
+        raise ValueError(f"Invalid review status: {status}")
+    project_root = Path(project_root).expanduser().resolve()
+    rec_dir = recording_dir_from_manifest(project_root, recording_id)
+    analysis_dir = rec_dir / "dissociation_analysis"
+    events = safe_read_csv(analysis_dir / "dissociation_events.csv")
+    row = get_event_row(events, event_id)
+    if row is None:
+        raise ValueError("Selected event no longer exists. Refresh the event queue.")
+    key = _dissociation_event_key(row)
+    if key is None:
+        raise ValueError("Selected event has invalid time boundaries.")
+
+    path = analysis_dir / "dissociation_review_log.csv"
+    saved = safe_read_csv(path)
+    columns = ["event_id", "core_start_s", "core_end_s", "review_status", "updated_utc"]
+    if saved is None or not set(columns).issubset(saved.columns):
+        saved = pd.DataFrame(columns=columns)
+    saved = saved[[c for c in columns]].copy()
+    saved = saved[
+        saved.apply(lambda r: _dissociation_event_key(r) != key, axis=1)
+    ]
+    record = {
+        "event_id": str(event_id), "core_start_s": key[0], "core_end_s": key[1],
+        "review_status": status, "updated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    saved = pd.concat([saved, pd.DataFrame([record])], ignore_index=True)
+    # A separate log survives analysis reruns; never overwrite edited sleep labels.
+    tmp = path.with_name(path.name + ".tmp")
+    saved.to_csv(tmp, index=False)
+    tmp.replace(path)
+    return status
 
 
 def dissociation_event_options(events):
@@ -5416,7 +5536,10 @@ def dissociation_event_options(events):
         score = float(row.get("max_dissociation_index", np.nan))
         reason = str(row.get("main_reason", ""))
 
-        label = f"#{rank} | {start_min:.2f}–{end_min:.2f} min | score {score:.3f} | {reason}"
+        review = str(row.get("qc_review_status", "pending"))
+        status_symbol = "✓" if review == "reviewed" else "○"
+        friendly_reason = REASON_NAMES.get(reason, reason.replace("_", " "))
+        label = f"{status_symbol} #{rank} | {start_min:.2f}–{end_min:.2f} min | index {score:.3f} | {friendly_reason}"
 
         event_id = str(row.get("event_id", f"event_{rank}"))
 
@@ -5532,10 +5655,12 @@ def pan_qc_graph_to_window(relayout, window_data, recording_id, project_root):
     Output("qc-diss-event-status", "children"),
     Input("qc-refresh-diss-events", "n_clicks"),
     Input("recording-id-store", "data"),
+    Input("qc-diss-review-refresh", "data"),
     State("project-root-store", "data"),
+    State("qc-diss-event-dropdown", "value"),
     prevent_initial_call=True,
 )
-def refresh_qc_dissociation_events(n, recording_id, project_root):
+def refresh_qc_dissociation_events(n, recording_id, review_refresh, project_root, current_event_id):
     events = load_dissociation_events_for_recording(project_root, recording_id)
 
     if events is None or len(events) == 0:
@@ -5543,9 +5668,13 @@ def refresh_qc_dissociation_events(n, recording_id, project_root):
 
     options = dissociation_event_options(events)
 
-    # Loading a recording should make dissociation events available, but it
-    # must not behave as though the user selected event #1.
-    return options, None, f"Loaded {len(options)} dissociation events."
+    # Never auto-jump on recording load; preserve selection after marking review.
+    keep_selected = (
+        current_event_id if callback_context.triggered_id == "qc-diss-review-refresh"
+        and current_event_id in {o["value"] for o in options} else None
+    )
+    reviewed_n = int((events.get("qc_review_status", pd.Series(dtype=object)) == "reviewed").sum())
+    return options, keep_selected, f"Loaded {len(options)} events · {reviewed_n} explicitly reviewed."
 
 
 @app.callback(
@@ -5573,6 +5702,91 @@ def step_qc_dissociation_event(n_prev, n_next, options, value):
         idx = min(len(values) - 1, idx + 1)
 
     return values[idx]
+
+
+@app.callback(
+    Output("qc-diss-review-refresh", "data"),
+    Output("qc-diss-review-status", "children"),
+    Input("qc-diss-mark-reviewed", "n_clicks"),
+    Input("qc-diss-reopen", "n_clicks"),
+    State("qc-diss-event-dropdown", "value"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def update_qc_dissociation_review(n_mark, n_reopen, event_id, project_root, recording_id):
+    if not event_id:
+        return no_update, "Choose an event before updating its review status."
+    trigger = callback_context.triggered_id
+    new_status = "reviewed" if trigger == "qc-diss-mark-reviewed" else "pending"
+    try:
+        persist_dissociation_review_status(project_root, recording_id, event_id, new_status)
+        return {"event": event_id, "status": new_status, "clicks": n_mark if new_status == "reviewed" else n_reopen}, (
+            "Event marked reviewed." if new_status == "reviewed" else "Event reopened for review."
+        )
+    except Exception as exc:
+        return no_update, f"Could not update event review: {exc}"
+
+
+@app.callback(
+    Output("qc-diss-physiology", "children"),
+    Input("qc-diss-event-dropdown", "value"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def show_qc_dissociation_physiology(event_id, project_root, recording_id):
+    if not event_id or not project_root or not recording_id:
+        return ""
+    events = load_dissociation_events_for_recording(project_root, recording_id)
+    event = get_event_row(events, event_id)
+    if event is None:
+        return "No physiology available for this event."
+    try:
+        project_root = Path(project_root).expanduser().resolve()
+        rec_dir = recording_dir_from_manifest(project_root, recording_id)
+        analysis_dir = rec_dir / "dissociation_analysis"
+        epochs = safe_read_csv(analysis_dir / "dissociation_epochs.csv")
+        event_profiles = safe_read_csv(analysis_dir / "dissociation_event_physiology.csv")
+        chart = event_detail_figure(epochs, event)
+        children = [html.H5("Physiology of selected dissociation event")]
+        children.append(html.Div(
+            "Core-event physiology is shown relative to other epochs in this recording, "
+            "not a diagnosis. Red shading shows the unpadded event; Final scoring is unchanged.",
+            className="app-subtitle",
+        ))
+        if chart is not None:
+            children.append(dcc.Graph(figure=chart))
+        if event_profiles is not None and "event_id" in event_profiles:
+            profiles = event_profiles[event_profiles["event_id"].astype(str) == str(event_id)]
+            if len(profiles):
+                profile = profiles.iloc[0]
+                rows = event_metric_rows(profile)
+                if rows:
+                    children.append(dash_table.DataTable(
+                        data=rows,
+                        columns=[{"name": c, "id": c} for c in rows[0]],
+                        page_size=8,
+                        style_table={"overflowX": "auto"},
+                        style_cell={"fontSize": 12, "padding": "8px", "textAlign": "left"},
+                    ))
+                src = profile.get("reference_source") or "none"
+                state = profile.get("reference_state") or "undefined"
+                count = int(profile.get("reference_n_epochs") or 0)
+                children.append(html.Div(
+                    f"Same-state background: {src} = {state}, "
+                    f"{count} unflagged epochs in the same recording. "
+                    "Contrast requires >=10 finite background values per feature.",
+                    className="app-subtitle",
+                ))
+        if chart is None and len(children) <= 3:
+            children.append(html.Div(
+                "No time-aligned EEG/EMG/photometry features for this event.",
+                className="app-subtitle",
+            ))
+        return html.Div(className="card", children=children)
+    except Exception as exc:
+        return f"Event physiology unavailable: {exc}"
 
 
 @app.callback(
@@ -5993,9 +6207,9 @@ def biological_interpretation(som_state, layer_state, final_state=None):
     if som == "Wake" and layer == "Sleep":
         return "Wake/Sleep conflict: possible low-EMG wake, drowsiness, or Layer 1 sleep overcall."
     if som == "REM" and final in {"Wake", "NREM"}:
-        return "Reviewer corrected Somnotate REM; inspect as possible false REM or transition."
+        return "Final differs from Somnotate REM; inspect possible false REM or transition."
     if som == "REM" and final == "REM":
-        return "Reviewer kept Somnotate REM at this peak."
+        return "Final and Somnotate both label this peak REM (not proof of manual validation)."
     return "General scoring disagreement or low-confidence period."
 
 
@@ -6066,22 +6280,22 @@ def somnotate_final_interpretation(som_state, final_state):
     final = normalize_state_label(final_state)
 
     if som == "REM" and final == "Wake":
-        return "Somnotate REM was corrected to Wake: inspect EMG/movement and possible false REM."
+        return "Somnotate REM / Final Wake: inspect EMG and movement; labels differ."
     if som == "REM" and final == "NREM":
-        return "Somnotate REM was corrected to NREM: inspect theta/delta balance and REM transition boundaries."
+        return "Somnotate REM / Final NREM: inspect EEG rhythms and REM transition boundaries."
     if som == "NREM" and final == "Wake":
-        return "Somnotate NREM was corrected to Wake: quiet wake vs NREM ambiguity or sleep overcall."
+        return "Somnotate NREM / Final Wake: possible quiet wake versus NREM ambiguity."
     if som == "NREM" and final == "REM":
-        return "Reviewer upgraded NREM to REM: possible missed REM or transition into REM."
+        return "Somnotate NREM / Final REM: possible missed REM or transition."
     if som == "Wake" and final == "NREM":
-        return "Somnotate Wake was corrected to NREM: low-EMG quiet sleep may have been missed."
+        return "Somnotate Wake / Final NREM: potential quiet sleep or model mismatch."
     if som == "Wake" and final == "REM":
-        return "Somnotate Wake was corrected to REM: check for REM with movement or model miss."
+        return "Somnotate Wake / Final REM: check movement, EMG and EEG."
     return "Somnotate and Final differ at the event peak; inspect raw EEG/EMG and neighboring epochs."
 
 
 def render_somnotate_final_patterns(events):
-    """Summarize biologically meaningful Somnotate vs reviewed Final differences."""
+    """Summarize Somnotate vs defined Final at flagged event peaks."""
     if events is None or len(events) == 0:
         return html.Div(className="card", children=[
             html.H4("Somnotate vs Final biological patterns"),
@@ -6105,10 +6319,10 @@ def render_somnotate_final_patterns(events):
 
     if len(usable) == 0:
         pieces = [
-            "No flagged events have both a defined Somnotate state and a reviewed Final state yet."
+            "No flagged events have both a defined Somnotate state and a defined Final state yet."
         ]
         if unreviewed_n:
-            pieces.append(f"{unreviewed_n} flagged events have Somnotate defined but Final is still Undefined/unreviewed.")
+            pieces.append(f"{unreviewed_n} flagged events have Somnotate defined but Final is still Undefined.")
         if no_som_n:
             pieces.append(f"{no_som_n} flagged events have no defined Somnotate state at the peak.")
         return html.Div(className="card", children=[
@@ -6121,17 +6335,17 @@ def render_somnotate_final_patterns(events):
     disagreement_n = len(disagree)
 
     cards = html.Div(className="dashboard-grid", children=[
-        compact_metric_card("Flagged events with reviewed Final", len(usable)),
+        compact_metric_card("Flagged events with defined Final", len(usable)),
         compact_metric_card("Somnotate = Final", f"{agreement_n} ({100*agreement_n/max(len(usable),1):.1f}%)"),
         compact_metric_card("Somnotate ≠ Final", f"{disagreement_n} ({100*disagreement_n/max(len(usable),1):.1f}%)"),
-        compact_metric_card("Final still unreviewed", unreviewed_n),
+        compact_metric_card("Final Undefined at peak", unreviewed_n),
     ])
 
     if disagreement_n == 0:
         return html.Div(className="card", children=[
             html.H4("Somnotate vs Final biological patterns"),
             html.Div(
-                "Among flagged events with reviewed Final scoring, Somnotate and Final agree at the event peak. "
+                "Among flagged events with defined Final scoring, Somnotate and Final agree at the event peak. "
                 "This suggests the current flagged events are not mainly reviewer corrections of Somnotate state labels.",
                 className="app-subtitle",
                 style={"marginBottom": "8px"},
@@ -6156,14 +6370,14 @@ def render_somnotate_final_patterns(events):
     summary = (
         f"Most common Somnotate/Final correction pattern: {most['pattern']} "
         f"({int(most['events'])} events, {most['% Somnotate-Final disagreements']:.1f}% of Somnotate-Final disagreements). "
-        "This section ignores unreviewed Final epochs so it reflects reviewer decisions, not missing review."
+        "Undefined Final epochs are excluded; a defined Final label may have been copied automatically and does not prove independent review."
     )
 
     return html.Div(className="card", children=[
         html.H4("Somnotate vs Final biological patterns"),
         html.Div(
-            "This is the main biological/reviewer summary: in the flagged events, did the reviewer keep Somnotate's Wake/NREM/REM state, "
-            "or systematically correct it to another biological state?",
+            "In flagged events, how often do the Somnotate and Final labels match or differ? "
+            "Final can be assigned manually or copied from a model, so agreement does not establish reviewer confirmation.",
             className="app-subtitle",
             style={"marginBottom": "8px"},
         ),
@@ -6193,7 +6407,7 @@ def find_state_column(df, candidates):
 
 
 def render_somnotate_rem_outcome(recording_dir):
-    """Compare all Somnotate REM epochs with reviewed Final labels."""
+    """Compare all Somnotate REM epochs with available Final labels."""
     recording_dir = Path(recording_dir)
     som = safe_read_csv(recording_dir / "somnotate" / "somnotate_results_timeseries.csv")
     final = safe_read_csv(recording_dir / "final_scoring.csv")
@@ -6248,13 +6462,37 @@ def render_somnotate_rem_outcome(recording_dir):
 
     cards = html.Div(className="dashboard-grid", children=[
         compact_metric_card("Somnotate REM epochs", n_rem),
-        compact_metric_card("Kept as Final REM", f"{kept} ({pct(kept)})"),
-        compact_metric_card("Corrected to NREM/Wake", f"{corrected_nrem + corrected_wake} ({pct(corrected_nrem + corrected_wake)})"),
-        compact_metric_card("Still unreviewed", f"{unreviewed} ({pct(unreviewed)})"),
+        compact_metric_card("Final agrees: REM", f"{kept} ({pct(kept)})"),
+        compact_metric_card("Final NREM/Wake", f"{corrected_nrem + corrected_wake} ({pct(corrected_nrem + corrected_wake)})"),
+        compact_metric_card("Final Undefined", f"{unreviewed} ({pct(unreviewed)})"),
     ])
 
     outcome_counts = rem["final_clean"].value_counts().rename_axis("Final state").reset_index(name="Somnotate REM epochs")
     outcome_counts["% Somnotate REM"] = (100.0 * outcome_counts["Somnotate REM epochs"] / max(n_rem, 1)).round(1)
+
+    # Compact biological summary: for every Somnotate REM epoch, what is Final?
+    fate_fig = go.Figure()
+    for final_state in ["REM", "NREM", "Wake", "Undefined", "Artifact", "Uncertain"]:
+        amount = int((rem["final_clean"] == final_state).sum())
+        if not amount:
+            continue
+        share = 100.0 * amount / max(n_rem, 1)
+        fate_fig.add_trace(go.Bar(
+            x=[share], y=["Somnotate REM"], orientation="h",
+            name=f"Final {final_state}",
+            marker_color=STATE_COLORS.get(final_state, "#94A3B8"),
+            text=f"{share:.1f}%" if share >= 7 else "",
+            textposition="inside",
+            hovertemplate=f"Final {final_state}: {amount} epochs ({share:.1f}%)<extra></extra>",
+        ))
+    fate_fig.update_layout(
+        barmode="stack", title="Where do Somnotate REM labels end up in Final?",
+        template="plotly_white", height=265,
+        margin=dict(l=105, r=30, t=55, b=45),
+        xaxis=dict(title="% of Somnotate REM epochs", range=[0, 100]),
+        yaxis=dict(title=""),
+        legend=dict(orientation="h", y=-0.55),
+    )
 
     # Build REM episodes from consecutive Somnotate REM epochs.
     rem_sorted = rem.sort_values("t0_s").reset_index(drop=True)
@@ -6284,26 +6522,27 @@ def render_somnotate_rem_outcome(recording_dir):
             "start min": round(float(sub["t0_s"].astype(float).min()) / 60.0, 2),
             "end min": round(float(sub["t1_s"].astype(float).max()) / 60.0, 2),
             "duration s": round(duration, 1),
-            "% kept Final REM": round(pct_kept, 1),
-            "% reviewed": round(pct_reviewed, 1),
+            "% Final REM": round(pct_kept, 1),
+            "% Final defined": round(pct_reviewed, 1),
             "main Final state": str(final_mode.iloc[0]) if len(final_mode) else "Undefined",
             "main Layer 1 state": str(layer_mode.iloc[0]) if len(layer_mode) else "Undefined",
         })
     episodes = pd.DataFrame(episode_rows)
     if len(episodes):
         # Put most corrected/reviewed and longer REM episodes first.
-        episodes = episodes.sort_values(["% kept Final REM", "% reviewed", "duration s"], ascending=[True, False, False]).head(12)
+        episodes = episodes.sort_values(["% Final REM", "% Final defined", "duration s"], ascending=[True, False, False]).head(12)
 
     note = (
-        "This section asks: when Somnotate called REM, did the reviewer keep REM in Final, "
-        "correct it to NREM/Wake, or leave it unreviewed? This is useful for spotting REM overcalls, "
-        "REM with movement/high EMG, or systematic reviewer corrections."
+        "Of all Somnotate REM epochs, how many have Final REM, Wake, NREM, or no Final label? "
+        "Differences may highlight REM overcalls, transitions, or high EMG. "
+        "Final can be auto-filled; these comparisons are descriptive, not necessarily human decisions."
     )
 
     children = [
         html.H4("Somnotate REM review outcome"),
         html.Div(note, className="app-subtitle", style={"marginBottom": "8px"}),
         cards,
+        dcc.Graph(figure=fate_fig),
         html.Div(style={"height": "8px"}),
         html.H5("All Somnotate REM epochs: Final outcome"),
         dash_table.DataTable(
@@ -6319,7 +6558,7 @@ def render_somnotate_rem_outcome(recording_dir):
     ]
     if len(episodes):
         children += [
-            html.H5("Somnotate REM episodes most likely corrected or needing review"),
+            html.H5("Somnotate REM episodes with low Final agreement or limited labeling"),
             dash_table.DataTable(
                 data=episodes.to_dict("records"),
                 columns=[{"name": c, "id": c} for c in episodes.columns],
@@ -6335,11 +6574,24 @@ def render_somnotate_rem_outcome(recording_dir):
     return html.Div(className="card", children=children)
 
 def render_dissociation_dashboard(analysis_dir):
-    """Clean, review-oriented dissociation dashboard."""
+    """Biologist-oriented, descriptive dissociation review dashboard."""
     analysis_dir = Path(analysis_dir)
     pairwise = safe_read_csv(analysis_dir / "dissociation_pairwise_summary.csv")
     state = safe_read_csv(analysis_dir / "dissociation_state_summary.csv")
+    epochs = safe_read_csv(analysis_dir / "dissociation_epochs.csv")
     events = safe_read_csv(analysis_dir / "dissociation_events.csv")
+    epoch_physiology = safe_read_csv(analysis_dir / "dissociation_epochs.csv")
+    event_physiology = safe_read_csv(analysis_dir / "dissociation_event_physiology.csv")
+    physiology_info_file = analysis_dir / "dissociation_physiology_info.json"
+    settings_path = analysis_dir / "analysis_settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except (ValueError, OSError):
+        settings = {}
+    threshold = float(settings.get("threshold", 0.20))
+    evidence = settings.get("evidence", "combined")
+    if events is not None:
+        events = attach_dissociation_review_status(events, analysis_dir)
 
     children = []
     n_events = 0 if events is None else len(events)
@@ -6357,10 +6609,103 @@ def render_dissociation_dashboard(analysis_dir):
 
     children.append(html.Div(className="dashboard-grid", children=[
         compact_metric_card("Dissociation events", n_events),
+        compact_metric_card("Explicitly reviewed", (
+            int((events["qc_review_status"] == "reviewed").sum())
+            if events is not None and "qc_review_status" in events else 0
+        )),
         compact_metric_card("Max score", max_score),
         compact_metric_card("Highest pairwise disagreement", key_pair_pct),
         compact_metric_card("Top reason", top_reason),
     ]))
+
+    children.append(html.Div(className="card", children=[
+        html.H4("How to interpret this dashboard"),
+        html.Div(
+            f"Evidence focus: {evidence}. The index combines available evidence (0–1) to prioritize QC, "
+            "not to estimate the probability of a true biological dissociation. "
+            "Layer 1 Sleep is compared with NREM/REM only after collapsing both to Wake/Sleep; "
+            "Undefined and unreviewed labels are excluded from agreement denominators. "
+            "Heatmaps include all comparable epochs, not just flagged events. "
+            "Counts and rates are descriptive within this recording; epochs are not independent animals.",
+            className="app-subtitle",
+        ),
+    ]))
+    if epochs is not None and len(epochs):
+        visualizations = [
+            score_timeline_figure(epochs, events, threshold),
+            hourly_burden_figure(epochs, threshold),
+            confusion_figure(epochs, "somnotate_state", "final_state", "Somnotate", "Final"),
+            confusion_figure(epochs, "somnotate_state", "manual_state", "Somnotate", "Manual"),
+            final_coverage_figure(epochs),
+        ]
+        visualizations = [plot for plot in visualizations if plot is not None]
+        if visualizations:
+            children.append(html.Div(className="card", children=[
+                html.H4("Scoring patterns across the entire recording"),
+                html.Div("Each plot uses the epoch time axis; its denominator is given on the axis or hover label.", className="app-subtitle"),
+                *[dcc.Graph(figure=plot) for plot in visualizations],
+            ]))
+    if events is not None and len(events):
+        raster = event_raster_figure(events)
+        if raster is not None:
+            children.append(html.Div(className="card", children=[dcc.Graph(figure=raster)]))
+
+    # Physiological characterization is descriptive, separate from the
+    # disagreement-based event detection and ranking.
+    if epoch_physiology is not None and len(epoch_physiology):
+        info = {}
+        if physiology_info_file.exists():
+            try:
+                info = json.loads(physiology_info_file.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                info = {}
+        data_info = info.get("data", {})
+        photo_info = data_info.get("photometry", {})
+        provenance = [
+            html.B("Data provenance: "),
+            html.Span(data_info.get("eeg_emg", "Epoch features unavailable. ")),
+            html.Span(" Photometry: " + str(photo_info.get("status", "Not available."))),
+        ]
+        if photo_info.get("available"):
+            provenance.append(html.Span(
+                f" Source {photo_info.get('source')}; "
+                f"sampling {photo_info.get('sampling_rate_hz')} Hz; "
+                f"onset {photo_info.get('onset_s', 0)} s relative to EEG; "
+                f"units {photo_info.get('units')}."
+            ))
+        overview = physiology_overview_figure(epoch_physiology, events)
+        contrast = event_contrast_heatmap(event_physiology, events)
+        physiol_children = [
+            html.H4("Event physiology: EEG, EMG and optional photometry"),
+            html.Div(
+                "EEG bandpower and theta/delta are from existing epoch features; EMG is log-RMS / P95. "
+                "Photometry is the raw stored signal summarized per epoch and standardized within this recording; "
+                "it is NOT assumed to be ΔF/F or acetylcholine concentration. "
+                "Red regions indicate detected event cores, not proven hybrid sleep states.",
+                className="app-subtitle",
+            ),
+            html.Div(provenance, className="status-line"),
+        ]
+        if overview is not None:
+            physiol_children.append(dcc.Graph(figure=overview))
+        if contrast is not None:
+            physiol_children.extend([
+                html.Div(
+                    "Each heatmap cell is the median feature z-score during the core event minus "
+                    "the median from unflagged epochs of the same predicted state. "
+                    "Requires at least 10 finite background epochs per feature. "
+                    "Missing values mean no trustworthy comparison; no p-values are implied.",
+                    className="app-subtitle",
+                ),
+                dcc.Graph(figure=contrast),
+            ])
+        if overview is None and contrast is None:
+            physiol_children.append(html.Div(
+                "No valid physiological feature data found. Run Compute epoch features, "
+                "and verify photometry sampling metadata if supplied.",
+                className="app-subtitle",
+            ))
+        children.append(html.Div(className="card", children=physiol_children))
 
     children.append(html.Div(className="card", children=[
         html.H4("How events are ranked"),
@@ -6411,41 +6756,9 @@ def render_dissociation_dashboard(analysis_dir):
         )
         children.append(html.Div(className="card", children=[dcc.Graph(figure=fig)]))
 
-    # Event timeline with reason split.
-    if events is not None and len(events):
-        df = events.copy()
-        if "start_min" not in df.columns and "start_s" in df.columns:
-            df["start_min"] = df["start_s"].astype(float) / 60.0
-        score_col = "max_dissociation_index" if "max_dissociation_index" in df.columns else find_first_numeric_col(df, ["mean_dissociation_index"])
-        if "start_min" in df.columns and score_col:
-            fig = go.Figure()
-            if "main_reason" in df.columns:
-                reasons = list(df["main_reason"].astype(str).fillna("Unknown").unique())
-            else:
-                reasons = ["Dissociation"]
-                df["main_reason"] = "Dissociation"
-            palette = ["#F97316", "#6366F1", "#14B8A6", "#EF4444", "#A855F7", "#64748B"]
-            for i, reason in enumerate(reasons):
-                sub = df[df["main_reason"].astype(str) == reason]
-                fig.add_trace(go.Scatter(
-                    x=sub["start_min"], y=sub[score_col], mode="markers", name=reason,
-                    marker=dict(size=9, color=palette[i % len(palette)], opacity=0.8),
-                    customdata=np.stack([
-                        sub.get("event_id", pd.Series([""] * len(sub))).astype(str),
-                        sub.get("end_min", sub.get("end_s", pd.Series([np.nan]*len(sub)))).astype(str),
-                    ], axis=-1),
-                    hovertemplate="%{customdata[0]}<br>Start=%{x:.2f} min<br>Score=%{y:.3f}<extra></extra>",
-                ))
-            fig.update_layout(
-                title="Dissociation event timeline", template="plotly_white", height=360,
-                margin=dict(l=55, r=25, t=55, b=45), xaxis_title="Time (min)", yaxis_title="Dissociation score",
-                legend=dict(orientation="h", y=1.08),
-            )
-            children.append(html.Div(className="card", children=[dcc.Graph(figure=fig)]))
-
     # Top ranked events table.
     if events is not None and len(events):
-        cols = [c for c in ["rank", "event_id", "start_min", "end_min", "duration_s", "max_dissociation_index", "main_reason", "states_at_peak"] if c in events.columns]
+        cols = [c for c in ["rank", "qc_review_status", "event_id", "start_min", "end_min", "duration_s", "max_dissociation_index", "main_reason", "states_at_peak"] if c in events.columns]
         df = events[cols].head(25).copy()
         for c in ["start_min", "end_min", "max_dissociation_index"]:
             if c in df.columns:
@@ -6484,9 +6797,12 @@ def table_from_csv(path: Path, max_rows=50):
     State("project-root-store", "data"),
     State("stats-recording", "value"),
     State("diss-threshold", "value"),
+    State("diss-evidence", "value"),
+    State("diss-max-gap", "value"),
+    State("diss-min-duration", "value"),
     prevent_initial_call=True,
 )
-def run_diss(n, project_root, recording_id, threshold):
+def run_diss(n, project_root, recording_id, threshold, evidence, max_gap_s, min_duration_s):
     if not project_root or not recording_id:
         return "Load project and choose recording.", no_update, no_update, no_update
 
@@ -6511,7 +6827,10 @@ def run_diss(n, project_root, recording_id, threshold):
         # So use the actual folder basename.
         pipeline_recording_id = rec_dir.name
 
-        threshold_text = str(threshold or "0.2").replace(",", ".")
+        threshold_text = str(0.20 if threshold is None else threshold).replace(",", ".")
+        evidence = evidence or "combined"
+        max_gap_s = 5 if max_gap_s is None else max_gap_s
+        min_duration_s = 0 if min_duration_s is None else min_duration_s
 
         cmd = [
             sys.executable,
@@ -6520,11 +6839,15 @@ def run_diss(n, project_root, recording_id, threshold):
             str(project_root),
             "--recording-id",
             str(pipeline_recording_id),
-            "--threshold",
-            threshold_text,
+            "--threshold", threshold_text,
+            "--evidence", str(evidence),
+            "--max-gap-s", str(max_gap_s),
+            "--min-duration-s", str(min_duration_s),
         ]
 
         code, out = run_command(cmd)
+        if code != 0:
+            return f"Dissociation analysis failed (exit {code}):\n{out}", no_update, no_update, no_update
 
         analysis = rec_dir / "dissociation_analysis"
 
