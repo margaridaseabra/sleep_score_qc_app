@@ -292,8 +292,12 @@ def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10, m
 
     out = pd.DataFrame(rows)
     if out.empty:
-        out["rank"] = pd.Series(dtype=int)
-        return out
+        return pd.DataFrame(columns=[
+            "event_id", "start_s", "end_s", "start_min", "end_min",
+            "duration_s", "review_duration_s", "core_start_s", "core_end_s",
+            "max_dissociation_index", "mean_dissociation_index",
+            "main_reason", "states_at_peak", "n_epochs", "rank",
+        ])
     out = out.sort_values(
         ["max_dissociation_index", "mean_dissociation_index", "duration_s"],
         ascending=[False, False, False],
@@ -307,8 +311,8 @@ def merge_dissociation_events(epoch_df, min_index=0.20, max_gap_s=5, pad_s=10, m
 def build_analysis(project_root, recording_id, threshold=0.20, evidence="combined", max_gap_s=5, pad_s=10, min_duration_s=0):
     if evidence not in {"combined", "disagreement", "confidence", "physiology"}:
         raise ValueError(f"Unsupported evidence mode: {evidence}")
-    if not 0 <= float(threshold) <= 1:
-        raise ValueError("Event threshold must be between 0 and 1")
+    if not 0 < float(threshold) <= 1:
+        raise ValueError("Event threshold must be greater than 0 and at most 1")
     if min(float(max_gap_s), float(pad_s), float(min_duration_s)) < 0:
         raise ValueError("Gap, padding and minimum duration must be non-negative")
     project_root = Path(project_root)
