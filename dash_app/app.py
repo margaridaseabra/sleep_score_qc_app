@@ -5437,7 +5437,77 @@ def load_dissociation_events_for_recording(project_root, recording_id):
         events = events.copy()
         events["rank"] = np.arange(1, len(events) + 1)
 
-    return events
+    return attach_dissociation_review_status(events, rec_dir / "dissociation_analysis")
+
+
+def _dissociation_event_key(row):
+    """Key a review decision to unpadded event bounds, not ephemeral rank."""
+    start = row.get("core_start_s", row.get("start_s"))
+    end = row.get("core_end_s", row.get("end_s"))
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(start) and np.isfinite(end)):
+        return None
+    return (round(start, 3), round(end, 3))
+
+
+def attach_dissociation_review_status(events, analysis_dir):
+    """Annotate events without touching Final scoring or detection output."""
+    if events is None:
+        return None
+    result = events.copy()
+    result["qc_review_status"] = "pending"
+    path = Path(analysis_dir) / "dissociation_review_log.csv"
+    saved = safe_read_csv(path)
+    if saved is None or not {"core_start_s", "core_end_s", "review_status"}.issubset(saved.columns):
+        return result
+    decisions = {}
+    for _, row in saved.iterrows():
+        key = _dissociation_event_key(row)
+        if key is not None and row["review_status"] in {"reviewed", "pending"}:
+            decisions[key] = row["review_status"]
+    result["qc_review_status"] = [
+        decisions.get(_dissociation_event_key(row), "pending")
+        for _, row in result.iterrows()
+    ]
+    return result
+
+
+def persist_dissociation_review_status(project_root, recording_id, event_id, status):
+    if status not in {"reviewed", "pending"}:
+        raise ValueError(f"Invalid review status: {status}")
+    project_root = Path(project_root).expanduser().resolve()
+    rec_dir = recording_dir_from_manifest(project_root, recording_id)
+    analysis_dir = rec_dir / "dissociation_analysis"
+    events = safe_read_csv(analysis_dir / "dissociation_events.csv")
+    row = get_event_row(events, event_id)
+    if row is None:
+        raise ValueError("Selected event no longer exists. Refresh the event queue.")
+    key = _dissociation_event_key(row)
+    if key is None:
+        raise ValueError("Selected event has invalid time boundaries.")
+
+    path = analysis_dir / "dissociation_review_log.csv"
+    saved = safe_read_csv(path)
+    columns = ["event_id", "core_start_s", "core_end_s", "review_status", "updated_utc"]
+    if saved is None or not set(columns).issubset(saved.columns):
+        saved = pd.DataFrame(columns=columns)
+    saved = saved[[c for c in columns]].copy()
+    saved = saved[
+        saved.apply(lambda r: _dissociation_event_key(r) != key, axis=1)
+    ]
+    record = {
+        "event_id": str(event_id), "core_start_s": key[0], "core_end_s": key[1],
+        "review_status": status, "updated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    saved = pd.concat([saved, pd.DataFrame([record])], ignore_index=True)
+    # A separate log survives analysis reruns; never overwrite edited sleep labels.
+    tmp = path.with_name(path.name + ".tmp")
+    saved.to_csv(tmp, index=False)
+    tmp.replace(path)
+    return status
 
 
 def dissociation_event_options(events):
@@ -5619,6 +5689,30 @@ def step_qc_dissociation_event(n_prev, n_next, options, value):
         idx = min(len(values) - 1, idx + 1)
 
     return values[idx]
+
+
+@app.callback(
+    Output("qc-diss-review-refresh", "data"),
+    Output("qc-diss-review-status", "children"),
+    Input("qc-diss-mark-reviewed", "n_clicks"),
+    Input("qc-diss-reopen", "n_clicks"),
+    State("qc-diss-event-dropdown", "value"),
+    State("project-root-store", "data"),
+    State("recording-id-store", "data"),
+    prevent_initial_call=True,
+)
+def update_qc_dissociation_review(n_mark, n_reopen, event_id, project_root, recording_id):
+    if not event_id:
+        return no_update, "Choose an event before updating its review status."
+    trigger = callback_context.triggered_id
+    new_status = "reviewed" if trigger == "qc-diss-mark-reviewed" else "pending"
+    try:
+        persist_dissociation_review_status(project_root, recording_id, event_id, new_status)
+        return {"event": event_id, "status": new_status, "clicks": n_mark if new_status == "reviewed" else n_reopen}, (
+            "Event marked reviewed." if new_status == "reviewed" else "Event reopened for review."
+        )
+    except Exception as exc:
+        return no_update, f"Could not update event review: {exc}"
 
 
 @app.callback(
@@ -6413,6 +6507,10 @@ def render_dissociation_dashboard(analysis_dir):
 
     children.append(html.Div(className="dashboard-grid", children=[
         compact_metric_card("Dissociation events", n_events),
+        compact_metric_card("Explicitly reviewed", (
+            int((events["qc_review_status"] == "reviewed").sum())
+            if events is not None and "qc_review_status" in events else 0
+        )),
         compact_metric_card("Max score", max_score),
         compact_metric_card("Highest pairwise disagreement", key_pair_pct),
         compact_metric_card("Top reason", top_reason),
@@ -6501,7 +6599,7 @@ def render_dissociation_dashboard(analysis_dir):
 
     # Top ranked events table.
     if events is not None and len(events):
-        cols = [c for c in ["rank", "event_id", "start_min", "end_min", "duration_s", "max_dissociation_index", "main_reason", "states_at_peak"] if c in events.columns]
+        cols = [c for c in ["rank", "qc_review_status", "event_id", "start_min", "end_min", "duration_s", "max_dissociation_index", "main_reason", "states_at_peak"] if c in events.columns]
         df = events[cols].head(25).copy()
         for c in ["start_min", "end_min", "max_dissociation_index"]:
             if c in df.columns:
