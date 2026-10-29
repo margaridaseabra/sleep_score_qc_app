@@ -34,7 +34,9 @@ def _recording(tmp_path, layers, som_state, conf=None, emg=None):
         som["somnotate_confidence"] = conf
     som.to_csv(folder / "somnotate" / "somnotate_results_timeseries.csv", index=False)
     if emg is not None:
-        pd.DataFrame({"epoch_id": list(range(n)), "emg_rms_z": emg}).to_csv(
+        # Production epoch_features.csv always contains time bounds; the
+        # physiology pipeline deliberately refuses unverified index-only alignment.
+        pd.DataFrame({**geometry, "epoch_id": list(range(n)), "emg_rms_z": emg}).to_csv(
             folder / "epoch_features.csv", index=False
         )
     return folder
