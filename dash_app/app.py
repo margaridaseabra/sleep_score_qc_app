@@ -6670,6 +6670,7 @@ def render_dissociation_dashboard(analysis_dir):
             provenance.append(html.Span(
                 f" Source {photo_info.get('source')}; "
                 f"sampling {photo_info.get('sampling_rate_hz')} Hz; "
+                f"onset {photo_info.get('onset_s', 0)} s relative to EEG; "
                 f"units {photo_info.get('units')}."
             ))
         overview = physiology_overview_figure(epoch_physiology, events)
