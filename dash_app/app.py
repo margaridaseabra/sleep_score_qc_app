@@ -6133,9 +6133,9 @@ def biological_interpretation(som_state, layer_state, final_state=None):
     if som == "Wake" and layer == "Sleep":
         return "Wake/Sleep conflict: possible low-EMG wake, drowsiness, or Layer 1 sleep overcall."
     if som == "REM" and final in {"Wake", "NREM"}:
-        return "Reviewer corrected Somnotate REM; inspect as possible false REM or transition."
+        return "Final differs from Somnotate REM; inspect possible false REM or transition."
     if som == "REM" and final == "REM":
-        return "Reviewer kept Somnotate REM at this peak."
+        return "Final and Somnotate both label this peak REM (not proof of manual validation)."
     return "General scoring disagreement or low-confidence period."
 
 
@@ -6206,22 +6206,22 @@ def somnotate_final_interpretation(som_state, final_state):
     final = normalize_state_label(final_state)
 
     if som == "REM" and final == "Wake":
-        return "Somnotate REM was corrected to Wake: inspect EMG/movement and possible false REM."
+        return "Somnotate REM / Final Wake: inspect EMG and movement; labels differ."
     if som == "REM" and final == "NREM":
-        return "Somnotate REM was corrected to NREM: inspect theta/delta balance and REM transition boundaries."
+        return "Somnotate REM / Final NREM: inspect EEG rhythms and REM transition boundaries."
     if som == "NREM" and final == "Wake":
-        return "Somnotate NREM was corrected to Wake: quiet wake vs NREM ambiguity or sleep overcall."
+        return "Somnotate NREM / Final Wake: possible quiet wake versus NREM ambiguity."
     if som == "NREM" and final == "REM":
-        return "Reviewer upgraded NREM to REM: possible missed REM or transition into REM."
+        return "Somnotate NREM / Final REM: possible missed REM or transition."
     if som == "Wake" and final == "NREM":
-        return "Somnotate Wake was corrected to NREM: low-EMG quiet sleep may have been missed."
+        return "Somnotate Wake / Final NREM: potential quiet sleep or model mismatch."
     if som == "Wake" and final == "REM":
-        return "Somnotate Wake was corrected to REM: check for REM with movement or model miss."
+        return "Somnotate Wake / Final REM: check movement, EMG and EEG."
     return "Somnotate and Final differ at the event peak; inspect raw EEG/EMG and neighboring epochs."
 
 
 def render_somnotate_final_patterns(events):
-    """Summarize biologically meaningful Somnotate vs reviewed Final differences."""
+    """Summarize Somnotate vs defined Final at flagged event peaks."""
     if events is None or len(events) == 0:
         return html.Div(className="card", children=[
             html.H4("Somnotate vs Final biological patterns"),
@@ -6245,10 +6245,10 @@ def render_somnotate_final_patterns(events):
 
     if len(usable) == 0:
         pieces = [
-            "No flagged events have both a defined Somnotate state and a reviewed Final state yet."
+            "No flagged events have both a defined Somnotate state and a defined Final state yet."
         ]
         if unreviewed_n:
-            pieces.append(f"{unreviewed_n} flagged events have Somnotate defined but Final is still Undefined/unreviewed.")
+            pieces.append(f"{unreviewed_n} flagged events have Somnotate defined but Final is still Undefined.")
         if no_som_n:
             pieces.append(f"{no_som_n} flagged events have no defined Somnotate state at the peak.")
         return html.Div(className="card", children=[
@@ -6261,17 +6261,17 @@ def render_somnotate_final_patterns(events):
     disagreement_n = len(disagree)
 
     cards = html.Div(className="dashboard-grid", children=[
-        compact_metric_card("Flagged events with reviewed Final", len(usable)),
+        compact_metric_card("Flagged events with defined Final", len(usable)),
         compact_metric_card("Somnotate = Final", f"{agreement_n} ({100*agreement_n/max(len(usable),1):.1f}%)"),
         compact_metric_card("Somnotate ≠ Final", f"{disagreement_n} ({100*disagreement_n/max(len(usable),1):.1f}%)"),
-        compact_metric_card("Final still unreviewed", unreviewed_n),
+        compact_metric_card("Final Undefined at peak", unreviewed_n),
     ])
 
     if disagreement_n == 0:
         return html.Div(className="card", children=[
             html.H4("Somnotate vs Final biological patterns"),
             html.Div(
-                "Among flagged events with reviewed Final scoring, Somnotate and Final agree at the event peak. "
+                "Among flagged events with defined Final scoring, Somnotate and Final agree at the event peak. "
                 "This suggests the current flagged events are not mainly reviewer corrections of Somnotate state labels.",
                 className="app-subtitle",
                 style={"marginBottom": "8px"},
@@ -6296,14 +6296,14 @@ def render_somnotate_final_patterns(events):
     summary = (
         f"Most common Somnotate/Final correction pattern: {most['pattern']} "
         f"({int(most['events'])} events, {most['% Somnotate-Final disagreements']:.1f}% of Somnotate-Final disagreements). "
-        "This section ignores unreviewed Final epochs so it reflects reviewer decisions, not missing review."
+        "Undefined Final epochs are excluded; a defined Final label may have been copied automatically and does not prove independent review."
     )
 
     return html.Div(className="card", children=[
         html.H4("Somnotate vs Final biological patterns"),
         html.Div(
-            "This is the main biological/reviewer summary: in the flagged events, did the reviewer keep Somnotate's Wake/NREM/REM state, "
-            "or systematically correct it to another biological state?",
+            "In flagged events, how often do the Somnotate and Final labels match or differ? "
+            "Final can be assigned manually or copied from a model, so agreement does not establish reviewer confirmation.",
             className="app-subtitle",
             style={"marginBottom": "8px"},
         ),
@@ -6333,7 +6333,7 @@ def find_state_column(df, candidates):
 
 
 def render_somnotate_rem_outcome(recording_dir):
-    """Compare all Somnotate REM epochs with reviewed Final labels."""
+    """Compare all Somnotate REM epochs with available Final labels."""
     recording_dir = Path(recording_dir)
     som = safe_read_csv(recording_dir / "somnotate" / "somnotate_results_timeseries.csv")
     final = safe_read_csv(recording_dir / "final_scoring.csv")
@@ -6388,9 +6388,9 @@ def render_somnotate_rem_outcome(recording_dir):
 
     cards = html.Div(className="dashboard-grid", children=[
         compact_metric_card("Somnotate REM epochs", n_rem),
-        compact_metric_card("Kept as Final REM", f"{kept} ({pct(kept)})"),
-        compact_metric_card("Corrected to NREM/Wake", f"{corrected_nrem + corrected_wake} ({pct(corrected_nrem + corrected_wake)})"),
-        compact_metric_card("Still unreviewed", f"{unreviewed} ({pct(unreviewed)})"),
+        compact_metric_card("Final agrees: REM", f"{kept} ({pct(kept)})"),
+        compact_metric_card("Final NREM/Wake", f"{corrected_nrem + corrected_wake} ({pct(corrected_nrem + corrected_wake)})"),
+        compact_metric_card("Final Undefined", f"{unreviewed} ({pct(unreviewed)})"),
     ])
 
     outcome_counts = rem["final_clean"].value_counts().rename_axis("Final state").reset_index(name="Somnotate REM epochs")
@@ -6435,9 +6435,9 @@ def render_somnotate_rem_outcome(recording_dir):
         episodes = episodes.sort_values(["% kept Final REM", "% reviewed", "duration s"], ascending=[True, False, False]).head(12)
 
     note = (
-        "This section asks: when Somnotate called REM, did the reviewer keep REM in Final, "
-        "correct it to NREM/Wake, or leave it unreviewed? This is useful for spotting REM overcalls, "
-        "REM with movement/high EMG, or systematic reviewer corrections."
+        "Of all Somnotate REM epochs, how many have Final REM, Wake, NREM, or no Final label? "
+        "Differences may highlight REM overcalls, transitions, or high EMG. "
+        "Final can be auto-filled; these comparisons are descriptive, not necessarily human decisions."
     )
 
     children = [
@@ -6459,7 +6459,7 @@ def render_somnotate_rem_outcome(recording_dir):
     ]
     if len(episodes):
         children += [
-            html.H5("Somnotate REM episodes most likely corrected or needing review"),
+            html.H5("Somnotate REM episodes with low Final agreement or limited labeling"),
             dash_table.DataTable(
                 data=episodes.to_dict("records"),
                 columns=[{"name": c, "id": c} for c in episodes.columns],
