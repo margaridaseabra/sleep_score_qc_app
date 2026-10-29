@@ -162,6 +162,52 @@ Final scoring is written to:
 project_root/recordings/<recording_id>/final_scoring.csv
 ```
 
+## Dissociation QC for sleep biologists
+
+After running Somnotate, open **4. Dissociation** and select the recording.
+The analysis is intended to **prioritize suspicious scoring intervals for review**,
+not to diagnose a biological dissociation or produce a validated probability.
+
+**Evidence selector**
+
+- **Combined**: scoring disagreements, model uncertainty and high EMG during REM-labelled epochs.
+- **State disagreements**: genuine comparisons of available labels only.
+- **Low model confidence**: epochs with uncertain model predictions.
+- **REM with high EMG**: REM-labelled epochs where `emg_rms_z > 2`; requires EMG features.
+
+The **threshold** controls which scored epochs enter the queue. **Merge gap**
+joins nearby flagged epochs; **minimum event duration** removes short core events.
+The dashboard shows an index timeline, hourly flagged-epoch proportion,
+Somnotate/Final and Somnotate/Manual comparison heatmaps, and a duration-by-reason plot.
+
+**Important interpretation**
+
+- Layer 1 only distinguishes **Wake and Sleep**. Its Sleep predictions are **not**
+  treated as NREM; comparisons to NREM/REM sources collapse both to Sleep.
+- Three-state confusion matrices use only comparable Wake, NREM and REM epochs.
+  Each heatmap row adds to 100% for a state with observations; percentages are
+  conditional on that row's source state, **not sensitivity/specificity against truth**.
+- Missing or Undefined labels are a **data coverage limitation** and do not
+  automatically create dissociation events.
+- Final labels may have been applied manually **or copied from a model**.
+  Final agreement is therefore not proof of independent human verification.
+- Event `duration_s` describes the **unpadded core episode**; the `start_s` /
+  `end_s` navigation window includes review padding.
+- Epoch counts are descriptive for a single recording. Do not treat adjacent
+  epochs as independent animals when reporting biological group statistics.
+
+From **2. QC / Review**, use the dissociation queue to jump to an event, inspect
+EEG/EMG, scoring and synchronized video, and optionally click **Mark selected event reviewed**
+or **Reopen selected event**. These explicit review decisions are saved to
+`recordings/<recording_id>/dissociation_analysis/dissociation_review_log.csv`.
+They never modify `final_scoring.csv`.
+
+**After correcting Final scoring**, rerun Dissociation and refresh the QC queue to
+update the statistics. Review decisions survive reruns when the **core event
+boundaries remain the same**. If a threshold or scoring change creates new event
+boundaries, those new events start pending rather than inheriting an unrelated
+review decision.
+
 ## Synchronized video QC
 
 A recording can be linked to an `.mp4`, `.mov`, or `.avi` video.
