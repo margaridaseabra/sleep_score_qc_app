@@ -6396,6 +6396,30 @@ def render_somnotate_rem_outcome(recording_dir):
     outcome_counts = rem["final_clean"].value_counts().rename_axis("Final state").reset_index(name="Somnotate REM epochs")
     outcome_counts["% Somnotate REM"] = (100.0 * outcome_counts["Somnotate REM epochs"] / max(n_rem, 1)).round(1)
 
+    # Compact biological summary: for every Somnotate REM epoch, what is Final?
+    fate_fig = go.Figure()
+    for final_state in ["REM", "NREM", "Wake", "Undefined", "Artifact", "Uncertain"]:
+        amount = int((rem["final_clean"] == final_state).sum())
+        if not amount:
+            continue
+        share = 100.0 * amount / max(n_rem, 1)
+        fate_fig.add_trace(go.Bar(
+            x=[share], y=["Somnotate REM"], orientation="h",
+            name=f"Final {final_state}",
+            marker_color=STATE_COLORS.get(final_state, "#94A3B8"),
+            text=f"{share:.1f}%" if share >= 7 else "",
+            textposition="inside",
+            hovertemplate=f"Final {final_state}: {amount} epochs ({share:.1f}%)<extra></extra>",
+        ))
+    fate_fig.update_layout(
+        barmode="stack", title="Where do Somnotate REM labels end up in Final?",
+        template="plotly_white", height=265,
+        margin=dict(l=105, r=30, t=55, b=45),
+        xaxis=dict(title="% of Somnotate REM epochs", range=[0, 100]),
+        yaxis=dict(title=""),
+        legend=dict(orientation="h", y=-0.55),
+    )
+
     # Build REM episodes from consecutive Somnotate REM epochs.
     rem_sorted = rem.sort_values("t0_s").reset_index(drop=True)
     median_step = np.nanmedian((rem_sorted["t1_s"].astype(float) - rem_sorted["t0_s"].astype(float)).to_numpy())
@@ -6424,15 +6448,15 @@ def render_somnotate_rem_outcome(recording_dir):
             "start min": round(float(sub["t0_s"].astype(float).min()) / 60.0, 2),
             "end min": round(float(sub["t1_s"].astype(float).max()) / 60.0, 2),
             "duration s": round(duration, 1),
-            "% kept Final REM": round(pct_kept, 1),
-            "% reviewed": round(pct_reviewed, 1),
+            "% Final REM": round(pct_kept, 1),
+            "% Final defined": round(pct_reviewed, 1),
             "main Final state": str(final_mode.iloc[0]) if len(final_mode) else "Undefined",
             "main Layer 1 state": str(layer_mode.iloc[0]) if len(layer_mode) else "Undefined",
         })
     episodes = pd.DataFrame(episode_rows)
     if len(episodes):
         # Put most corrected/reviewed and longer REM episodes first.
-        episodes = episodes.sort_values(["% kept Final REM", "% reviewed", "duration s"], ascending=[True, False, False]).head(12)
+        episodes = episodes.sort_values(["% Final REM", "% Final defined", "duration s"], ascending=[True, False, False]).head(12)
 
     note = (
         "Of all Somnotate REM epochs, how many have Final REM, Wake, NREM, or no Final label? "
@@ -6444,6 +6468,7 @@ def render_somnotate_rem_outcome(recording_dir):
         html.H4("Somnotate REM review outcome"),
         html.Div(note, className="app-subtitle", style={"marginBottom": "8px"}),
         cards,
+        dcc.Graph(figure=fate_fig),
         html.Div(style={"height": "8px"}),
         html.H5("All Somnotate REM epochs: Final outcome"),
         dash_table.DataTable(
