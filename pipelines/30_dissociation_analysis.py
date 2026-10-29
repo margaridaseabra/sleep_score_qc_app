@@ -454,7 +454,7 @@ def build_analysis(project_root, recording_id, threshold=0.20, evidence="combine
 
     if evidence in {"combined", "confidence"} and "somnotate_confidence" in out.columns:
         conf = pd.to_numeric(out["somnotate_confidence"], errors="coerce").to_numpy(dtype=float)
-        valid = np.isfinite(conf)
+        valid = np.isfinite(conf) & out["somnotate_state"].isin(["Wake", "NREM", "REM"]).to_numpy()
         max_possible[valid] += weights["som_uncertainty"]
         add = np.zeros(len(out), dtype=float)
         add[valid] = (1 - np.clip(conf[valid], 0, 1)) * weights["som_uncertainty"]
@@ -464,7 +464,7 @@ def build_analysis(project_root, recording_id, threshold=0.20, evidence="combine
 
     if evidence in {"combined", "confidence"} and "layer1_confidence" in out.columns:
         conf = pd.to_numeric(out["layer1_confidence"], errors="coerce").to_numpy(dtype=float)
-        valid = np.isfinite(conf)
+        valid = np.isfinite(conf) & out["layer1_wake_sleep"].isin(["Wake", "Sleep"]).to_numpy()
         max_possible[valid] += weights["layer1_uncertainty"]
         add = np.zeros(len(out), dtype=float)
         add[valid] = (1 - np.clip(conf[valid], 0, 1)) * weights["layer1_uncertainty"]
