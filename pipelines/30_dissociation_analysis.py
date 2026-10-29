@@ -7,9 +7,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from dissociation_physiology import (
-    load_epoch_physiology, summarize_event_physiology,
-)
+# Support both script execution (python pipelines/30_...) and test/module import.
+try:
+    from pipelines.dissociation_physiology import (
+        load_epoch_physiology, summarize_event_physiology,
+    )
+except ModuleNotFoundError:
+    from dissociation_physiology import (
+        load_epoch_physiology, summarize_event_physiology,
+    )
 
 
 STATE_ORDER = ["Wake", "NREM", "REM", "Sleep", "Uncertain", "Undefined", "Artifact"]
