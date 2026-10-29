@@ -23,6 +23,18 @@ from flask import abort, request, send_file
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# Works both with "python dash_app/app.py" and "python -m dash_app.app".
+try:
+    from dash_app.dissociation_viz import (
+        confusion_figure, score_timeline_figure, hourly_burden_figure,
+        event_raster_figure, final_coverage_figure, REASON_NAMES,
+    )
+except ModuleNotFoundError:
+    from dissociation_viz import (
+        confusion_figure, score_timeline_figure, hourly_burden_figure,
+        event_raster_figure, final_coverage_figure, REASON_NAMES,
+    )
+
 try:
     import h5py
 except Exception:
@@ -2963,6 +2975,8 @@ app.validation_layout = html.Div([
     html.Button(id="forward-5"), html.Button(id="forward-15"), html.Div(id="window-label"),
     html.Button(id="qc-refresh-diss-events"), html.Button(id="qc-prev-diss-event"),
     PDropdown(id="qc-diss-event-dropdown"), html.Button(id="qc-next-diss-event"), html.Div(id="qc-diss-event-status"),
+    html.Button(id="qc-diss-mark-reviewed"), html.Button(id="qc-diss-reopen"),
+    dcc.Store(id="qc-diss-review-refresh"), html.Div(id="qc-diss-review-status"),
     
                 html.Div(className="qc-mode-bar", children=[
                     html.Div("Mouse mode:", style={"fontWeight": "700"}),
@@ -3009,6 +3023,7 @@ dcc.Graph(id="qc-graph"),
 
     # Dissociation tab
     PDropdown(id="stats-recording"), PInput(id="diss-threshold"), html.Button(id="btn-run-diss"),
+    PDropdown(id="diss-evidence"), PInput(id="diss-max-gap"), PInput(id="diss-min-duration"),
     html.Div(id="diss-action-status"), html.Div(id="diss-log"), html.Div(id="diss-pairwise"),
     html.Div(id="diss-state"), html.Div(id="diss-events"),
 ])
@@ -3134,6 +3149,12 @@ def render_tab(tab, project_root, _refresh):
                         PDropdown(id="qc-diss-event-dropdown", options=[], placeholder="Choose dissociation event", style={"width":"100%"}),
                         html.Button("Next", id="qc-next-diss-event", n_clicks=0),
                     ]),
+                    html.Div(style={"display": "flex", "gap": "8px", "marginTop": "8px", "flexWrap": "wrap"}, children=[
+                        html.Button("Mark selected event reviewed", id="qc-diss-mark-reviewed", n_clicks=0),
+                        html.Button("Reopen selected event", id="qc-diss-reopen", n_clicks=0),
+                    ]),
+                    html.Div(id="qc-diss-review-status", className="status-line"),
+                    dcc.Store(id="qc-diss-review-refresh"),
                     html.Div(id="qc-diss-event-status", className="status-line"),
                 ]),
 
@@ -3581,11 +3602,25 @@ def render_tab(tab, project_root, _refresh):
     if tab == "tab-stats":
         return html.Div(className="card", children=[
             html.H3("Dissociation review dashboard"),
-            html.Div("Find where Layer 1, Somnotate, Manual and Final scoring disagree, then jump to those periods from the QC viewer.", className="app-subtitle"),
+            html.Div("Explore which biological states disagree, when discrepancies occur, and which intervals merit closer EEG/EMG/video review. These are review prompts, not diagnoses.", className="app-subtitle"),
             html.Div(style={"display":"flex","gap":"8px","alignItems":"center", "flexWrap":"wrap"}, children=[
                 html.Label("Recording:"), PDropdown(id="stats-recording", options=rec_options, value=rec_options[0]["value"] if rec_options else None, style={"width":"360px"}),
                 html.Label("Event threshold:"), PInput(id="diss-threshold", type="number", value=0.20, step=0.05, style={"width":"100px"}),
                 html.Button("Run dissociation analysis", id="btn-run-diss", n_clicks=0),
+            ]),
+            html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap", "marginTop": "10px"}, children=[
+                html.Label("Evidence to prioritize:"),
+                PDropdown(id="diss-evidence", value="combined", clearable=False,
+                    options=[
+                        {"label": "Combined (default)", "value": "combined"},
+                        {"label": "State disagreements only", "value": "disagreement"},
+                        {"label": "Low model confidence only", "value": "confidence"},
+                        {"label": "REM with high EMG only", "value": "physiology"},
+                    ], style={"width": "270px"}),
+                html.Label("Merge gap (s):"),
+                PInput(id="diss-max-gap", type="number", value=5, min=0, step=1, style={"width": "80px"}),
+                html.Label("Minimum event (s):"),
+                PInput(id="diss-min-duration", type="number", value=0, min=0, step=1, style={"width": "80px"}),
             ]),
             html.Div(
                 className="status-line",
@@ -3596,7 +3631,9 @@ def render_tab(tab, project_root, _refresh):
                         "The pipeline gives each epoch a dissociation score from 0 to 1. "
                         "Epochs with score ≥ threshold are grouped into review events. "
                         "Lower values catch more possible problems; higher values show fewer, stronger disagreements. "
-                        "Start around 0.20 for broad review and increase to 0.30 if the event list is too noisy."
+                        "Start around 0.20 for broad review and increase to 0.30 if the event list is too noisy. "
+                        "The evidence selector limits what contributes to the index; merge gap joins nearby flagged epochs, "
+                        "and minimum event duration filters brief episodes before review padding."
                     ),
                 ],
             ),
@@ -5416,7 +5453,10 @@ def dissociation_event_options(events):
         score = float(row.get("max_dissociation_index", np.nan))
         reason = str(row.get("main_reason", ""))
 
-        label = f"#{rank} | {start_min:.2f}–{end_min:.2f} min | score {score:.3f} | {reason}"
+        review = str(row.get("qc_review_status", "pending"))
+        status_symbol = "✓" if review == "reviewed" else "○"
+        friendly_reason = REASON_NAMES.get(reason, reason.replace("_", " "))
+        label = f"{status_symbol} #{rank} | {start_min:.2f}–{end_min:.2f} min | index {score:.3f} | {friendly_reason}"
 
         event_id = str(row.get("event_id", f"event_{rank}"))
 
@@ -5532,10 +5572,12 @@ def pan_qc_graph_to_window(relayout, window_data, recording_id, project_root):
     Output("qc-diss-event-status", "children"),
     Input("qc-refresh-diss-events", "n_clicks"),
     Input("recording-id-store", "data"),
+    Input("qc-diss-review-refresh", "data"),
     State("project-root-store", "data"),
+    State("qc-diss-event-dropdown", "value"),
     prevent_initial_call=True,
 )
-def refresh_qc_dissociation_events(n, recording_id, project_root):
+def refresh_qc_dissociation_events(n, recording_id, review_refresh, project_root, current_event_id):
     events = load_dissociation_events_for_recording(project_root, recording_id)
 
     if events is None or len(events) == 0:
@@ -5543,9 +5585,13 @@ def refresh_qc_dissociation_events(n, recording_id, project_root):
 
     options = dissociation_event_options(events)
 
-    # Loading a recording should make dissociation events available, but it
-    # must not behave as though the user selected event #1.
-    return options, None, f"Loaded {len(options)} dissociation events."
+    # Never auto-jump on recording load; preserve selection after marking review.
+    keep_selected = (
+        current_event_id if callback_context.triggered_id == "qc-diss-review-refresh"
+        and current_event_id in {o["value"] for o in options} else None
+    )
+    reviewed_n = int((events.get("qc_review_status", pd.Series(dtype=object)) == "reviewed").sum())
+    return options, keep_selected, f"Loaded {len(options)} events · {reviewed_n} explicitly reviewed."
 
 
 @app.callback(
@@ -6335,11 +6381,21 @@ def render_somnotate_rem_outcome(recording_dir):
     return html.Div(className="card", children=children)
 
 def render_dissociation_dashboard(analysis_dir):
-    """Clean, review-oriented dissociation dashboard."""
+    """Biologist-oriented, descriptive dissociation review dashboard."""
     analysis_dir = Path(analysis_dir)
     pairwise = safe_read_csv(analysis_dir / "dissociation_pairwise_summary.csv")
     state = safe_read_csv(analysis_dir / "dissociation_state_summary.csv")
+    epochs = safe_read_csv(analysis_dir / "dissociation_epochs.csv")
     events = safe_read_csv(analysis_dir / "dissociation_events.csv")
+    settings_path = analysis_dir / "analysis_settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except (ValueError, OSError):
+        settings = {}
+    threshold = float(settings.get("threshold", 0.20))
+    evidence = settings.get("evidence", "combined")
+    if events is not None:
+        events = attach_dissociation_review_status(events, analysis_dir)
 
     children = []
     n_events = 0 if events is None else len(events)
@@ -6361,6 +6417,38 @@ def render_dissociation_dashboard(analysis_dir):
         compact_metric_card("Highest pairwise disagreement", key_pair_pct),
         compact_metric_card("Top reason", top_reason),
     ]))
+
+    children.append(html.Div(className="card", children=[
+        html.H4("How to interpret this dashboard"),
+        html.Div(
+            f"Evidence focus: {evidence}. The index combines available evidence (0–1) to prioritize QC, "
+            "not to estimate the probability of a true biological dissociation. "
+            "Layer 1 Sleep is compared with NREM/REM only after collapsing both to Wake/Sleep; "
+            "Undefined and unreviewed labels are excluded from agreement denominators. "
+            "Heatmaps include all comparable epochs, not just flagged events. "
+            "Counts and rates are descriptive within this recording; epochs are not independent animals.",
+            className="app-subtitle",
+        ),
+    ]))
+    if epochs is not None and len(epochs):
+        visualizations = [
+            score_timeline_figure(epochs, events, threshold),
+            hourly_burden_figure(epochs, threshold),
+            confusion_figure(epochs, "somnotate_state", "final_state", "Somnotate", "Final"),
+            confusion_figure(epochs, "somnotate_state", "manual_state", "Somnotate", "Manual"),
+            final_coverage_figure(epochs),
+        ]
+        visualizations = [plot for plot in visualizations if plot is not None]
+        if visualizations:
+            children.append(html.Div(className="card", children=[
+                html.H4("Scoring patterns across the entire recording"),
+                html.Div("Each plot uses the epoch time axis; its denominator is given on the axis or hover label.", className="app-subtitle"),
+                *[dcc.Graph(figure=plot) for plot in visualizations],
+            ]))
+    if events is not None and len(events):
+        raster = event_raster_figure(events)
+        if raster is not None:
+            children.append(html.Div(className="card", children=[dcc.Graph(figure=raster)]))
 
     children.append(html.Div(className="card", children=[
         html.H4("How events are ranked"),
@@ -6411,38 +6499,6 @@ def render_dissociation_dashboard(analysis_dir):
         )
         children.append(html.Div(className="card", children=[dcc.Graph(figure=fig)]))
 
-    # Event timeline with reason split.
-    if events is not None and len(events):
-        df = events.copy()
-        if "start_min" not in df.columns and "start_s" in df.columns:
-            df["start_min"] = df["start_s"].astype(float) / 60.0
-        score_col = "max_dissociation_index" if "max_dissociation_index" in df.columns else find_first_numeric_col(df, ["mean_dissociation_index"])
-        if "start_min" in df.columns and score_col:
-            fig = go.Figure()
-            if "main_reason" in df.columns:
-                reasons = list(df["main_reason"].astype(str).fillna("Unknown").unique())
-            else:
-                reasons = ["Dissociation"]
-                df["main_reason"] = "Dissociation"
-            palette = ["#F97316", "#6366F1", "#14B8A6", "#EF4444", "#A855F7", "#64748B"]
-            for i, reason in enumerate(reasons):
-                sub = df[df["main_reason"].astype(str) == reason]
-                fig.add_trace(go.Scatter(
-                    x=sub["start_min"], y=sub[score_col], mode="markers", name=reason,
-                    marker=dict(size=9, color=palette[i % len(palette)], opacity=0.8),
-                    customdata=np.stack([
-                        sub.get("event_id", pd.Series([""] * len(sub))).astype(str),
-                        sub.get("end_min", sub.get("end_s", pd.Series([np.nan]*len(sub)))).astype(str),
-                    ], axis=-1),
-                    hovertemplate="%{customdata[0]}<br>Start=%{x:.2f} min<br>Score=%{y:.3f}<extra></extra>",
-                ))
-            fig.update_layout(
-                title="Dissociation event timeline", template="plotly_white", height=360,
-                margin=dict(l=55, r=25, t=55, b=45), xaxis_title="Time (min)", yaxis_title="Dissociation score",
-                legend=dict(orientation="h", y=1.08),
-            )
-            children.append(html.Div(className="card", children=[dcc.Graph(figure=fig)]))
-
     # Top ranked events table.
     if events is not None and len(events):
         cols = [c for c in ["rank", "event_id", "start_min", "end_min", "duration_s", "max_dissociation_index", "main_reason", "states_at_peak"] if c in events.columns]
@@ -6484,9 +6540,12 @@ def table_from_csv(path: Path, max_rows=50):
     State("project-root-store", "data"),
     State("stats-recording", "value"),
     State("diss-threshold", "value"),
+    State("diss-evidence", "value"),
+    State("diss-max-gap", "value"),
+    State("diss-min-duration", "value"),
     prevent_initial_call=True,
 )
-def run_diss(n, project_root, recording_id, threshold):
+def run_diss(n, project_root, recording_id, threshold, evidence, max_gap_s, min_duration_s):
     if not project_root or not recording_id:
         return "Load project and choose recording.", no_update, no_update, no_update
 
@@ -6511,7 +6570,10 @@ def run_diss(n, project_root, recording_id, threshold):
         # So use the actual folder basename.
         pipeline_recording_id = rec_dir.name
 
-        threshold_text = str(threshold or "0.2").replace(",", ".")
+        threshold_text = str(0.20 if threshold is None else threshold).replace(",", ".")
+        evidence = evidence or "combined"
+        max_gap_s = 5 if max_gap_s is None else max_gap_s
+        min_duration_s = 0 if min_duration_s is None else min_duration_s
 
         cmd = [
             sys.executable,
@@ -6520,11 +6582,15 @@ def run_diss(n, project_root, recording_id, threshold):
             str(project_root),
             "--recording-id",
             str(pipeline_recording_id),
-            "--threshold",
-            threshold_text,
+            "--threshold", threshold_text,
+            "--evidence", str(evidence),
+            "--max-gap-s", str(max_gap_s),
+            "--min-duration-s", str(min_duration_s),
         ]
 
         code, out = run_command(cmd)
+        if code != 0:
+            return f"Dissociation analysis failed (exit {code}):\n{out}", no_update, no_update, no_update
 
         analysis = rec_dir / "dissociation_analysis"
 
